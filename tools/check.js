@@ -352,6 +352,7 @@ const DEFAULT_VOICE_MARKER = '[Default Voice]';
 async function runAssertions() {
 const api = new Function(source + `;return {
     isExcluded, readableText, getDirection, DEFAULT_EXCLUSIONS, settings, hasProfile,
+    accentPhrase,
     splitSegments, collectQuotes, isNamedSpeaker, parseDirection,
     normalize, pickLine, castEntry, hash, syncPrompts, skipped, isSkipped, setSkipped,
     voiceInstruction, cleanProfile, PROFILE_FIELDS, splitLines, buildUnits, targetMessage,
@@ -555,12 +556,28 @@ print('voiceInstruction');
 const bob = { gender: 'male', age: 'late forties', accent: 'Scottish', tone: 'Gruff and clipped.' };
 eq('design mode composes everything', voiceInstruction(bob, false),
    'male, late forties. Scottish accent. Gruff and clipped.');
-eq('clone mode keeps tone only', voiceInstruction(bob, true), 'Gruff and clipped.');
+// A clone fixes who is speaking, so gender is withheld — but accent and age
+// are directable over a cloned timbre, and withholding them was the bug.
+eq('clone mode withholds gender only', voiceInstruction(bob, true),
+   'late forties. Scottish accent. Gruff and clipped.');
 eq('skips absent fields', voiceInstruction({ tone: 'Soft.' }, false), 'Soft.');
 eq('trailing punctuation not doubled', voiceInstruction({ gender: 'female', tone: 'Wry;' }, false),
    'female. Wry.');
 eq('empty profile', voiceInstruction({}, false), '');
-eq('clone mode with no tone', voiceInstruction({ gender: 'male' }, true), '');
+eq('clone mode with nothing but gender', voiceInstruction({ gender: 'male' }, true), '');
+eq('clone mode with only an accent', voiceInstruction({ accent: 'Welsh' }, true),
+   'Welsh accent.');
+
+print('accentPhrase');
+const { accentPhrase } = api;
+eq('a bare accent is named as one', accentPhrase('Scottish'), 'Scottish accent');
+eq('one that already says so is left alone',
+   accentPhrase('a soft Welsh accent'), 'a soft Welsh accent');
+eq('case does not matter', accentPhrase('Broad Yorkshire Accent'), 'Broad Yorkshire Accent');
+eq('a short name takes the word', accentPhrase('Broad West Country'), 'Broad West Country accent');
+eq('a described accent stands on its own',
+   accentPhrase('A light rural American warmth.'), 'A light rural American warmth');
+eq('nothing', accentPhrase(''), '');
 
 print('syncPrompts');
 const shipped = api.DEFAULT_PROMPT;

@@ -1630,12 +1630,35 @@ function castFor(speaker) {
  * describing a voice that the reference audio already fixes only fights it.
  * Tone survives either way: it is manner, not timbre.
  */
+/**
+ * The accent as a phrase Breeze can read.
+ *
+ * A name wants the word adding — "Scottish" alone is ambiguous. A phrase does
+ * not: the model often answers with a description rather than a name, and
+ * "A light rural American warmth accent" is worse than what it wrote.
+ */
+function accentPhrase(accent) {
+    const text = String(accent ?? '').trim().replace(/[.\s]+$/, '');
+    if (!text) return '';
+    if (/accent/i.test(text)) return text;
+    return text.split(/\s+/).length <= 3 ? `${text} accent` : text;
+}
+
 function voiceInstruction(entry, cloned) {
+    // Only gender is withheld from a clone. The reference audio fixes the voice
+    // that is speaking, and contradicting it there is the one thing that
+    // reliably fights the reference.
+    //
+    // Accent and age are not that. An accent is articulation and prosody, which
+    // is precisely what an instruction can steer over a cloned timbre, and it is
+    // usually the thing that most distinguishes one character from another
+    // sharing a base. Withholding both was why a cast member with gender, age
+    // and accent all filled in reached Breeze as nothing but their tone.
     const parts = cloned
-        ? [entry.tone]
+        ? [entry.age, accentPhrase(entry.accent), entry.tone]
         : [
             [entry.gender, entry.age].map(v => String(v ?? '').trim()).filter(Boolean).join(', '),
-            entry.accent ? `${String(entry.accent).trim()} accent` : '',
+            accentPhrase(entry.accent),
             entry.tone,
         ];
 

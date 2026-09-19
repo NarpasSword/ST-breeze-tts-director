@@ -419,12 +419,26 @@ what makes it visible at all.
 
 ### Composing a voice instruction
 
-`voiceInstruction(entry, cloned)` builds what Breeze is actually told. When the
-base is a **clone** — `ref_audio_url` and `ref_text` both present — it emits the
-tone alone. Identity words (gender, age, accent) would describe a voice the
-reference audio has already fixed, and fight it. In design mode, with no
-reference to contradict, the whole profile composes. The cast sheet prints the
-result under each speaker, so an edit's effect is visible before you hear it.
+`voiceInstruction(entry, cloned)` builds what Breeze is actually told. In design
+mode the whole profile composes. When the base is a **clone** —
+`ref_audio_url` and `ref_text` both present — **gender alone is withheld**: the
+reference fixes who is speaking, and contradicting that is the one thing that
+reliably fights it.
+
+Accent and age are not that, and used to be withheld too. An accent is
+articulation and prosody, which is exactly what an instruction can steer over a
+cloned timbre, and it is usually what most separates two characters sharing a
+base. Dropping it meant a cast member with gender, age and accent all filled in
+reached Breeze as nothing but their tone.
+
+`accentPhrase()` adds the word "accent" to a short name — `Scottish` alone is
+ambiguous — but leaves a longer phrase as written, since the model often answers
+with a description and "A light rural American warmth accent" is worse than what
+it wrote.
+
+The cast sheet prints the composed result under each speaker, so what actually
+reaches Breeze is visible before you hear it — which is how a missing accent
+shows up at all.
 
 ### Prompts upgrade themselves now
 
