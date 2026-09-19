@@ -529,6 +529,10 @@ eq('keeps filled fields', cleanProfile({ gender: 'male', age: ' 40s ', tone: 'Gr
 eq('drops unknown', cleanProfile({ gender: 'unknown', tone: 'Soft.' }), { tone: 'Soft.' });
 eq('drops unlisted keys', cleanProfile({ tone: 'Soft.', mood: 'angry' }), { tone: 'Soft.' });
 eq('all empty is null', cleanProfile({ gender: '', age: '  ' }), null);
+// A long tone is kept, not truncated — mangling someone's voice is worse than
+// a wordy one — but it warns, which is how it becomes visible at all.
+const wordy = Array(40).fill('word').join(' ');
+eq('an over-long tone survives', cleanProfile({ tone: wordy })?.tone, wordy);
 eq('missing is null', cleanProfile(undefined), null);
 
 print('extractJson');

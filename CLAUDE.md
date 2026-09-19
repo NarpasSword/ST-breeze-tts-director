@@ -399,6 +399,24 @@ spec leaves the top-level fields empty; reading only those found nothing.
 comes from a model. When no card is found, that is logged rather than passed
 over in silence.
 
+### The voice is the instrument, not the performance
+
+A cast member's `tone` describes how someone **always** sounds — pitch, texture,
+pace, habitual manner. How a given line is *felt* is the per-paragraph
+director's job, and the two compose at generation time.
+
+Keeping them apart matters in the prompt, or the model writes the performance
+into the instrument: an early version returned *"teasing and quick-witted when
+confident, but prone to breathless, rambling flusters when nervous"* — a
+description of a character arc, not a voice, and at forty-odd words it also
+drowned the paragraph direction it was concatenated with. The casting prompt
+therefore caps the tone at fifteen words, bans semicolons, dashes and
+sub-clauses, and shows one worked example of the right shape.
+
+`cleanProfile()` warns past `TONE_WORD_LIMIT` but never truncates — cutting
+someone's voice off mid-phrase is worse than a wordy one, and the warning is
+what makes it visible at all.
+
 ### Composing a voice instruction
 
 `voiceInstruction(entry, cloned)` builds what Breeze is actually told. When the

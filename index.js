@@ -682,13 +682,20 @@ your description is what tells them apart — so choose on sound alone, never on
 has been cast already or on where a voice sits in the list.
 
 Then describe the voice itself:
-  gender  — as the description or their lines give it
+  gender  — one or two words
   age     — approximate, such as "late teens" or "forties"
-  tone    — ONE sentence: pitch, texture, pace, and their habitual manner of speaking
-  accent  — only where there is a clear basis for one
+  tone    — AT MOST 15 WORDS. Pitch, texture, pace, habitual manner. Short plain
+            phrases, no semicolons, no dashes, no sub-clauses.
+  accent  — only where there is a clear basis for one, else ""
 
-Leave a field as "" when nothing supports it. Do not invent. Describe how they sound,
-not how they look, what they have done, or what is happening to them.
+Describe the voice as it always sounds, not how it changes with mood. How a line is
+felt is directed separately, line by line; this is the instrument, not the
+performance. Nothing about appearance, history, or what is happening to them.
+
+Good tone: "Bright and light. Quick, clipped delivery with an upward lilt."
+Too much: anything naming what they feel, when they feel it, or what lies beneath it.
+
+Leave a field as "" when nothing supports it. Do not invent.
 
 Reply with ONLY a JSON object, no commentary, no code fences:
 {"base": "<a voice name from the list>", "gender": "", "age": "", "tone": "", "accent": ""}`;
@@ -1501,12 +1508,25 @@ function pruneCast() {
 
 const PROFILE_FIELDS = ['gender', 'age', 'tone', 'accent'];
 
+// Roughly twice what the prompt asks for. Not enforced — truncating someone's
+// voice mid-phrase is worse than a long one — but worth saying out loud, since a
+// sprawling tone reaches Breeze as a sprawling instruction and reads as one.
+const TONE_WORD_LIMIT = 30;
+
 function cleanProfile(raw) {
     const profile = {};
     for (const field of PROFILE_FIELDS) {
         const value = String(raw?.[field] ?? '').trim();
         if (value && value.toLowerCase() !== 'unknown') profile[field] = value;
     }
+
+    const words = profile.tone ? profile.tone.split(/\s+/).length : 0;
+    if (words > TONE_WORD_LIMIT) {
+        console.warn(`[Breeze Director] a ${words}-word tone came back where 15 were `
+            + 'asked for; Breeze follows a short instruction more closely. '
+            + 'Shorten it in the voice cast, or tighten the casting prompt.', profile.tone);
+    }
+
     return Object.keys(profile).length ? profile : null;
 }
 
