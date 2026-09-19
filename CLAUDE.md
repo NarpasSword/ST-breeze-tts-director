@@ -5,14 +5,17 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## What this is
 
 A SillyTavern third-party extension: **Breeze Director & Player**. One `index.js`
-(~1000 lines, no build step, no dependencies) that does two things sharing one
-text-splitting rule:
+(~1300 lines, no build step, no dependencies) that does three things over a
+shared splitting rule:
 
 - **Director** — one LLM call per chat message writes a delivery instruction for
   every paragraph, stored in the chat file. The TTS provider picks those up while
   narrating.
+- **Casting** — the same call attributes each quoted span to a speaker, and each
+  speaker is routed to its own Breeze voice. Non-quote text reads in a
+  configurable narrator voice.
 - **Player** — an inline panel per message with paragraph-level seek, per-message
-  resume, and take history.
+  resume, per-segment voice overrides, and take history.
 
 There is no build, lint, or test tooling. The file is plain ES module JS loaded
 directly by the browser.
@@ -66,27 +69,54 @@ await globalThis.breezeTts.cacheStats()
 
 ## Architecture
 
-### Narration units must mirror SillyTavern's splitting
+### Paragraphs direct; segments only pick a voice
 
-`buildUnits()` splits a message by `\n`, dropping empty lines — **exactly** what
-SillyTavern's TTS extension does when it builds narration jobs. One unit here is
-one generated clip there. If that rule drifts, `pickLine()` can no longer match
-the text the provider hands back and every instruction falls through to
-paragraph 1.
+Two levels of splitting, and the distinction is load-bearing:
 
-The `.bak` file preserves an earlier design that further split each line into
-dialogue / action / narration segments, mirroring ST's optional
-`multi_voice_enabled`. That was **deliberately reverted** — it produced
-sentence-sized fragments. Don't reintroduce it without also handling
-`multi_voice_enabled` invalidation of stored directions.
+- `buildUnits()` splits a message by `\n`, dropping empty lines — **exactly**
+  what SillyTavern's TTS extension does when it builds narration jobs. This is
+  the unit of *direction*, of panel rows, and of resume positions.
+- `splitSegments()` splits one paragraph into quoted and unquoted spans, so each
+  can take its own voice. It mirrors ST's `parseMessageSegments`
+  (`tts/index.js:537`) exactly, delimiters stripped and empties dropped, and its
+  regex is byte-identical to ST's.
+
+An earlier design used segments for *direction* too, and was reverted because
+one-sentence fragments made for poor stage directions — that history is in
+`.bak`. Segments are back for voices only; every segment in a paragraph
+inherits that paragraph's single instruction, so the arc survives.
+
+This is also why `pickLine()` needs no segment awareness: its "quote-only
+narration hands us a fragment" branch already maps a span back to its parent
+paragraph's instruction.
+
+**Caveat on the first rule.** ST only splits by line when
+`extension_settings.tts.narrate_by_paragraphs` is on (`tts/index.js:274`). With
+it off, ST enqueues the whole message as one job, `pickLine()` matches
+paragraph 1, and the entire message is read with paragraph 1's instruction. The
+settings panel warns when it is off. The player here does its own splitting and
+is unaffected.
 
 ### Data model
 
 `message.extra.breeze_direction`, saved into the chat file by `saveChat()`:
 
 ```js
-{ swipe_id, ts, lines: [{ text, instruction }], history: [{ ts, lines }] }  // history capped at HISTORY_LIMIT = 5
+{
+  swipe_id, ts,
+  lines: [{ text, instruction, segments? }],   // segments only when the paragraph needs them
+  history: [{ ts, lines }],                    // capped at HISTORY_LIMIT = 5
+}
 ```
+
+`segments` is `[{ text, kind, speaker?, voice? }]` and is **omitted entirely**
+when a paragraph is one plain narration span — the common case — so records stay
+small and directions written before casting still load.
+
+`voice` is pinned only for a *foreign* speaker. The character's own dialogue and
+unattributed spans store no voice and resolve live through `voiceForSegment()`,
+so editing the narrator setting or the TTS voice map keeps working on messages
+already in the chat. A voice picked by hand in the panel pins the same field.
 
 `getDirection()` returns `null` when `swipe_id` no longer matches, so swiping
 silently invalidates a take rather than misapplying it. Text goes in the chat
@@ -94,7 +124,14 @@ silently invalidates a take rather than misapplying it. Text goes in the chat
 IndexedDB.
 
 Player resume positions live in `extensionSettings.breeze_player.resume`, keyed
-`"<chatId>:<messageId>"`, pruned past 200 entries.
+`"<chatId>:<messageId>"`, pruned past 200 entries. Resume stays
+paragraph-granular even though playback is now segment-granular.
+
+The speaker→voice cast lives in `breeze_director.cast` as
+`{ [chatId]: { [speaker]: voice } }`, pruned past `CAST_CHAT_LIMIT` chats. It is
+nested rather than flat-keyed because speaker names can contain a colon. A
+speaker keeps one voice for a whole chat on purpose — re-picking per message
+would make the same stranger sound like a different person every paragraph.
 
 ### Two settings keys, for history
 
@@ -113,8 +150,26 @@ were once separate extensions. Keep both keys — renaming drops users' configs.
 3. `on_missing` decides the no-direction case: `static` (provider's own preset,
    no LLM call) or `generate` (blocks playback).
 
-`run()` and `ensureVoice()` are single-flight via `inFlight` / `voiceJobs` maps,
-so the auto-run and the narration hook never issue duplicate calls.
+`run()`, `ensureVoice()` and `castVoice()` are single-flight via `inFlight` /
+`voiceJobs` / `castJobs`, so the auto-run and the narration hook never issue
+duplicate calls, and two paragraphs naming the same stranger cannot race into
+two different voices.
+
+### Casting a quoted speaker
+
+`castVoice()` is only ever called for a speaker `isForeignSpeaker()` accepts.
+Resolution order, each step falling through on failure:
+
+1. `breezeTts.voiceForCharacter(speaker)` — a hand-assigned voice-map entry
+   always beats the director.
+2. The chat's cast cache.
+3. `cardFor(speaker)` hits → `designVoice()` writes them a real voice.
+4. Otherwise `pickVoice()` asks the model to choose from `listVoices()`.
+5. Null → the caller falls back to `voiceForSegment()`'s live resolution.
+
+Non-quote text uses `defaultVoice()`: the configured `narrator_voice` if it
+still exists in the provider's JSON, else the character's own voice. Leaving the
+setting empty reproduces pre-casting behavior exactly.
 
 ### Failure policy
 
@@ -136,7 +191,11 @@ mode. The voice-design prompt is the one place that *does* describe the voice.
 
 - **Prompts persist in settings, so editing the default in this file changes
   nothing for an existing install.** After any change to `DEFAULT_PROMPT` or
-  `DEFAULT_VOICE_PROMPT`, click "Reset prompt" in the panel.
+  `DEFAULT_VOICE_PROMPT`, click "Reset prompt" in the panel. This now fails
+  loudly rather than silently: a saved prompt without `{{quotes}}` can never
+  return speaker attribution, so `bind()` shows a warning under the prompt box
+  until it is reset, and `generate()` logs when attribution was expected but
+  came back empty.
 - **Reasoning models can still starve.** `generate()` floors the request at
   `max(setting, 600 + 80 × paragraphs)` and reports an empty completion
   separately from an unparseable one, both with the raw result logged. If empty

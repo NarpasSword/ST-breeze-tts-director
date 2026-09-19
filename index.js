@@ -22,13 +22,35 @@ For each paragraph, write ONE short sentence describing how to deliver it: tone,
 Describe delivery only — never the speaker's age, gender, accent, or timbre.
 Let the direction develop across the paragraphs so the reading has an arc.
 Do not summarise or quote the text.
-
-Reply with ONLY a JSON array of exactly {{count}} strings, no commentary, no code fences.
+{{quotes}}
+Reply with ONLY a JSON object, no commentary, no code fences:
+{"directions": [exactly {{count}} strings, one per paragraph], "speakers": {"Q1": "name", ...}}
 
 Character: {{char}}
 
 Paragraphs:
 {{parts}}`;
+
+/** Spliced into the prompt at {{quotes}} when the message has quoted speech. */
+const QUOTES_BLOCK = `
+Each quote below is spoken aloud. Name who speaks it, exactly as the text names them.
+Use "{{char}}" when {{char}} is the one speaking, and "unknown" when the text does not say.
+
+Quotes:
+{{list}}
+`;
+
+const DEFAULT_VOICE_PICK_PROMPT = `Choose the best-fitting voice for a character from the list below.
+
+Character: {{speaker}}
+
+Lines they speak:
+{{lines}}
+
+Available voices:
+{{voices}}
+
+Reply with ONLY the voice name, copied exactly from the list. Nothing else.`;
 
 const DEFAULT_VOICE_PROMPT = `Design a speaking voice for the character below.
 
@@ -55,7 +77,13 @@ const DEFAULTS = {
     auto_voice: true,
     voice_prompt: DEFAULT_VOICE_PROMPT,
     prefetch: true,
+    cast_enabled: true,
+    narrator_voice: '',   // '' = the character's own voice
+    voice_pick_prompt: DEFAULT_VOICE_PICK_PROMPT,
+    cast: {},             // chatId -> { speaker: voiceName }
 };
+
+const CAST_CHAT_LIMIT = 50;
 
 const PLAYER_DEFAULTS = {
     autoplay_next: true,
@@ -102,6 +130,94 @@ function buildUnits(mes) {
     return splitLines(mes).map(text => ({ text }));
 }
 
+// Verbatim from SillyTavern's parseMessageSegments (tts/index.js). A paragraph
+// stays the unit of direction; segments exist only to decide who reads what.
+const SEGMENT_PATTERN = /(\*[^*]*?\*)|(".*?")|(\u201C.*?\u201D)|(\u00AB.*?\u00BB)|(\u300C.*?\u300D)|(\u300E.*?\u300F)|(\uFF02.*?\uFF02)/gim;
+
+/**
+ * Split one paragraph into spans that may each take their own voice, matching
+ * ST's rules: delimiters stripped, pieces trimmed, empties dropped, and the
+ * whole line kept when nothing matches. Asterisk actions read as narration —
+ * only quoted speech can change speaker.
+ */
+function splitSegments(line) {
+    const segments = [];
+    const regex = new RegExp(SEGMENT_PATTERN.source, 'gim');
+    let lastIndex = 0;
+    let match;
+
+    while ((match = regex.exec(line)) !== null) {
+        if (match.index > lastIndex) {
+            const before = line.slice(lastIndex, match.index).trim();
+            if (before) segments.push({ text: before, kind: 'narration' });
+        }
+        const content = match[0].slice(1, -1).trim();
+        if (content) segments.push({ text: content, kind: match[1] ? 'narration' : 'dialogue' });
+        lastIndex = match.index + match[0].length;
+    }
+
+    if (lastIndex < line.length) {
+        const rest = line.slice(lastIndex).trim();
+        if (rest) segments.push({ text: rest, kind: 'narration' });
+    }
+
+    if (segments.length) return segments;
+    const whole = line.trim();
+    return whole ? [{ text: whole, kind: 'narration' }] : [];
+}
+
+/** Every quoted span in the message, numbered Q1..Qn for the director to attribute. */
+function collectQuotes(layout) {
+    const quotes = [];
+    layout.forEach((segments, paragraph) => {
+        segments.forEach((segment, at) => {
+            if (segment.kind !== 'dialogue') return;
+            quotes.push({ id: `Q${quotes.length + 1}`, paragraph, at, text: segment.text });
+        });
+    });
+    return quotes;
+}
+
+const GENERIC_SPEAKERS = new Set(['', 'unknown', 'unclear', 'narrator', 'none', 'null', 'n/a']);
+
+/** Is this quote spoken by someone other than the message's own character? */
+function isForeignSpeaker(speaker, message) {
+    const name = String(speaker ?? '').trim().toLowerCase();
+    if (!name || GENERIC_SPEAKERS.has(name)) return false;
+    return name !== String(message?.name ?? '').trim().toLowerCase();
+}
+
+/** The voice the character themselves narrates with, per the TTS voice map. */
+function charVoice(message) {
+    return globalThis.breezeTts?.voiceForCharacter(message?.name) ?? null;
+}
+
+/** The voice for non-quote text: the configured narrator, else the character's own. */
+function defaultVoice(message) {
+    const breeze = globalThis.breezeTts;
+    const narrator = settings().narrator_voice;
+    if (narrator && breeze?.hasVoice(narrator)) return narrator;
+    return charVoice(message);
+}
+
+/**
+ * Resolve a stored segment to a voice at play time. Only a foreign speaker has
+ * a voice pinned into the chat; everything else resolves live, so editing the
+ * narrator setting or the voice map keeps working on old messages.
+ */
+function voiceForSegment(segment, message) {
+    if (segment?.kind !== 'dialogue') return defaultVoice(message);
+    if (segment.voice && globalThis.breezeTts?.hasVoice(segment.voice)) return segment.voice;
+    return charVoice(message) ?? defaultVoice(message);
+}
+
+/** The clips one paragraph plays, in order. */
+function clipsFor(message, line) {
+    const segments = line?.segments;
+    if (!segments?.length) return [{ text: line?.text ?? '', voice: defaultVoice(message) }];
+    return segments.map(segment => ({ text: segment.text, voice: voiceForSegment(segment, message) }));
+}
+
 const normalize = s => String(s ?? '').replace(/[*_"'`~]/g, '').replace(/\s+/g, ' ').trim().toLowerCase();
 
 /** Stored direction, but only if it still belongs to the current swipe. */
@@ -118,42 +234,83 @@ function hasDirection(index) {
 
 // ---------------------------------------------------------------- generation
 
-function buildPrompt(message, units) {
-    const context = ctx();
-    const parts = units.map((unit, i) => `${i + 1}. ${unit.text}`).join('\n\n');
-    return settings().prompt
-        .replace(/{{parts}}/g, parts)
-        .replace(/{{count}}/g, String(units.length))
-        .replace(/{{message}}/g, String(message?.mes ?? ''))
-        .replace(/{{char}}/g, String(message?.name ?? context.name2 ?? ''))
-        .replace(/{{user}}/g, String(context.name1 ?? ''));
+/** Substitute without letting $& and friends in chat text be interpreted. */
+function put(template, token, value) {
+    return template.replace(token, () => value);
 }
 
-function parseInstructions(raw, count) {
+function buildPrompt(message, units, quotes) {
+    const context = ctx();
+    const parts = units.map((unit, i) => `${i + 1}. ${unit.text}`).join('\n\n');
+    const block = quotes.length
+        ? put(QUOTES_BLOCK, /{{list}}/g,
+            quotes.map(q => `${q.id} (paragraph ${q.paragraph + 1}): ${q.text}`).join('\n'))
+        : '';
+
+    // {{quotes}} first: the block it splices in carries {{char}} of its own.
+    let prompt = put(settings().prompt, /{{quotes}}/g, block);
+    prompt = put(prompt, /{{parts}}/g, parts);
+    prompt = put(prompt, /{{count}}/g, String(units.length));
+    prompt = put(prompt, /{{message}}/g, String(message?.mes ?? ''));
+    prompt = put(prompt, /{{char}}/g, String(message?.name ?? context.name2 ?? ''));
+    prompt = put(prompt, /{{user}}/g, String(context.name1 ?? ''));
+    return prompt;
+}
+
+/**
+ * Read a completion into { instructions, speakers }. Three shapes are accepted,
+ * because prompts persist in settings: the current object form, a bare array
+ * from a pre-cast saved prompt, and anything else via the first-line fallback.
+ */
+function parseDirection(raw, count) {
     const text = String(raw ?? '')
         .replace(/<think>[\s\S]*?<\/think>/gi, '')
         .replace(/```(?:json)?/gi, '')
         .trim();
 
-    const start = text.indexOf('[');
-    const end = text.lastIndexOf(']');
-    if (start !== -1 && end > start) {
+    // Pad short replies with the last usable direction.
+    const pad = (list) => {
+        const clean = list.map(v => String(v ?? '').trim()).filter(Boolean);
+        if (!clean.length) return null;
+        while (clean.length < count) clean.push(clean[clean.length - 1]);
+        return clean.slice(0, count);
+    };
+
+    const objectStart = text.indexOf('{');
+    const objectEnd = text.lastIndexOf('}');
+    if (objectStart !== -1 && objectEnd > objectStart) {
         try {
-            const parsed = JSON.parse(text.slice(start, end + 1));
-            if (Array.isArray(parsed)) {
-                const clean = parsed.map(v => String(v ?? '').trim()).filter(Boolean);
-                if (clean.length) {
-                    // Pad short replies with the last usable direction.
-                    while (clean.length < count) clean.push(clean[clean.length - 1]);
-                    return clean.slice(0, count);
+            const parsed = JSON.parse(text.slice(objectStart, objectEnd + 1));
+            const instructions = Array.isArray(parsed?.directions) ? pad(parsed.directions) : null;
+            if (instructions) {
+                const speakers = {};
+                for (const [id, name] of Object.entries(parsed?.speakers ?? {})) {
+                    speakers[String(id).trim().toUpperCase()] = String(name ?? '').trim();
                 }
+                return { instructions, speakers };
+            }
+        } catch { /* fall through to the array form */ }
+    }
+
+    const arrayStart = text.indexOf('[');
+    const arrayEnd = text.lastIndexOf(']');
+    if (arrayStart !== -1 && arrayEnd > arrayStart) {
+        try {
+            const parsed = JSON.parse(text.slice(arrayStart, arrayEnd + 1));
+            if (Array.isArray(parsed)) {
+                const instructions = pad(parsed);
+                if (instructions) return { instructions, speakers: {} };
             }
         } catch { /* fall through to the single-instruction path */ }
     }
 
     // Model ignored the format: use its first line as one direction for everything.
     const single = text.split('\n').map(l => l.trim()).filter(Boolean)[0];
-    return single ? new Array(count).fill(single.replace(/^["'`]|["'`]$/g, '')) : null;
+    if (!single) return null;
+    return {
+        instructions: new Array(count).fill(single.replace(/^["\'`]|["\'`]$/g, '')),
+        speakers: {},
+    };
 }
 
 async function generate(index, { quiet = true } = {}) {
@@ -171,13 +328,20 @@ async function generate(index, { quiet = true } = {}) {
     const units = buildUnits(message.mes);
     if (!units.length) return null;
 
+    const layout = units.map(unit => splitSegments(unit.text));
+    const quotes = collectQuotes(layout);
+    const attribute = config.cast_enabled && quotes.length > 0;
+
     // A reasoning model can spend the whole budget thinking and return nothing,
     // so floor the request at enough room to think and still write every line.
-    const budget = Math.max(Number(config.max_tokens) || 0, 600 + 80 * units.length);
+    const budget = Math.max(
+        Number(config.max_tokens) || 0,
+        600 + 80 * units.length + 20 * (attribute ? quotes.length : 0),
+    );
 
     const result = await context.ConnectionManagerRequestService.sendRequest(
         config.profile,
-        buildPrompt(message, units),
+        buildPrompt(message, units, attribute ? quotes : []),
         budget,
     );
 
@@ -190,11 +354,50 @@ async function generate(index, { quiet = true } = {}) {
         return null;
     }
 
-    const instructions = parseInstructions(result?.content, units.length);
-    if (!instructions) {
+    const parsed = parseDirection(result?.content, units.length);
+    if (!parsed) {
         console.warn('[Breeze Director] could not parse a completion:', result?.content);
         if (!quiet) toastr.error('Model returned nothing usable.', 'Breeze Director');
         return null;
+    }
+
+    // pickVoice quotes a speaker's own lines back at the model; tag them now.
+    for (const quote of quotes) {
+        quote.speaker = attribute ? String(parsed.speakers[quote.id] ?? '').trim() : '';
+    }
+
+    if (attribute && !Object.keys(parsed.speakers).length) {
+        console.info('[Breeze Director] no speaker attribution came back — if the saved '
+            + 'prompt predates casting, click "Reset prompt".');
+    }
+
+    const lines = [];
+    for (let i = 0; i < units.length; i++) {
+        const line = { text: units[i].text, instruction: parsed.instructions[i] };
+        const segments = layout[i];
+
+        // One plain narration span is the common case: store nothing extra, so
+        // records stay small and pre-casting directions keep loading unchanged.
+        if (segments.length !== 1 || segments[0].kind !== 'narration') {
+            line.segments = [];
+            for (let at = 0; at < segments.length; at++) {
+                const segment = segments[at];
+                const entry = { text: segment.text, kind: segment.kind };
+
+                if (segment.kind === 'dialogue') {
+                    const quote = quotes.find(q => q.paragraph === i && q.at === at);
+                    const speaker = attribute ? String(parsed.speakers[quote?.id] ?? '').trim() : '';
+                    entry.speaker = speaker || null;
+                    // Only a foreign speaker gets a voice pinned; the character's
+                    // own lines resolve live so voice-map edits keep working.
+                    if (isForeignSpeaker(speaker, message)) {
+                        entry.voice = await castVoice(speaker, quotes);
+                    }
+                }
+                line.segments.push(entry);
+            }
+        }
+        lines.push(line);
     }
 
     // Keep the previous take so a regeneration you dislike can be undone.
@@ -207,7 +410,7 @@ async function generate(index, { quiet = true } = {}) {
     message.extra.breeze_direction = {
         swipe_id: message.swipe_id ?? 0,
         ts: Date.now(),
-        lines: units.map((unit, i) => ({ text: unit.text, instruction: instructions[i] })),
+        lines,
         history: history.slice(0, HISTORY_LIMIT),
     };
 
@@ -341,6 +544,115 @@ async function designVoice(name) {
     return voiceName;
 }
 
+// -------------------------------------------------------------------- casting
+// A speaker keeps one voice for a whole chat: re-picking per message would make
+// the same stranger sound like a different person every paragraph.
+
+const castJobs = new Map();
+
+function currentChatId() {
+    return ctx().getCurrentChatId?.() ?? 'chat';
+}
+
+function castMap() {
+    const config = settings();
+    config.cast = config.cast ?? {};
+    const id = currentChatId();
+    config.cast[id] = config.cast[id] ?? {};
+    return config.cast[id];
+}
+
+/** Keep the cast from accumulating every chat ever opened. */
+function pruneCast() {
+    const config = settings();
+    const chats = Object.keys(config.cast ?? {});
+    for (const stale of chats.slice(0, Math.max(0, chats.length - CAST_CHAT_LIMIT))) {
+        delete config.cast[stale];
+    }
+}
+
+/** Ask the director to choose one of the provider's existing voices. */
+async function pickVoice(speaker, quotes) {
+    const config = settings();
+    const breeze = globalThis.breezeTts;
+    const available = breeze?.listVoices() ?? [];
+    if (!config.profile || !available.length) return null;
+
+    const spoken = quotes
+        .filter(q => q.speaker === speaker)
+        .slice(0, 4)
+        .map(q => `- ${q.text}`)
+        .join('\n');
+
+    const prompt = put(
+        put(
+            put(config.voice_pick_prompt, /{{speaker}}/g, speaker),
+            /{{lines}}/g, spoken || '(none recorded)',
+        ),
+        /{{voices}}/g, available.map(name => `- ${name}`).join('\n'),
+    );
+
+    const result = await ctx().ConnectionManagerRequestService.sendRequest(config.profile, prompt, 60);
+    const answer = String(result?.content ?? '')
+        .replace(/<think>[\s\S]*?<\/think>/gi, '')
+        .trim()
+        .toLowerCase();
+    if (!answer) return null;
+
+    // The model may quote the name or wrap it in a sentence; match generously.
+    const exact = available.find(name => name.toLowerCase() === answer);
+    if (exact) return exact;
+    const loose = available.find(name => answer.includes(name.toLowerCase()));
+    if (loose) return loose;
+
+    console.warn(`[Breeze Director] "${answer}" is not one of the available voices.`);
+    return null;
+}
+
+/**
+ * The voice a foreign speaker should use. Manual voice-map entries win, then
+ * the chat's cast, then a voice designed from their card, then a pick from the
+ * existing voices. Never throws: the caller falls back to the default voice.
+ */
+async function castVoice(speaker, quotes = []) {
+    const breeze = globalThis.breezeTts;
+    if (!breeze?.available) return null;
+
+    // A hand-assigned voice always beats anything the director decides.
+    const mapped = breeze.voiceForCharacter(speaker);
+    if (mapped) return mapped;
+
+    const cast = castMap();
+    if (cast[speaker] && breeze.hasVoice(cast[speaker])) return cast[speaker];
+
+    if (castJobs.has(speaker)) return castJobs.get(speaker);
+
+    const pending = (async () => {
+        // A real character card deserves a voice written for it.
+        if (cardFor(speaker)) {
+            const designed = await designVoice(speaker);
+            if (designed) return designed;
+        }
+        return pickVoice(speaker, quotes);
+    })()
+        .then(voice => {
+            if (!voice) return null;
+            cast[speaker] = voice;
+            pruneCast();
+            ctx().saveSettingsDebounced();
+            console.info(`[Breeze Director] cast ${speaker} as "${voice}".`);
+            return voice;
+        })
+        .catch(error => {
+            console.warn('[Breeze Director] casting failed for', speaker, error);
+            return null;
+        })
+        .finally(() => castJobs.delete(speaker));
+
+    castJobs.set(speaker, pending);
+    return pending;
+}
+
 /** Ensure the character has a voice, designing one from their card if not. */
 async function ensureVoice(name) {
     const config = settings();
@@ -370,11 +682,13 @@ async function prefetchMessage(index) {
     const message = ctx().chat?.[index];
     if (!breeze?.available || !message) return;
 
-    const voice = breeze.voiceForCharacter(message.name);
-    if (!voice) return;
+    const direction = getDirection(message);
+    const units = buildUnits(message.mes);
 
-    for (const unit of buildUnits(message.mes)) {
-        await breeze.prefetch(unit.text, voice);
+    for (let i = 0; i < units.length; i++) {
+        for (const clip of clipsFor(message, direction?.lines?.[i] ?? units[i])) {
+            if (clip.voice) await breeze.prefetch(clip.text, clip.voice);
+        }
     }
 }
 
@@ -442,9 +756,9 @@ function clearPosition(messageId) {
 
 const player = {
     audio: new Audio(),
-    units: [],
-    index: 0,
-    voice: null,
+    units: [],        // paragraphs; each holds the clips it plays in order
+    index: 0,         // paragraph
+    clipIndex: 0,     // segment within the paragraph
     messageId: null,
     url: null,
     onChange: null,
@@ -457,29 +771,43 @@ const player = {
         const breeze = globalThis.breezeTts;
         if (!breeze?.available) throw new Error('Select the Breeze TTS provider first.');
 
-        const voice = breeze.voiceForCharacter(message.name);
-        if (!voice) throw new Error(`No Breeze voice assigned to ${message.name}.`);
+        if (!defaultVoice(message)) {
+            throw new Error(`No Breeze voice assigned to ${message.name}, and no narrator voice set.`);
+        }
 
         this.stop();
         this.messageId = messageId;
-        this.units = buildUnits(message.mes);
-        this.voice = voice;
+
+        // Paragraph-granular units keep resume keys and panel rows unchanged;
+        // the voice switching lives inside each unit's clip list.
+        const direction = getDirection(message);
+        this.units = buildUnits(message.mes).map((unit, i) => ({
+            text: unit.text,
+            clips: clipsFor(message, direction?.lines?.[i] ?? unit).filter(clip => clip.voice),
+        }));
+
         this.index = Math.min(loadPosition(messageId), Math.max(this.units.length - 1, 0));
+        this.clipIndex = 0;
         return this.units;
     },
 
-    async playAt(index) {
+    async playAt(index, clipIndex = 0) {
         if (index < 0 || index >= this.units.length) return this.stop();
 
+        const clips = this.units[index].clips;
+        if (clipIndex >= clips.length) return this.playAt(index + 1);
+
         this.index = index;
-        savePosition(this.messageId, index);
+        this.clipIndex = clipIndex;
+        // Resume is paragraph-granular: only record on entering one.
+        if (clipIndex === 0) savePosition(this.messageId, index);
         this.notify('loading');
 
         // Ignore results from any earlier play that is still resolving.
         const token = ++this.loadToken;
         let clip;
         try {
-            clip = await globalThis.breezeTts.getClip(this.units[index].text, this.voice);
+            clip = await globalThis.breezeTts.getClip(clips[clipIndex].text, clips[clipIndex].voice);
         } catch (error) {
             toastr.error(String(error?.message ?? error), 'Breeze Player');
             return this.notify('error');
@@ -493,9 +821,9 @@ const player = {
         await this.audio.play().catch(() => { });
         this.notify('playing');
 
-        // Warm the next clip while this one plays.
-        const next = this.units[index + 1];
-        if (next) globalThis.breezeTts.prefetch(next.text, this.voice);
+        // Warm whatever comes next: the rest of this paragraph, then the next.
+        const next = clips[clipIndex + 1] ?? this.units[index + 1]?.clips?.[0];
+        if (next) globalThis.breezeTts.prefetch(next.text, next.voice);
     },
 
     next() { return this.playAt(this.index + 1); },
@@ -503,7 +831,7 @@ const player = {
 
     toggle() {
         if (this.audio.paused) {
-            if (!this.audio.src) return this.playAt(this.index);
+            if (!this.audio.src) return this.playAt(this.index, this.clipIndex);
             this.audio.play().catch(() => { });
             this.notify('playing');
         } else {
@@ -514,6 +842,7 @@ const player = {
 
     stop() {
         this.loadToken++;
+        this.clipIndex = 0;
         this.audio.pause();
         this.audio.removeAttribute('src');
         this.revoke();
@@ -531,6 +860,13 @@ const player = {
 };
 
 player.audio.addEventListener('ended', () => {
+    // Mid-paragraph the reading always continues; autoplay only governs whether
+    // playback carries on across a paragraph break.
+    const clips = player.units[player.index]?.clips ?? [];
+    if (player.clipIndex + 1 < clips.length) {
+        return player.playAt(player.index, player.clipIndex + 1);
+    }
+
     if (!playerSettings().autoplay_next) return player.notify('paused');
     if (player.index + 1 < player.units.length) {
         player.playAt(player.index + 1);
@@ -580,6 +916,56 @@ function stamp(ts) {
     if (!ts) return 'earlier take';
     const date = new Date(ts);
     return `${date.toLocaleDateString()} ${date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}`;
+}
+
+/** Who reads each span of a paragraph, with a per-segment voice override. */
+function castRows(message, segments, editable) {
+    const box = document.createElement('div');
+    box.style.cssText = 'margin-top:0.35em;display:flex;flex-direction:column;gap:0.25em;';
+    const available = globalThis.breezeTts?.listVoices?.() ?? [];
+
+    for (const segment of segments) {
+        const line = document.createElement('div');
+        line.style.cssText = 'display:flex;gap:0.4em;align-items:center;'
+            + 'font-size:calc(var(--mainFontSize) * 0.9);';
+
+        const who = document.createElement('span');
+        who.style.cssText = 'opacity:0.7;flex:0 0 auto;';
+        who.textContent = segment.kind === 'dialogue' ? (segment.speaker || 'unattributed') : 'narration';
+
+        const text = document.createElement('span');
+        text.style.cssText = 'flex:1;min-width:0;opacity:0.55;'
+            + 'white-space:nowrap;overflow:hidden;text-overflow:ellipsis;';
+        text.textContent = segment.text;
+
+        const select = document.createElement('select');
+        select.className = 'text_pole';
+        select.style.cssText = 'flex:0 0 auto;width:auto;';
+
+        // "auto" spells out what would play, so an override is an informed choice.
+        const auto = document.createElement('option');
+        auto.value = '';
+        auto.textContent = `auto (${voiceForSegment({ ...segment, voice: null }, message) ?? 'none'})`;
+        select.append(auto);
+        for (const name of available) {
+            const option = document.createElement('option');
+            option.value = name;
+            option.textContent = name;
+            select.append(option);
+        }
+
+        select.value = segment.voice ?? '';
+        select.disabled = !editable;
+        select.addEventListener('change', async () => {
+            if (select.value) segment.voice = select.value;
+            else delete segment.voice;
+            await ctx().saveChat();
+        });
+
+        line.append(who, text, select);
+        box.append(line);
+    }
+    return box;
 }
 
 async function openPanel(messageId, { play = false, expandAll = false } = {}) {
@@ -713,6 +1099,9 @@ async function openPanel(messageId, { play = false, expandAll = false } = {}) {
                     await ctx().saveChat();
                 });
                 row.append(input);
+
+                const segments = lines[i]?.segments ?? [];
+                if (segments.length) row.append(castRows(message, segments, editable));
             }
 
             if (i === playingIndex) row.style.background = 'var(--white20a)';
@@ -819,8 +1208,21 @@ async function eraseClips(messageId) {
     const breeze = globalThis.breezeTts;
     if (!message || !breeze?.available) return;
 
-    const voice = breeze.voiceForCharacter(message.name);
-    if (!voice) return toastr.info(`No Breeze voice assigned to ${message.name}.`, 'Breeze');
+    // A message can now span several voices, and clips are keyed per voice.
+    const direction = getDirection(message);
+    const units = buildUnits(message.mes);
+    const byVoice = new Map();
+    units.forEach((unit, i) => {
+        for (const clip of clipsFor(message, direction?.lines?.[i] ?? unit)) {
+            if (!clip.voice) continue;
+            if (!byVoice.has(clip.voice)) byVoice.set(clip.voice, []);
+            byVoice.get(clip.voice).push(clip.text);
+        }
+    });
+
+    if (!byVoice.size) {
+        return toastr.info(`No Breeze voice assigned to ${message.name}.`, 'Breeze');
+    }
 
     // Older providers only offer an all-or-nothing clear; say so rather than
     // quietly wiping every other message's audio too.
@@ -837,8 +1239,14 @@ async function eraseClips(messageId) {
         return toastr.success(`Cleared ${before.count} clips (${size(before.bytes)}).`, 'Breeze');
     }
 
-    const texts = buildUnits(message.mes).map(unit => unit.text);
-    const { count, bytes } = await breeze.dropClips(texts, voice);
+    let count = 0;
+    let bytes = 0;
+    for (const [voice, texts] of byVoice) {
+        const dropped = await breeze.dropClips(texts, voice);
+        count += dropped.count;
+        bytes += dropped.bytes;
+    }
+
     toastr.success(
         count ? `Erased ${count} clips (${size(bytes)}) for this message.` : 'Nothing cached for this message.',
         'Breeze',
@@ -891,7 +1299,12 @@ const SETTINGS_HTML = `
       <label class="checkbox_label"><input id="bd_auto_user" type="checkbox"> …and on user messages</label>
       <label class="checkbox_label"><input id="bd_prefetch" type="checkbox"> Pre-generate audio after directing</label>
       <label class="checkbox_label"><input id="bd_auto_voice" type="checkbox"> Design a voice from the character card when one is missing</label>
+      <label class="checkbox_label"><input id="bd_cast" type="checkbox"> Give quoted speech its own voice per speaker</label>
       <small>Click the masks icon on any message to view, generate, or edit its direction.</small>
+      <small id="bd_paragraph_warn" style="color:var(--golden);display:block;"></small>
+
+      <label for="bd_narrator">Narrator voice (everything outside quotes):</label>
+      <select id="bd_narrator" class="text_pole"></select>
 
       <label for="bd_profile">Connection Profile:</label>
       <select id="bd_profile" class="text_pole"></select>
@@ -918,10 +1331,16 @@ const SETTINGS_HTML = `
       <code>{{message}}</code>, <code>{{char}}</code>, <code>{{user}}</code>):</label>
       <textarea id="bd_prompt" class="text_pole textarea_compact" rows="14"></textarea>
       <input id="bd_reset" class="menu_button" type="button" value="Reset prompt">
+      <small id="bd_prompt_warn" style="color:var(--golden);display:block;"></small>
 
       <label for="bd_voice_prompt">Voice design prompt (<code>{{char}}</code>, <code>{{description}}</code>):</label>
       <textarea id="bd_voice_prompt" class="text_pole textarea_compact" rows="10"></textarea>
       <input id="bd_voice_reset" class="menu_button" type="button" value="Reset voice prompt">
+
+      <label for="bd_voice_pick_prompt">Voice casting prompt (<code>{{speaker}}</code>,
+      <code>{{lines}}</code>, <code>{{voices}}</code>):</label>
+      <textarea id="bd_voice_pick_prompt" class="text_pole textarea_compact" rows="8"></textarea>
+      <input id="bd_voice_pick_reset" class="menu_button" type="button" value="Reset casting prompt">
 
       <hr>
       <b>Player</b>
@@ -956,16 +1375,54 @@ function bind() {
     checkbox('#bd_auto_user', 'auto_user');
     checkbox('#bd_prefetch', 'prefetch');
     checkbox('#bd_auto_voice', 'auto_voice');
+    checkbox('#bd_cast', 'cast_enabled');
     field('#bd_missing', 'on_missing');
     field('#bd_mode', 'mode');
     field('#bd_cfg', 'cfg_scale', Number);
     field('#bd_tokens', 'max_tokens', Number);
     field('#bd_prompt', 'prompt');
     field('#bd_voice_prompt', 'voice_prompt');
+    field('#bd_voice_pick_prompt', 'voice_pick_prompt');
+
+    // Two silent-failure modes worth naming: a saved prompt from before casting
+    // never returns speakers, and with ST's own paragraph narration off it hands
+    // the provider the whole message as one job.
+    const warn = () => {
+        $('#bd_prompt_warn').text(config.prompt.includes('{{quotes}}')
+            ? ''
+            : 'This saved prompt predates speaker casting — click "Reset prompt" to enable it.');
+        $('#bd_paragraph_warn').text(ctx().extensionSettings?.tts?.narrate_by_paragraphs
+            ? ''
+            : 'SillyTavern\'s "Narrate by paragraphs" is off, so its own narration reads '
+                + 'each message as a single job. The player here is unaffected.');
+    };
+    warn();
+    $('#bd_prompt').on('input', warn);
+
+    // Voices come from the provider's JSON, which the user can edit at any time.
+    const fillVoices = () => {
+        const available = globalThis.breezeTts?.listVoices?.() ?? [];
+        const select = $('#bd_narrator');
+        select.empty().append($('<option/>').val('').text('— the character\'s own voice —'));
+        for (const name of available) select.append($('<option/>').val(name).text(name));
+        select.val(available.includes(config.narrator_voice) ? config.narrator_voice : '');
+    };
+    fillVoices();
+    $('#bd_narrator').on('focus', fillVoices).on('change', function () {
+        config.narrator_voice = String($(this).val() ?? '');
+        save();
+    });
 
     $('#bd_reset').on('click', () => {
         config.prompt = DEFAULT_PROMPT;
         $('#bd_prompt').val(DEFAULT_PROMPT);
+        save();
+        warn();
+    });
+
+    $('#bd_voice_pick_reset').on('click', () => {
+        config.voice_pick_prompt = DEFAULT_VOICE_PICK_PROMPT;
+        $('#bd_voice_pick_prompt').val(DEFAULT_VOICE_PICK_PROMPT);
         save();
     });
     const playerConfig = playerSettings();
@@ -1056,6 +1513,7 @@ jQuery(async () => {
     eventSource.on(event_types.CHAT_CHANGED, () => {
         inFlight.clear();
         voiceJobs.clear();
+        castJobs.clear();
         player.stop();
         closeAllPanels();
         addButtons();
