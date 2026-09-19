@@ -341,12 +341,28 @@ mode. The voice-design prompt is the one place that *does* describe the voice.
   return speaker attribution, so `bind()` shows a warning under the prompt box
   until it is reset, and `generate()` logs when attribution was expected but
   came back empty.
-- **Reasoning models can still starve.** `generate()` floors the request at
-  `max(setting, 600 + 80 × paragraphs)` and reports an empty completion
-  separately from an unparseable one, both with the raw result logged. If empty
-  completions persist, the answer is a non-reasoning connection profile — the
-  task is a handful of one-line stage directions and thinking tokens buy little
+- **Every model call goes through `askModel()`.** Do not call
+  `ConnectionManagerRequestService.sendRequest` directly. A reasoning model
+  spends its budget thinking before it writes anything, so a request sized for
+  the answer comes back empty — and empty is silent. `askModel()` floors every
+  budget at the user's own `max_tokens`, never the caller's estimate of answer
+  length, and warns distinctly when a completion is empty.
+
+  This bug has now happened twice. It was fixed for the director call, then
+  reintroduced the moment identification, base-picking and voice design were
+  added with budgets of 400, 80 and 200 tokens. The base pick at 80 could never
+  have answered. A scenario in `tools/check.js` records the budget of every call
+  `generate()` makes and fails if any is below `max_tokens`.
+
+  If empty completions persist even so, the answer is a non-reasoning connection
+  profile: the work is short structured replies, and thinking tokens buy little
   at roughly 4× the cost per call.
+
+- **Parse model JSON with `extractJson()`**, never by slicing first `{` to last
+  `}`. Reasoning models muse in prose containing braces before emitting their
+  JSON, which defeats the naive slice. `extractJson()` scans for the first
+  balanced, string-aware, actually-parsing object. Quote ids likewise come back
+  as `Q1`, `q1` or bare `1`; `normalizeQuoteId()` settles them.
 - **Erasing a message's audio needs provider v2.** `eraseClips()` calls
   `breezeTts.dropClips(texts, voice)`, which resolves clips through the
   IndexedDB `voiceText` index added in the provider's DB version 2. Clips cached

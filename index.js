@@ -320,6 +320,72 @@ function hasDirection(index) {
 
 // ---------------------------------------------------------------- generation
 
+/**
+ * Every model call goes through here.
+ *
+ * A reasoning model spends its budget thinking before it writes anything, so a
+ * request sized for the answer alone comes back empty — this extension's
+ * original bug, and it recurred the moment auxiliary calls were added with
+ * budgets of 80 and 200 tokens. The floor is therefore the user's own
+ * max_tokens, never the caller's estimate of how long the answer is.
+ */
+async function askModel(label, prompt, minTokens) {
+    const config = settings();
+    const budget = Math.max(Number(config.max_tokens) || 0, minTokens);
+
+    const result = await ctx().ConnectionManagerRequestService.sendRequest(
+        config.profile, prompt, budget,
+    );
+
+    const text = String(result?.content ?? '')
+        .replace(/<think>[\s\S]*?<\/think>/gi, '')
+        .replace(/```(?:json)?/gi, '')
+        .trim();
+
+    if (!text) {
+        console.warn(`[Breeze Director] ${label}: empty completion at budget ${budget}. `
+            + 'A reasoning model may have spent it all thinking — raise Max response '
+            + 'tokens, or use a non-reasoning connection profile.', result);
+    }
+    return text;
+}
+
+/**
+ * The first balanced {...} that parses. Scanning rather than taking the first
+ * brace to the last matters for reasoning models, which like to muse in prose
+ * containing braces before emitting the JSON.
+ */
+function extractJson(text) {
+    for (let start = text.indexOf('{'); start !== -1; start = text.indexOf('{', start + 1)) {
+        let depth = 0;
+        let inString = false;
+        let escaped = false;
+
+        for (let i = start; i < text.length; i++) {
+            const ch = text[i];
+            if (escaped) { escaped = false; continue; }
+            if (ch === '\\') { escaped = true; continue; }
+            if (ch === '"') { inString = !inString; continue; }
+            if (inString) continue;
+            if (ch === '{') depth++;
+            else if (ch === '}' && --depth === 0) {
+                try {
+                    return JSON.parse(text.slice(start, i + 1));
+                } catch { /* not this one; try the next opening brace */ }
+                break;
+            }
+        }
+    }
+    return null;
+}
+
+/** Quote ids come back as Q1, q1 or plain 1 depending on the model's mood. */
+function normalizeQuoteId(id) {
+    const text = String(id ?? '').trim().toUpperCase();
+    const digits = text.match(/^Q?(\d+)$/);
+    return digits ? `Q${digits[1]}` : text;
+}
+
 /** Substitute without letting $& and friends in chat text be interpreted. */
 function put(template, token, value) {
     return template.replace(token, () => value);
@@ -418,26 +484,13 @@ async function generate(index, { quiet = true } = {}) {
         ? await identifySpeakers(message, units, quotes)
         : { speakers: {}, profiles: {} };
 
-    // A reasoning model can spend the whole budget thinking and return nothing,
-    // so floor the request at enough room to think and still write every line.
-    const budget = Math.max(Number(config.max_tokens) || 0, 600 + 80 * units.length);
-
-    const result = await context.ConnectionManagerRequestService.sendRequest(
-        config.profile,
-        buildPrompt(message, units),
-        budget,
-    );
-
-    // Empty and unparseable are different failures: one wants a bigger budget
-    // or a non-reasoning profile, the other wants a different prompt.
-    if (!String(result?.content ?? '').trim()) {
-        console.warn('[Breeze Director] empty completion — the model likely spent the '
-            + `budget (${budget}) on reasoning. Raw result:`, result);
+    const completion = await askModel('direction', buildPrompt(message, units), 600 + 80 * units.length);
+    if (!completion) {
         if (!quiet) toastr.error('Model returned an empty completion.', 'Breeze Director');
         return null;
     }
 
-    const parsed = parseDirection(result?.content, units.length);
+    const parsed = parseDirection(completion, units.length);
     if (!parsed) {
         console.warn('[Breeze Director] could not parse a completion:', result?.content);
         if (!quiet) toastr.error('Model returned nothing usable.', 'Breeze Director');
@@ -615,13 +668,8 @@ async function designVoice(name) {
         .replace(/{{description}}/g, description)
         .replace(/{{user}}/g, String(context.name1 ?? ''));
 
-    const result = await context.ConnectionManagerRequestService.sendRequest(
-        config.profile, prompt, 200,
-    );
-
-    let line = String(result?.content ?? '')
-        .replace(/<think>[\s\S]*?<\/think>/gi, '')
-        .split('\n').map(l => l.trim()).filter(Boolean)[0] ?? '';
+    const text = await askModel('voice design', prompt, 300);
+    let line = text.split('\n').map(l => l.trim()).filter(Boolean)[0] ?? '';
     line = line.replace(/^["'`]|["'`]$/g, '').trim();
     if (!line) return null;
 
@@ -725,39 +773,28 @@ async function askIdentify(message, units, from, to, quotes, known) {
     prompt = put(prompt, /{{char}}/g, String(message?.name ?? context.name2 ?? ''));
     prompt = put(prompt, /{{user}}/g, String(context.name1 ?? ''));
 
-    const budget = 400 + 120 * quotes.length;
-    const result = await context.ConnectionManagerRequestService.sendRequest(
-        config.profile, prompt, budget,
-    );
+    const text = await askModel('identification', prompt, 400 + 120 * quotes.length);
+    if (!text) return null;
 
-    const text = String(result?.content ?? '')
-        .replace(/<think>[\s\S]*?<\/think>/gi, '')
-        .replace(/```(?:json)?/gi, '')
-        .trim();
-
-    const start = text.indexOf('{');
-    const end = text.lastIndexOf('}');
-    if (start === -1 || end <= start) {
-        console.warn('[Breeze Director] identification returned nothing usable:', text || result);
+    const parsed = extractJson(text);
+    if (!parsed) {
+        console.warn('[Breeze Director] identification returned no usable JSON:', text);
         return null;
     }
 
-    try {
-        const parsed = JSON.parse(text.slice(start, end + 1));
-        const speakers = {};
-        for (const [id, name] of Object.entries(parsed?.speakers ?? {})) {
-            speakers[String(id).trim().toUpperCase()] = String(name ?? '').trim();
-        }
-        const profiles = {};
-        for (const [name, raw] of Object.entries(parsed?.profiles ?? {})) {
-            const profile = cleanProfile(raw);
-            if (profile) profiles[String(name).trim()] = profile;
-        }
-        return { speakers, profiles };
-    } catch (error) {
-        console.warn('[Breeze Director] could not parse identification:', text, error);
-        return null;
+    const speakers = {};
+    for (const [id, name] of Object.entries(parsed?.speakers ?? {})) {
+        speakers[normalizeQuoteId(id)] = String(name ?? '').trim();
     }
+    const profiles = {};
+    for (const [name, raw] of Object.entries(parsed?.profiles ?? {})) {
+        const profile = cleanProfile(raw);
+        if (profile) profiles[String(name).trim()] = profile;
+    }
+
+    console.info(`[Breeze Director] identified ${Object.keys(speakers).length}`
+        + ` of ${quotes.length} quotes.`);
+    return { speakers, profiles };
 }
 
 /**
@@ -910,11 +947,7 @@ async function askCasting(speaker, quotes, profile) {
     prompt = put(prompt, /{{voices}}/g, available.map(name => `- ${name}`).join('\n'));
     prompt = put(prompt, /{{cast}}/g, roster ? put(CAST_BLOCK, /{{list}}/g, roster) : '');
 
-    const result = await ctx().ConnectionManagerRequestService.sendRequest(config.profile, prompt, 80);
-    const answer = String(result?.content ?? '')
-        .replace(/<think>[\s\S]*?<\/think>/gi, '')
-        .trim()
-        .toLowerCase();
+    const answer = (await askModel('base voice', prompt, 120)).toLowerCase();
     if (!answer) return null;
 
     // The model may quote the name or wrap it in a sentence; match generously.

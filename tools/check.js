@@ -120,10 +120,12 @@ const api = new Function(source + `;return {
     splitSegments, collectQuotes, isForeignSpeaker, parseDirection,
     normalize, pickLine, castEntry, hash, syncPrompts,
     voiceInstruction, cleanProfile, profileFor, PROFILE_FIELDS,
+    extractJson, normalizeQuoteId,
     DEFAULT_PROMPT, DEFAULT_VOICE_CAST_PROMPT };`)();
 const { splitSegments, collectQuotes, isForeignSpeaker, parseDirection,
         normalize, pickLine, castEntry, hash, syncPrompts,
-        voiceInstruction, cleanProfile, profileFor } = api;
+        voiceInstruction, cleanProfile, profileFor,
+        extractJson, normalizeQuoteId } = api;
 
 
 print('splitSegments');
@@ -180,6 +182,22 @@ eq('drops unknown', cleanProfile({ gender: 'unknown', tone: 'Soft.' }), { tone: 
 eq('drops unlisted keys', cleanProfile({ tone: 'Soft.', mood: 'angry' }), { tone: 'Soft.' });
 eq('all empty is null', cleanProfile({ gender: '', age: '  ' }), null);
 eq('missing is null', cleanProfile(undefined), null);
+
+print('extractJson');
+eq('plain object', extractJson('{"a":1}'), { a: 1 });
+eq('skips prose braces before the json',
+   extractJson('Let me think {this is not json} then: {"a":1}'), { a: 1 });
+eq('ignores braces inside strings', extractJson('{"a":"} not the end {","b":2}'), { a: '} not the end {', b: 2 });
+eq('handles nesting', extractJson('{"a":{"b":2}}'), { a: { b: 2 } });
+eq('no json at all', extractJson('nothing here'), null);
+eq('unbalanced', extractJson('{"a":1'), null);
+
+print('normalizeQuoteId');
+eq('already canonical', normalizeQuoteId('Q1'), 'Q1');
+eq('lowercase', normalizeQuoteId('q2'), 'Q2');
+eq('bare number', normalizeQuoteId('3'), 'Q3');
+eq('padded', normalizeQuoteId(' q4 '), 'Q4');
+eq('non-numeric left alone', normalizeQuoteId('Alice'), 'ALICE');
 
 print('profileFor');
 eq('exact key', profileFor({ Bob: { tone: 'a' } }, 'Bob'), { tone: 'a' });
@@ -258,6 +276,13 @@ function runCastScenarios() {
                        profiles: { Bob: { gender: 'male', tone: 'Gruff.' } } } },
          { cast: ['Bob'], added: [], tone: 'Mine.', voice: 'villain' }],
 
+        ['survives a reasoning preamble and odd quote ids',
+         { map: { Alice: 'narrator' }, casting: 'villain',
+           raw: 'Hmm {let me see}. Here:\n{"speakers":{"1":"Alice","q2":"Bob"},'
+                + '"profiles":{"Bob":{"gender":"male","tone":"Gruff."}}}',
+           identify: null },
+         { cast: ['Bob'], added: ['bob'] }],
+
         ['unattributed quotes are ignored',
          { map: { Alice: 'narrator' }, casting: 'villain',
            identify: { speakers: { Q1: 'Alice', Q2: 'unknown' }, profiles: {} } },
@@ -270,10 +295,12 @@ function runCastScenarios() {
     // running them concurrently has each one generating against another's model.
     return scenarios.reduce((chain, [label, setup, want]) => chain.then(async () => {
         const added = new Map();
+        const budgets = [];
         context.chat = [{ name: 'Alice', swipe_id: 0, extra: {}, mes: MES }];
-        context.ConnectionManagerRequestService.sendRequest = async (profile, prompt) => {
+        context.ConnectionManagerRequestService.sendRequest = async (profile, prompt, maxTokens) => {
+            budgets.push([prompt.split('\n')[0].slice(0, 20), maxTokens]);
             if (prompt.includes('who speaks each line')) {
-                return { content: JSON.stringify(setup.identify) };
+                return { content: setup.raw ?? JSON.stringify(setup.identify) };
             }
             if (prompt.includes('Choose which existing voice')) return { content: setup.casting };
             return { content: JSON.stringify(['Weary.', 'Flat and final.']) };
@@ -304,6 +331,10 @@ function runCastScenarios() {
             eq(label + ' — voices added', [...added.keys()], want.added);
             if (want.tone) eq(label + ' — profile kept', cast.Bob?.tone, want.tone);
             if (want.voice) eq(label + ' — voice kept', cast.Bob?.voice, want.voice);
+            // The original bug: auxiliary calls sized for the answer, not for a
+            // reasoning model's thinking, came back empty and failed silently.
+            const starved = budgets.filter(([, max]) => max < config.max_tokens);
+            eq(label + ' — every call clears max_tokens', starved, []);
         } catch (error) {
             fails++;
             print('  FAIL ' + label + ' threw: ' + error);
