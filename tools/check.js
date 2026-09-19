@@ -293,14 +293,28 @@ function runAssertions() {
 const api = new Function(source + `;return {
     splitSegments, collectQuotes, isForeignSpeaker, parseDirection,
     normalize, pickLine, castEntry, hash, syncPrompts,
-    voiceInstruction, cleanProfile, PROFILE_FIELDS,
+    voiceInstruction, cleanProfile, PROFILE_FIELDS, splitLines, buildUnits,
     extractJson, normalizeQuoteId,
     DEFAULT_PROMPT, DEFAULT_VOICE_CAST_PROMPT };`)();
 const { splitSegments, collectQuotes, isForeignSpeaker, parseDirection,
         normalize, pickLine, castEntry, hash, syncPrompts,
-        voiceInstruction, cleanProfile,
+        voiceInstruction, cleanProfile, splitLines, buildUnits,
         extractJson, normalizeQuoteId } = api;
 
+
+print('splitLines');
+eq('plain paragraphs', splitLines('one\ntwo'), ['one', 'two']);
+eq('blank line between paragraphs', splitLines('one\n\ntwo'), ['one', 'two']);
+eq('CRLF paragraph break', splitLines('one\r\n\r\ntwo'), ['one', 'two']);
+eq('trailing CR is trimmed off', splitLines('one\r\ntwo'), ['one', 'two']);
+eq('whitespace-only line', splitLines('one\n   \ntwo'), ['one', 'two']);
+eq('tab-only line', splitLines('one\n\t\ntwo'), ['one', 'two']);
+eq('zero-width-only line', splitLines('one\n\u200B\ntwo'), ['one', 'two']);
+eq('byte-order mark line', splitLines('one\n\uFEFF\ntwo'), ['one', 'two']);
+eq('inner spacing survives', splitLines('a  b'), ['a  b']);
+eq('nothing at all', splitLines(''), []);
+eq('only blanks', splitLines('\r\n \n\t'), []);
+eq('units skip the blanks', buildUnits('one\r\n\r\ntwo').length, 2);
 
 print('splitSegments');
 eq('plain prose', splitSegments('He turned away.'), [{ text: 'He turned away.', kind: 'narration' }]);

@@ -110,9 +110,19 @@ await globalThis.breezeTts.cacheStats()
 
 Two levels of splitting, and the distinction is load-bearing:
 
-- `buildUnits()` splits a message by `\n`, dropping empty lines — **exactly**
-  what SillyTavern's TTS extension does when it builds narration jobs. This is
-  the unit of *direction*, of panel rows, and of resume positions.
+- `buildUnits()` splits a message by `\n`, dropping lines that **look** empty.
+  This is the unit of *direction*, of panel rows, and of resume positions.
+
+  ST itself drops only lines of length zero. That is not enough: a message with
+  CRLF endings splits into lines still carrying their `\r`, so every paragraph
+  break becomes a one-character line that survives the test and shows up as a
+  blank paragraph — a panel row, a unit to direct, a clip of nothing to
+  generate. Lines of spaces or of zero-width characters do the same, so
+  `splitLines()` trims both before deciding.
+
+  This makes our paragraph numbering diverge from ST's line numbering, which
+  costs nothing: the player addresses paragraphs through an explicit hint, and
+  ST's own path finds them by matching text.
 - `splitSegments()` splits one paragraph into quoted and unquoted spans, so each
   can take its own voice. It follows ST's `parseMessageSegments`
   (`tts/index.js:537`) — delimiters stripped, pieces trimmed, empties dropped —

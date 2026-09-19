@@ -747,9 +747,30 @@ function playerSettings() {
     return fill(ctx().extensionSettings, PLAYER_MODULE, PLAYER_DEFAULTS);
 }
 
-/** Exactly how the TTS extension splits a message into narration jobs. */
+// Whitespace plus the zero-width characters that occupy a line while showing
+// nothing: zero-width space/non-joiner/joiner and the byte-order mark.
+const BLANK = /[\s\u200B-\u200D\uFEFF]/;
+const BLANK_EDGES = new RegExp(`^${BLANK.source}+|${BLANK.source}+$`, 'g');
+
+/**
+ * How the TTS extension splits a message into narration jobs, with one
+ * deliberate difference: a line that *looks* empty is treated as empty.
+ *
+ * ST drops only lines of length zero. A message with CRLF endings splits on
+ * "\n" into lines still carrying their "\r", so every paragraph break becomes a
+ * one-character line that survives that test and renders as a blank paragraph —
+ * a row in the panel, a unit to direct, and a clip of nothing to generate.
+ * Lines of spaces and of zero-width characters do the same.
+ *
+ * Skipping them makes our paragraph numbering diverge from ST's line numbering,
+ * which costs nothing: the player addresses paragraphs through an explicit hint,
+ * and ST's own path finds them by matching text.
+ */
 function splitLines(mes) {
-    return String(mes ?? '').split('\n').filter(line => line.length > 0);
+    return String(mes ?? '')
+        .split('\n')
+        .map(line => line.replace(BLANK_EDGES, ''))
+        .filter(Boolean);
 }
 
 /** A narration unit is one paragraph: exactly how TTS splits jobs by line. */
