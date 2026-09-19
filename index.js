@@ -1,16 +1,592 @@
-// SillyTavern/data/narpas/extensions/breeze-director/index.js
+// SillyTavern extension: Breeze TTS, Director & Player.
 //
-// Breeze Director & Player. Two halves of one extension:
-//   Director - LLM-written per-paragraph delivery instructions, voice design
-//              from character cards, and audio pre-generation.
-//   Player   - paragraph-by-paragraph playback with seek and resume.
-// Both share the narration-unit splitting below, which mirrors the TTS
-// extension's own, so one unit here is exactly one generated clip.
+// One extension, three halves that were once three folders:
 //
-// Settings live under two keys, breeze_director and breeze_player, so configs
-// saved when these were separate extensions carry over unchanged.
+//   Provider — registers "Breeze" in the TTS provider dropdown, wraps its raw
+//              PCM in WAV, caches clips in IndexedDB, and publishes
+//              globalThis.breezeTts.
+//   Director — an LLM call per message writes per-paragraph delivery direction,
+//              another works out who speaks each quote, and each speaker is
+//              cast a voice of their own.
+//   Player   — an inline panel per message: paragraph seek, resume, take
+//              history, per-segment voice overrides.
 //
-// Requires: ../breeze-tts/index.js  (the provider, registers globalThis.breezeTts)
+// The two halves still talk through globalThis.breezeTts and
+// globalThis.breezeDirector rather than calling each other directly. That
+// boundary is worth keeping: the provider must work with no director present,
+// and the director must tolerate a provider that is absent or older.
+//
+// They were separate extensions until they drifted apart once too often — a
+// director deployed against a months-old provider fails silently, because an
+// exception inside casting is indistinguishable from the model declining.
+// Shipping them together removes that failure mode entirely.
+//
+// The provider's voices are the user's to curate, in its own settings box.
+// Nothing here writes one: a cast member is one of those voices as a base, plus
+// a description, composed into an instruction when a line is generated.
+import { registerTtsProvider, getPreviewString, saveTtsProviderSettings } from '../../tts/index.js';
+
+// Shared by both halves. Pure formatting, no concern of either.
+
+/** Bytes as MB or KB, whichever reads better. */
+function size(bytes) {
+    return bytes > 1048576 ? `${(bytes / 1048576).toFixed(1)} MB` : `${Math.round(bytes / 1024)} KB`;
+}
+
+// ===========================================================================
+// PROVIDER
+// ===========================================================================
+
+
+const SAMPLE_RATE = 24000; // Breeze streams mono s16le at 24 kHz
+const BYTES_PER_SAMPLE = 2;
+const DEFAULT_VOICE_MARKER = '[Default Voice]';
+
+const DEFAULT_VOICES = {
+    'narrator': {
+        instruction: 'A calm, warm narrator with clear diction and unhurried pacing.',
+        cfg_scale: 4,
+    },
+    'villain': {
+        instruction: 'A gravelly older man, menacing and slow, with a hint of amusement.',
+        cfg_scale: 4,
+    },
+};
+
+/** Wrap raw PCM bytes in a 44-byte WAV header so the browser can play them. */
+function toWav(pcm) {
+    const length = pcm.size ?? pcm.byteLength;
+    const header = new ArrayBuffer(44);
+    const view = new DataView(header);
+    const str = (offset, text) => {
+        for (let i = 0; i < text.length; i++) view.setUint8(offset + i, text.charCodeAt(i));
+    };
+    const byteRate = SAMPLE_RATE * BYTES_PER_SAMPLE;
+
+    str(0, 'RIFF');
+    view.setUint32(4, 36 + length, true);
+    str(8, 'WAVE');
+    str(12, 'fmt ');
+    view.setUint32(16, 16, true);
+    view.setUint16(20, 1, true);            // PCM
+    view.setUint16(22, 1, true);            // mono
+    view.setUint32(24, SAMPLE_RATE, true);
+    view.setUint32(28, byteRate, true);
+    view.setUint16(32, BYTES_PER_SAMPLE, true);
+    view.setUint16(34, 16, true);
+    str(36, 'data');
+    view.setUint32(40, length, true);
+
+    return new Blob([header, pcm], { type: 'audio/wav' });
+}
+
+// ------------------------------------------------------------------ clip cache
+// IndexedDB rather than the chat file: audio is far too big to ride along in
+// chat JSON, and this survives reloads without bloating exports.
+
+const DB_NAME = 'breeze-tts';
+const STORE = 'clips';
+const DB_VERSION = 2; // v2 adds the voiceText index
+let dbPromise = null;
+
+function db() {
+    if (!dbPromise) {
+        dbPromise = new Promise((resolve, reject) => {
+            const request = indexedDB.open(DB_NAME, DB_VERSION);
+            request.onupgradeneeded = () => {
+                const database = request.result;
+                const store = database.objectStoreNames.contains(STORE)
+                    ? request.transaction.objectStore(STORE)
+                    : database.createObjectStore(STORE, { keyPath: 'key' });
+                if (!store.indexNames.contains('ts')) store.createIndex('ts', 'ts');
+                // The primary key folds in the instruction, so erasing the audio
+                // for one message needs a second way in. Rows written before v2
+                // carry no voice/text, stay out of this index, and age out via LRU.
+                if (!store.indexNames.contains('voiceText')) {
+                    store.createIndex('voiceText', ['voice', 'text']);
+                }
+            };
+            request.onsuccess = () => resolve(request.result);
+            request.onerror = () => reject(request.error);
+        });
+    }
+    return dbPromise;
+}
+
+function tx(mode, run) {
+    return db().then(database => new Promise((resolve, reject) => {
+        const transaction = database.transaction(STORE, mode);
+        const request = run(transaction.objectStore(STORE));
+        transaction.onerror = () => reject(transaction.error);
+        if (request) {
+            request.onsuccess = () => resolve(request.result);
+            request.onerror = () => reject(request.error);
+        } else {
+            transaction.oncomplete = () => resolve();
+        }
+    }));
+}
+
+const cache = {
+    async get(key) {
+        try {
+            const row = await tx('readonly', store => store.get(key));
+            if (!row) return null;
+            // Refresh recency without blocking the caller.
+            tx('readwrite', store => store.put({ ...row, ts: Date.now() })).catch(() => { });
+            return row.blob;
+        } catch (error) {
+            console.warn('[Breeze] cache read failed:', error);
+            return null;
+        }
+    },
+    async put(key, blob, limit, meta = {}) {
+        try {
+            await tx('readwrite', store => store.put({
+                key, blob, ts: Date.now(), voice: meta.voice ?? '', text: meta.text ?? '',
+            }));
+            await cache.evict(limit);
+        } catch (error) {
+            console.warn('[Breeze] cache write failed:', error);
+        }
+    },
+    async evict(limit) {
+        const total = await cache.count();
+        if (total <= limit) return;
+        const excess = total - limit;
+        await tx('readwrite', store => {
+            let removed = 0;
+            const cursorRequest = store.index('ts').openCursor();
+            cursorRequest.onsuccess = () => {
+                const cursor = cursorRequest.result;
+                if (!cursor || removed >= excess) return;
+                cursor.delete();
+                removed++;
+                cursor.continue();
+            };
+            return null;
+        });
+    },
+    count() {
+        return tx('readonly', store => store.count()).catch(() => 0);
+    },
+    /** Clip count and total bytes on disk. */
+    async stats() {
+        try {
+            const database = await db();
+            return await new Promise((resolve, reject) => {
+                const transaction = database.transaction(STORE, 'readonly');
+                const request = transaction.objectStore(STORE).openCursor();
+                let count = 0;
+                let bytes = 0;
+                request.onsuccess = () => {
+                    const cursor = request.result;
+                    if (!cursor) return resolve({ count, bytes });
+                    count++;
+                    bytes += cursor.value?.blob?.size ?? 0;
+                    cursor.continue();
+                };
+                request.onerror = () => reject(request.error);
+            });
+        } catch {
+            return { count: 0, bytes: 0 };
+        }
+    },
+    /** Delete every cached clip for these lines in this voice, whatever the instruction. */
+    async dropMany(voice, texts) {
+        let count = 0;
+        let bytes = 0;
+        try {
+            const database = await db();
+            await new Promise((resolve, reject) => {
+                const transaction = database.transaction(STORE, 'readwrite');
+                const index = transaction.objectStore(STORE).index('voiceText');
+                transaction.oncomplete = () => resolve();
+                transaction.onerror = () => reject(transaction.error);
+
+                for (const text of new Set(texts)) {
+                    const cursorRequest = index.openCursor(IDBKeyRange.only([voice, text]));
+                    cursorRequest.onsuccess = () => {
+                        const cursor = cursorRequest.result;
+                        if (!cursor) return;
+                        count++;
+                        bytes += cursor.value?.blob?.size ?? 0;
+                        cursor.delete();
+                        cursor.continue();
+                    };
+                }
+            });
+        } catch (error) {
+            console.warn('[Breeze] cache drop failed:', error);
+        }
+        return { count, bytes };
+    },
+    clear() {
+        return tx('readwrite', store => store.clear());
+    },
+};
+
+// ------------------------------------------------------------------ public API
+// Declared before the provider class: registerTtsProvider() constructs and loads
+// the provider during the register call, so anything bound afterwards is too late.
+
+globalThis.breezeTts = {
+    _provider: null,
+    _bind(provider) { this._provider = provider; },
+    get available() { return !!this._provider; },
+    listVoices() { return this._provider?.listVoices() ?? []; },
+    hasVoice(name) { return this._provider?.hasVoice(name) ?? false; },
+    voiceForCharacter(character) { return this._provider?.voiceForCharacter(character) ?? null; },
+    prefetch(text, voice, hint) { return this._provider?.prefetch(text, voice, hint) ?? Promise.resolve(false); },
+    getClip(text, voice, hint) { return this._provider?._clip(text, voice, hint); },
+    cacheStats() { return cache.stats(); },
+    /** Play a base voice under an instruction that is not stored anywhere. */
+    previewWith(voice, instruction, cfgScale) {
+        return this._provider?.previewTtsVoice(voice, { instruction, cfg_scale: cfgScale });
+    },
+    /** A copy of a voice's raw preset, for deriving another voice from it. */
+    voicePreset(name) {
+        const preset = this._provider?.voicePreset(name);
+        return preset ? { ...preset } : null;
+    },
+    dropClips(texts, voice) { return cache.dropMany(voice, texts); },
+    clearCache() { return cache.clear(); },
+};
+
+// ------------------------------------------------------------------- provider
+
+class BreezeTtsProvider {
+    constructor() {
+        globalThis.breezeTts._bind(this);
+    }
+
+    settings;
+    voices = [];
+    ready = false;
+    separator = ' . ';
+    audioElement = document.createElement('audio');
+    _pending = new Map();
+
+    defaultSettings = {
+        voiceMap: {},
+        provider_endpoint: 'http://127.0.0.1:7860',
+        voices_json: JSON.stringify(DEFAULT_VOICES, null, 2),
+        chunk_ms: 0,
+        seed: 42,
+        cache_enabled: true,
+        cache_max: 500,
+    };
+
+    get settingsHtml() {
+        return `
+        <label for="breeze_endpoint">Breeze API Endpoint:</label>
+        <input id="breeze_endpoint" type="text" class="text_pole"/>
+
+        <label for="breeze_seed">Seed:</label>
+        <input id="breeze_seed" type="number" class="text_pole"/>
+
+        <label for="breeze_chunk">Stream chunk size (ms, 0 = wait for full clip):</label>
+        <input id="breeze_chunk" type="number" min="0" step="100" class="text_pole"/>
+        <small>Streaming disables the clip cache and can sound seamed. 0 is recommended.</small>
+
+        <label class="checkbox_label">
+            <input id="breeze_cache" type="checkbox"> Cache generated clips
+        </label>
+        <label for="breeze_cache_max">Max cached clips:</label>
+        <input id="breeze_cache_max" type="number" min="0" step="50" class="text_pole"/>
+        <div class="flex-container">
+            <input id="breeze_cache_clear" class="menu_button" type="button" value="Clear cache"/>
+            <span id="breeze_cache_count" class="flex1"></span>
+        </div>
+
+        <label for="breeze_voices">Voices (JSON):</label>
+        <small>Each key is a voice name. Fields: <code>instruction</code>, <code>cfg_scale</code>,
+        <code>ref_audio_url</code>, <code>ref_text</code>, <code>dynamic</code>.</small>
+        <textarea id="breeze_voices" class="text_pole textarea_compact" rows="14"></textarea>
+        <div id="breeze_status"></div>`;
+    }
+
+    async loadSettings(settings) {
+        this.settings = Object.assign({}, this.defaultSettings);
+        for (const key in settings) {
+            if (key in this.settings) this.settings[key] = settings[key];
+        }
+
+        $('#breeze_endpoint').val(this.settings.provider_endpoint).on('input', () => this.onSettingsChange());
+        $('#breeze_seed').val(this.settings.seed).on('input', () => this.onSettingsChange());
+        $('#breeze_chunk').val(this.settings.chunk_ms).on('input', () => this.onSettingsChange());
+        $('#breeze_cache').prop('checked', this.settings.cache_enabled).on('change', () => this.onSettingsChange());
+        $('#breeze_cache_max').val(this.settings.cache_max).on('input', () => this.onSettingsChange());
+        $('#breeze_voices').val(this.settings.voices_json).on('input', () => this.onSettingsChange());
+        $('#breeze_cache_clear').on('click', async () => {
+            await cache.clear();
+            this.refreshCacheCount();
+            toastr.success('Clip cache cleared.', 'Breeze');
+        });
+
+        this.refreshCacheCount();
+        await this.checkReady();
+    }
+
+    onSettingsChange() {
+        this.settings.provider_endpoint = String($('#breeze_endpoint').val()).replace(/\/+$/, '');
+        this.settings.seed = Number($('#breeze_seed').val());
+        this.settings.chunk_ms = Number($('#breeze_chunk').val());
+        this.settings.cache_enabled = !!$('#breeze_cache').prop('checked');
+        this.settings.cache_max = Number($('#breeze_cache_max').val());
+        this.settings.voices_json = String($('#breeze_voices').val());
+        this.voices = [];
+        saveTtsProviderSettings();
+    }
+
+    async refreshCacheCount() {
+        const { count, bytes } = await cache.stats();
+        $('#breeze_cache_count').text(count ? `${count} clips — ${size(bytes)}` : 'cache empty');
+    }
+
+    dispose() { }
+
+    _presets() {
+        try {
+            return JSON.parse(this.settings.voices_json);
+        } catch (error) {
+            toastr.error('Voices JSON is not valid.', 'Breeze TTS');
+            throw error;
+        }
+    }
+
+    async checkReady() {
+        try {
+            const response = await fetch(`${this.settings.provider_endpoint}/health`);
+            const data = await response.json();
+            this.ready = data.status === 'ok';
+            $('#breeze_status').text(this.ready ? 'Ready' : `Status: ${data.status}`);
+        } catch {
+            this.ready = false;
+            $('#breeze_status').text('Offline — is the Breeze API running, and is CORS enabled?');
+        }
+        this.voices = await this.fetchTtsVoiceObjects();
+    }
+
+    async onRefreshClick() {
+        await this.checkReady();
+        await this.refreshCacheCount();
+    }
+
+    async fetchTtsVoiceObjects() {
+        return Object.keys(this._presets()).map(name => ({ name, voice_id: name, lang: 'en-US' }));
+    }
+
+    async getVoice(voiceName) {
+        if (!this.voices.length) this.voices = await this.fetchTtsVoiceObjects();
+        const match = this.voices.find(v => v.name === voiceName);
+        if (!match) throw `TTS Voice name ${voiceName} not found`;
+        return match;
+    }
+
+    /**
+     * Settle the instruction for this line, consulting the director if present.
+     * `hint` names the message and paragraph the text came from. Callers that
+     * know it should pass it: without one the director has to find the line by
+     * matching text, which a short quoted fragment can defeat.
+     */
+    async _plan(text, voiceId, hint) {
+        const preset = this._presets()[voiceId];
+        if (!preset) throw `Unknown Breeze voice: ${voiceId}`;
+
+        let instruction = preset.instruction ?? '';
+        let cfgScale = preset.cfg_scale ?? 1;
+
+        // An explicit instruction settles it: the cast sheet previewing a voice
+        // it has composed, with no message to direct from.
+        if (hint?.instruction) {
+            instruction = hint.instruction;
+            cfgScale = hint.cfg_scale ?? cfgScale;
+        // `bypass` plays the voice as written, undirected.
+        } else if (!hint?.bypass && preset.dynamic !== false
+            && typeof globalThis.breezeDirector === 'function') {
+            try {
+                const directed = await globalThis.breezeDirector(text, voiceId, preset, hint);
+                if (directed?.instruction) {
+                    instruction = directed.instruction;
+                    cfgScale = directed.cfg_scale ?? cfgScale;
+                }
+            } catch (error) {
+                console.error('[Breeze] director hook failed, using static preset:', error);
+            }
+        }
+
+        const key = JSON.stringify([
+            this.settings.provider_endpoint, voiceId, instruction, cfgScale,
+            this.settings.seed, preset.ref_audio_url ?? '', text,
+        ]);
+
+        return { preset, instruction, cfgScale, key };
+    }
+
+    /** POST to Breeze. Retries while the server is busy generating something else. */
+    async _fetch(text, plan) {
+        const form = new FormData();
+        form.append('text', text);
+        form.append('seed', String(this.settings.seed));
+        form.append('cfg_scale', String(plan.cfgScale));
+        if (plan.instruction) form.append('instruction', plan.instruction);
+
+        if (plan.preset.ref_audio_url) {
+            const audio = await fetch(plan.preset.ref_audio_url).then(r => r.blob());
+            form.append('ref_audio', audio, 'reference.wav');
+            form.append('ref_text', plan.preset.ref_text ?? '');
+        }
+
+        for (let attempt = 0; attempt < 40; attempt++) {
+            const response = await fetch(`${this.settings.provider_endpoint}/v1/audio/speech`, {
+                method: 'POST',
+                body: form,
+            });
+            if (response.status === 409) {
+                await new Promise(resolve => setTimeout(resolve, 500));
+                continue;
+            }
+            if (!response.ok) throw new Error(`Breeze HTTP ${response.status}: ${await response.text()}`);
+            return response;
+        }
+        throw new Error('Breeze stayed busy for too long.');
+    }
+
+    /** A complete WAV clip, from cache when possible. */
+    async _clip(text, voiceId, hint) {
+        const plan = await this._plan(text, voiceId, hint);
+
+        if (this.settings.cache_enabled) {
+            const hit = await cache.get(plan.key);
+            if (hit) {
+                console.debug('[Breeze] cache hit');
+                return hit;
+            }
+        }
+
+        // Prefetch and playback can ask for the same clip at once; generate once.
+        if (this._pending.has(plan.key)) return this._pending.get(plan.key);
+
+        const work = (async () => {
+            const response = await this._fetch(text, plan);
+            const clip = toWav(await response.blob());
+            if (this.settings.cache_enabled) {
+                await cache.put(plan.key, clip, Number(this.settings.cache_max), { voice: voiceId, text });
+                this.refreshCacheCount();
+            }
+            return clip;
+        })();
+
+        this._pending.set(plan.key, work);
+        try {
+            return await work;
+        } finally {
+            this._pending.delete(plan.key);
+        }
+    }
+
+    /** Generate and cache ahead of playback. Errors are swallowed by design. */
+    async prefetch(text, voiceId, hint) {
+        if (!this.settings.cache_enabled) return false;
+        try {
+            await this._clip(text, voiceId, hint);
+            return true;
+        } catch (error) {
+            console.warn('[Breeze] prefetch failed:', error);
+            return false;
+        }
+    }
+
+    async *generateTts(text, voiceId) {
+        // Streaming path: playable chunks as PCM arrives, no caching.
+        if (Number(this.settings.chunk_ms) > 0) {
+            const plan = await this._plan(text, voiceId);
+            const response = await this._fetch(text, plan);
+            const minBytes = Math.floor(SAMPLE_RATE * BYTES_PER_SAMPLE * this.settings.chunk_ms / 1000);
+            const reader = response.body.getReader();
+            let buffer = [];
+            let size = 0;
+
+            const flush = () => {
+                // Never split a 16-bit sample across chunks.
+                let pending = new Blob(buffer);
+                let carry = null;
+                if (pending.size % BYTES_PER_SAMPLE !== 0) {
+                    carry = pending.slice(pending.size - 1);
+                    pending = pending.slice(0, pending.size - 1);
+                }
+                buffer = carry ? [carry] : [];
+                size = carry ? carry.size : 0;
+                return new Response(toWav(pending), { headers: { 'Content-Type': 'audio/wav' } });
+            };
+
+            while (true) {
+                const { done, value } = await reader.read();
+                if (done) break;
+                buffer.push(value);
+                size += value.length;
+                if (size >= minBytes) yield flush();
+            }
+            if (size > 0) yield flush();
+            return;
+        }
+
+        yield new Response(await this._clip(text, voiceId), {
+            headers: { 'Content-Type': 'audio/wav' },
+        });
+    }
+
+    async previewTtsVoice(voiceId, hint = { bypass: true }) {
+        this.audioElement.pause();
+        this.audioElement.currentTime = 0;
+
+        const clip = await this._clip(getPreviewString('en-US'), voiceId, hint);
+        const url = URL.createObjectURL(clip);
+        this.audioElement.src = url;
+        this.audioElement.onended = () => URL.revokeObjectURL(url);
+        await this.audioElement.play();
+    }
+
+    // ----------------------------------------------------- methods the API uses
+
+    listVoices() {
+        return Object.keys(this._presets());
+    }
+
+    hasVoice(name) {
+        return Object.prototype.hasOwnProperty.call(this._presets(), name);
+    }
+
+    voicePreset(name) {
+        return this._presets()[name] ?? null;
+    }
+
+    /** Resolve which voice a character narrates with, following the default marker. */
+    voiceForCharacter(character) {
+        const map = this.settings.voiceMap ?? {};
+        let value = map[character];
+        if (value === DEFAULT_VOICE_MARKER) value = map[DEFAULT_VOICE_MARKER];
+        if (!value || value === 'disabled' || value === DEFAULT_VOICE_MARKER) return null;
+        return this.hasVoice(value) ? value : null;
+    }
+}
+
+// Registration throws if something else already claimed the name — which is
+// exactly what happens when the old standalone breeze-tts extension is still
+// installed. Unguarded, that exception aborts this whole file and the
+// extension vanishes from the UI with no visible cause.
+try {
+    registerTtsProvider('Breeze', BreezeTtsProvider);
+} catch (error) {
+    console.error('[Breeze] could not register the TTS provider:', error);
+    toastr.error('The Breeze TTS provider is already registered. Disable the separate '
+        + '"Breeze TTS Provider" extension — this one now includes it.', 'Breeze');
+}
+
+// ===========================================================================
+// DIRECTOR AND PLAYER
+// ===========================================================================
 
 const MODULE = 'breeze_director';
 const PLAYER_MODULE = 'breeze_player';
@@ -30,17 +606,47 @@ Character: {{char}}
 Paragraphs:
 {{parts}}`;
 
-const DEFAULT_VOICE_PROMPT = `Design a speaking voice for the character below.
+const DEFAULT_IDENTIFY_PROMPT = `Work out who speaks each line of quoted speech in this passage.
+{{context}}
+Passage:
+{{parts}}
 
-Write ONE sentence describing the voice itself: apparent age, texture, pitch, accent if the
-description implies one, and their default manner of speaking.
-Describe the voice only — no plot, no backstory, no character name.
-Output the sentence and nothing else.
+Quoted lines to attribute:
+{{quotes}}
 
-Name: {{char}}
+Name the speaker of each quote, exactly as the passage gives it. Use "{{char}}" when
+{{char}} is speaking and "{{user}}" for {{user}}. Use "unknown" only when the passage
+genuinely does not say.
 
-Description:
-{{description}}`;
+Reply with ONLY a JSON object mapping each label to a name, no commentary, no code fences:
+{"Q1": "name", "Q2": "name"}`;
+
+const DEFAULT_VOICE_CAST_PROMPT = `Describe a character's voice, and choose an existing voice to build it on.
+
+Character: {{speaker}}
+{{context}}
+Lines they speak:
+{{lines}}
+
+Available base voices:
+{{voices}}
+{{cast}}
+Pick the closest base from the list. Several characters may share one, since your
+description is what tells them apart. If this character is someone already cast under
+a different name, reuse their base.
+
+Then describe their voice: apparent gender, approximate age, the tone and manner of
+their speech, and an accent only if there is a basis for one. Leave a field as ""
+when there is no basis — do not invent.
+
+Reply with ONLY a JSON object, no commentary, no code fences:
+{"base": "<a voice name from the list>", "gender": "", "age": "", "tone": "", "accent": ""}`;
+
+/** Spliced into the casting prompt at {{cast}} once anyone has been cast. */
+const CAST_BLOCK = `
+Already cast in this scene:
+{{list}}
+`;
 
 const DEFAULTS = {
     enabled: true,
@@ -52,10 +658,57 @@ const DEFAULTS = {
     mode: 'replace',      // replace | append
     on_missing: 'static', // static | generate
     prompt: DEFAULT_PROMPT,
-    auto_voice: true,
-    voice_prompt: DEFAULT_VOICE_PROMPT,
     prefetch: true,
+    cast_enabled: true,
+    narrator_voice: '',   // '' = the character's own voice
+    voice_cast_prompt: DEFAULT_VOICE_CAST_PROMPT,
+    identify_prompt: DEFAULT_IDENTIFY_PROMPT,
+    identify_chunk: -1,   // paragraphs per identification call; -1 = whole message
+    cast: {},             // chatId -> { speaker: { voice, base, tone } }
+    prompt_stamps: {},    // key -> hash of the default it was written from
 };
+
+const CAST_CHAT_LIMIT = 50;
+
+// How far back a cast scan will look. Each message with quotes in it costs at
+// least one model call, so this is a spend ceiling as much as a search depth.
+const CAST_SCAN_LIMIT = 20;
+
+// Prompts live in settings, so shipping a new default used to change nothing for
+// an existing install. Each stored prompt is stamped with a hash of the default
+// it came from: if it still matches, nobody edited it and it upgrades silently.
+// If it does not, the user customised it and it is left alone.
+const SHIPPED_PROMPTS = {
+    prompt: () => DEFAULT_PROMPT,
+    voice_cast_prompt: () => DEFAULT_VOICE_CAST_PROMPT,
+    identify_prompt: () => DEFAULT_IDENTIFY_PROMPT,
+};
+
+function hash(text) {
+    let h = 5381;
+    for (let i = 0; i < String(text).length; i++) {
+        h = ((h << 5) + h + String(text).charCodeAt(i)) | 0;
+    }
+    return String(h);
+}
+
+function syncPrompts(config) {
+    config.prompt_stamps = config.prompt_stamps ?? {};
+    for (const [key, shipped] of Object.entries(SHIPPED_PROMPTS)) {
+        const current = shipped();
+        const stored = config[key];
+        if (stored === current) {
+            config.prompt_stamps[key] = hash(current);
+            continue;
+        }
+        // No stamp means it predates this mechanism: assume it may be custom.
+        if (config.prompt_stamps[key] && config.prompt_stamps[key] === hash(stored)) {
+            config[key] = current;
+            config.prompt_stamps[key] = hash(current);
+            console.info(`[Breeze Director] upgraded the unedited "${key}" to the new default.`);
+        }
+    }
+}
 
 const PLAYER_DEFAULTS = {
     autoplay_next: true,
@@ -85,7 +738,9 @@ function fill(store, key, defaults) {
 }
 
 function settings() {
-    return fill(ctx().extensionSettings, MODULE, DEFAULTS);
+    const config = fill(ctx().extensionSettings, MODULE, DEFAULTS);
+    syncPrompts(config);
+    return config;
 }
 
 function playerSettings() {
@@ -102,7 +757,143 @@ function buildUnits(mes) {
     return splitLines(mes).map(text => ({ text }));
 }
 
-const normalize = s => String(s ?? '').replace(/[*_"'`~]/g, '').replace(/\s+/g, ' ').trim().toLowerCase();
+// SillyTavern's parseMessageSegments (tts/index.js) minus its \*action\*
+// alternative: this chat is plaintext, so an asterisk is an asterisk. Leaving
+// that alternative in would let a stray pair — "2 * 3 * 4", a footnote marker —
+// be read as markup and silently stripped out of what gets spoken.
+// A paragraph stays the unit of direction; segments only decide who reads what.
+const SEGMENT_PATTERN = /(".*?")|(\u201C.*?\u201D)|(\u00AB.*?\u00BB)|(\u300C.*?\u300D)|(\u300E.*?\u300F)|(\uFF02.*?\uFF02)/gim;
+
+/**
+ * Split one paragraph into spans that may each take their own voice, matching
+ * ST's rules: delimiters stripped, pieces trimmed, empties dropped, and the
+ * whole line kept when nothing matches. Only quoted speech changes speaker;
+ * everything around it is narration.
+ */
+function splitSegments(line) {
+    const segments = [];
+    const regex = new RegExp(SEGMENT_PATTERN.source, 'gim');
+    let lastIndex = 0;
+    let match;
+
+    while ((match = regex.exec(line)) !== null) {
+        if (match.index > lastIndex) {
+            const before = line.slice(lastIndex, match.index).trim();
+            if (before) segments.push({ text: before, kind: 'narration' });
+        }
+        // Every alternative left in the pattern is a quote form.
+        const content = match[0].slice(1, -1).trim();
+        if (content) segments.push({ text: content, kind: 'dialogue' });
+        lastIndex = match.index + match[0].length;
+    }
+
+    if (lastIndex < line.length) {
+        const rest = line.slice(lastIndex).trim();
+        if (rest) segments.push({ text: rest, kind: 'narration' });
+    }
+
+    if (segments.length) return segments;
+    const whole = line.trim();
+    return whole ? [{ text: whole, kind: 'narration' }] : [];
+}
+
+/** Every quoted span in the message, numbered Q1..Qn for the director to attribute. */
+function collectQuotes(layout) {
+    const quotes = [];
+    layout.forEach((segments, paragraph) => {
+        segments.forEach((segment, at) => {
+            if (segment.kind !== 'dialogue') return;
+            quotes.push({ id: `Q${quotes.length + 1}`, paragraph, at, text: segment.text });
+        });
+    });
+    return quotes;
+}
+
+const GENERIC_SPEAKERS = new Set(['', 'unknown', 'unclear', 'narrator', 'none', 'null', 'n/a']);
+
+/** Is this quote spoken by someone other than the message's own character? */
+function isForeignSpeaker(speaker, message) {
+    const name = String(speaker ?? '').trim().toLowerCase();
+    if (!name || GENERIC_SPEAKERS.has(name)) return false;
+    return name !== String(message?.name ?? '').trim().toLowerCase();
+}
+
+/** A base voice's preset. Null rather than throwing: the voices JSON is hand-edited. */
+function basePreset(name) {
+    if (!name) return null;
+    try {
+        return globalThis.breezeTts?.voicePreset(name) ?? null;
+    } catch (error) {
+        console.warn('[Breeze Director] could not read base voice', name, error);
+        return null;
+    }
+}
+
+/** The voice the character themselves narrates with, per the TTS voice map. */
+function charVoice(message) {
+    return globalThis.breezeTts?.voiceForCharacter(message?.name) ?? null;
+}
+
+/** The voice for non-quote text: the configured narrator, else the character's own. */
+function defaultVoice(message) {
+    const breeze = globalThis.breezeTts;
+    const narrator = settings().narrator_voice;
+    if (narrator && breeze?.hasVoice(narrator)) return narrator;
+    return charVoice(message);
+}
+
+/**
+ * Resolve a stored segment to a voice at play time. Only a foreign speaker has
+ * a voice pinned into the chat; everything else resolves live, so editing the
+ * narrator setting or the voice map keeps working on old messages.
+ */
+function voiceForSegment(segment, message) {
+    const breeze = globalThis.breezeTts;
+    if (segment?.kind !== 'dialogue') return defaultVoice(message);
+
+    // A voice picked by hand in the panel wins outright.
+    if (segment.voice && breeze?.hasVoice(segment.voice)) return segment.voice;
+
+    // Otherwise the speaker's cast entry names the base to speak through. This
+    // is resolved at play time, not stored, so editing the cast reaches
+    // messages already in the chat.
+    const entry = castFor(segment.speaker);
+    if (entry?.base && breeze?.hasVoice(entry.base)) return entry.base;
+
+    return charVoice(message) ?? defaultVoice(message);
+}
+
+/**
+ * The clips one paragraph plays, in order. Each carries a hint naming the
+ * message and paragraph it came from, so the director returns that paragraph's
+ * instruction outright instead of matching a fragment back to it.
+ */
+function clipsFor(message, line, messageId, paragraph) {
+    const segments = line?.segments;
+    if (!segments?.length) {
+        return [{
+            text: line?.text ?? '',
+            voice: defaultVoice(message),
+            speaker: null,
+            hint: { messageId, paragraph, speaker: null },
+        }];
+    }
+    return segments.map(segment => {
+        const speaker = segment.kind === 'dialogue' ? (segment.speaker || null) : null;
+        return {
+            text: segment.text,
+            voice: voiceForSegment(segment, message),
+            speaker,
+            // The speaker rides along so the director can lay their voice
+            // description over the paragraph's delivery direction.
+            hint: { messageId, paragraph, speaker },
+        };
+    });
+}
+
+// Strips quote marks so a segment matches the paragraph it came from. Asterisks
+// stay: in plaintext they are content, not markup.
+const normalize = s => String(s ?? '').replace(/["'`\u201C\u201D\u00AB\u00BB]/g, '').replace(/\s+/g, ' ').trim().toLowerCase();
 
 /** Stored direction, but only if it still belongs to the current swipe. */
 function getDirection(message) {
@@ -118,42 +909,173 @@ function hasDirection(index) {
 
 // ---------------------------------------------------------------- generation
 
+/**
+ * Every model call goes through here.
+ *
+ * A reasoning model spends its budget thinking before it writes anything, so a
+ * request sized for the answer alone comes back empty — this extension's
+ * original bug, and it recurred the moment auxiliary calls were added with
+ * budgets of 80 and 200 tokens. The floor is therefore the user's own
+ * max_tokens, never the caller's estimate of how long the answer is.
+ */
+async function callModel(label, prompt, minTokens, roomy) {
+    const config = settings();
+    // Reasoning is billed against the same budget, so the retry buys thinking
+    // room rather than a longer answer.
+    const budget = Math.max(Number(config.max_tokens) || 0, minTokens) * (roomy ? 3 : 1);
+
+    const result = await ctx().ConnectionManagerRequestService.sendRequest(
+        config.profile, prompt, budget,
+    );
+
+    const clean = (value) => String(value ?? '')
+        .replace(/<think>[\s\S]*?<\/think>/gi, '')
+        .replace(/```(?:json)?/gi, '')
+        .trim();
+
+    return { content: clean(result?.content), reasoning: clean(result?.reasoning), budget };
+}
+
+/** Plain text from the model, retried once with more room if it comes back empty. */
+async function askModel(label, prompt, minTokens) {
+    let reply = await callModel(label, prompt, minTokens);
+    if (!reply.content) {
+        console.warn(`[Breeze Director] ${label}: empty at budget ${reply.budget}, `
+            + 'retrying with room to think.');
+        reply = await callModel(label, prompt, minTokens, true);
+    }
+    if (!reply.content) {
+        console.warn(`[Breeze Director] ${label}: still empty at budget ${reply.budget}. `
+            + 'Raise Max response tokens, or use a non-reasoning connection profile.');
+    }
+    return reply.content;
+}
+
+/**
+ * A JSON object from the model. Falls back to the reasoning channel, because a
+ * model that runs out of room mid-thought has often already written the answer
+ * there — and retries once with a larger budget before giving up.
+ */
+async function askJson(label, prompt, minTokens) {
+    for (const roomy of [false, true]) {
+        const reply = await callModel(label, prompt, minTokens, roomy);
+        const parsed = extractJson(reply.content) ?? extractJson(reply.reasoning);
+        if (parsed) return parsed;
+
+        console.warn(`[Breeze Director] ${label}: no usable JSON at budget ${reply.budget}`
+            + (roomy ? '. Giving up.' : ', retrying with room to think.'),
+            reply.content || '(empty completion)');
+    }
+    return null;
+}
+
+/**
+ * The first balanced {...} that parses. Scanning rather than taking the first
+ * brace to the last matters for reasoning models, which like to muse in prose
+ * containing braces before emitting the JSON.
+ */
+function extractJson(text) {
+    for (let start = text.indexOf('{'); start !== -1; start = text.indexOf('{', start + 1)) {
+        let depth = 0;
+        let inString = false;
+        let escaped = false;
+
+        for (let i = start; i < text.length; i++) {
+            const ch = text[i];
+            if (escaped) { escaped = false; continue; }
+            if (ch === '\\') { escaped = true; continue; }
+            if (ch === '"') { inString = !inString; continue; }
+            if (inString) continue;
+            if (ch === '{') depth++;
+            else if (ch === '}' && --depth === 0) {
+                try {
+                    return JSON.parse(text.slice(start, i + 1));
+                } catch { /* not this one; try the next opening brace */ }
+                break;
+            }
+        }
+    }
+    return null;
+}
+
+/** Quote ids come back as Q1, q1 or plain 1 depending on the model's mood. */
+function normalizeQuoteId(id) {
+    const text = String(id ?? '').trim().toUpperCase();
+    const digits = text.match(/^Q?(\d+)$/);
+    return digits ? `Q${digits[1]}` : text;
+}
+
+/** Substitute without letting $& and friends in chat text be interpreted. */
+function put(template, token, value) {
+    return template.replace(token, () => value);
+}
+
 function buildPrompt(message, units) {
     const context = ctx();
     const parts = units.map((unit, i) => `${i + 1}. ${unit.text}`).join('\n\n');
-    return settings().prompt
-        .replace(/{{parts}}/g, parts)
-        .replace(/{{count}}/g, String(units.length))
-        .replace(/{{message}}/g, String(message?.mes ?? ''))
-        .replace(/{{char}}/g, String(message?.name ?? context.name2 ?? ''))
-        .replace(/{{user}}/g, String(context.name1 ?? ''));
+
+    let prompt = put(settings().prompt, /{{parts}}/g, parts);
+    prompt = put(prompt, /{{count}}/g, String(units.length));
+    prompt = put(prompt, /{{message}}/g, String(message?.mes ?? ''));
+    prompt = put(prompt, /{{char}}/g, String(message?.name ?? context.name2 ?? ''));
+    prompt = put(prompt, /{{user}}/g, String(context.name1 ?? ''));
+    return prompt;
 }
 
-function parseInstructions(raw, count) {
+/**
+ * Read a completion into { instructions, speakers }. Three shapes are accepted,
+ * because prompts persist in settings: the current object form, a bare array
+ * from a pre-cast saved prompt, and anything else via the first-line fallback.
+ */
+function parseDirection(raw, count) {
     const text = String(raw ?? '')
         .replace(/<think>[\s\S]*?<\/think>/gi, '')
         .replace(/```(?:json)?/gi, '')
         .trim();
 
-    const start = text.indexOf('[');
-    const end = text.lastIndexOf(']');
-    if (start !== -1 && end > start) {
+    // Pad short replies with the last usable direction.
+    const pad = (list) => {
+        const clean = list.map(v => String(v ?? '').trim()).filter(Boolean);
+        if (!clean.length) return null;
+        while (clean.length < count) clean.push(clean[clean.length - 1]);
+        return clean.slice(0, count);
+    };
+
+    const objectStart = text.indexOf('{');
+    const objectEnd = text.lastIndexOf('}');
+    if (objectStart !== -1 && objectEnd > objectStart) {
         try {
-            const parsed = JSON.parse(text.slice(start, end + 1));
-            if (Array.isArray(parsed)) {
-                const clean = parsed.map(v => String(v ?? '').trim()).filter(Boolean);
-                if (clean.length) {
-                    // Pad short replies with the last usable direction.
-                    while (clean.length < count) clean.push(clean[clean.length - 1]);
-                    return clean.slice(0, count);
+            const parsed = JSON.parse(text.slice(objectStart, objectEnd + 1));
+            const instructions = Array.isArray(parsed?.directions) ? pad(parsed.directions) : null;
+            if (instructions) {
+                const speakers = {};
+                for (const [id, name] of Object.entries(parsed?.speakers ?? {})) {
+                    speakers[String(id).trim().toUpperCase()] = String(name ?? '').trim();
                 }
+                return { instructions, speakers };
+            }
+        } catch { /* fall through to the array form */ }
+    }
+
+    const arrayStart = text.indexOf('[');
+    const arrayEnd = text.lastIndexOf(']');
+    if (arrayStart !== -1 && arrayEnd > arrayStart) {
+        try {
+            const parsed = JSON.parse(text.slice(arrayStart, arrayEnd + 1));
+            if (Array.isArray(parsed)) {
+                const instructions = pad(parsed);
+                if (instructions) return { instructions, speakers: {} };
             }
         } catch { /* fall through to the single-instruction path */ }
     }
 
     // Model ignored the format: use its first line as one direction for everything.
     const single = text.split('\n').map(l => l.trim()).filter(Boolean)[0];
-    return single ? new Array(count).fill(single.replace(/^["'`]|["'`]$/g, '')) : null;
+    if (!single) return null;
+    return {
+        instructions: new Array(count).fill(single.replace(/^["\'`]|["\'`]$/g, '')),
+        speakers: {},
+    };
 }
 
 async function generate(index, { quiet = true } = {}) {
@@ -171,30 +1093,58 @@ async function generate(index, { quiet = true } = {}) {
     const units = buildUnits(message.mes);
     if (!units.length) return null;
 
-    // A reasoning model can spend the whole budget thinking and return nothing,
-    // so floor the request at enough room to think and still write every line.
-    const budget = Math.max(Number(config.max_tokens) || 0, 600 + 80 * units.length);
+    const layout = units.map(unit => splitSegments(unit.text));
+    const quotes = collectQuotes(layout);
+    const attribute = config.cast_enabled && quotes.length > 0;
 
-    const result = await context.ConnectionManagerRequestService.sendRequest(
-        config.profile,
-        buildPrompt(message, units),
-        budget,
-    );
+    // Who speaks gets its own call, or several: one job per prompt, and each
+    // chunk knows who the ones before it named.
+    const speakers = attribute ? await identifySpeakers(message, units, quotes) : {};
 
-    // Empty and unparseable are different failures: one wants a bigger budget
-    // or a non-reasoning profile, the other wants a different prompt.
-    if (!String(result?.content ?? '').trim()) {
-        console.warn('[Breeze Director] empty completion — the model likely spent the '
-            + `budget (${budget}) on reasoning. Raw result:`, result);
+    const completion = await askModel('direction', buildPrompt(message, units), 600 + 80 * units.length);
+    if (!completion) {
         if (!quiet) toastr.error('Model returned an empty completion.', 'Breeze Director');
         return null;
     }
 
-    const instructions = parseInstructions(result?.content, units.length);
-    if (!instructions) {
+    const parsed = parseDirection(completion, units.length);
+    if (!parsed) {
         console.warn('[Breeze Director] could not parse a completion:', result?.content);
         if (!quiet) toastr.error('Model returned nothing usable.', 'Breeze Director');
         return null;
+    }
+
+    // askCasting quotes a speaker's own lines back at the model; tag them now.
+    for (const quote of quotes) {
+        quote.speaker = String(speakers[quote.id] ?? '').trim();
+    }
+
+    const lines = [];
+    for (let i = 0; i < units.length; i++) {
+        const line = { text: units[i].text, instruction: parsed.instructions[i] };
+        const segments = layout[i];
+
+        // One plain narration span is the common case: store nothing extra, so
+        // records stay small and pre-casting directions keep loading unchanged.
+        if (segments.length !== 1 || segments[0].kind !== 'narration') {
+            line.segments = [];
+            for (let at = 0; at < segments.length; at++) {
+                const segment = segments[at];
+                const entry = { text: segment.text, kind: segment.kind };
+
+                if (segment.kind === 'dialogue') {
+                    const quote = quotes.find(q => q.paragraph === i && q.at === at);
+                    const speaker = String(speakers[quote?.id] ?? '').trim();
+                    entry.speaker = speaker || null;
+                    // Casting records the speaker; which base they speak
+                    // through is resolved at play time from the cast, so
+                    // editing it reaches messages already in the chat.
+                    if (isForeignSpeaker(speaker, message)) await castVoice(speaker, quotes);
+                }
+                line.segments.push(entry);
+            }
+        }
+        lines.push(line);
     }
 
     // Keep the previous take so a regeneration you dislike can be undone.
@@ -207,7 +1157,7 @@ async function generate(index, { quiet = true } = {}) {
     message.extra.breeze_direction = {
         swipe_id: message.swipe_id ?? 0,
         ts: Date.now(),
-        lines: units.map((unit, i) => ({ text: unit.text, instruction: instructions[i] })),
+        lines,
         history: history.slice(0, HISTORY_LIMIT),
     };
 
@@ -243,6 +1193,11 @@ function locate(text) {
     return chat.length - 1;
 }
 
+/**
+ * Which paragraph's instruction applies to this text. Only used when no hint
+ * was passed — SillyTavern's own narration path, where the text is a whole
+ * paragraph and matching is dependable.
+ */
 function pickLine(direction, text) {
     const needle = normalize(text);
     if (!needle) return direction.lines[0]?.instruction;
@@ -250,118 +1205,399 @@ function pickLine(direction, text) {
     const exact = direction.lines.find(l => normalize(l.text) === needle);
     if (exact) return exact.instruction;
 
-    // Quote-only narration hands us a fragment of the line.
-    const partial = direction.lines.find(l => {
-        const body = normalize(l.text);
-        return body.includes(needle) || needle.includes(body);
-    });
-    return (partial ?? direction.lines[0])?.instruction;
+    // A fragment can sit inside more than one paragraph; the longest container
+    // is the least bad guess. Pass a hint and this never runs.
+    let best = null;
+    let bestLength = -1;
+    for (const line of direction.lines) {
+        const body = normalize(line.text);
+        if (!body.includes(needle) && !needle.includes(body)) continue;
+        if (body.length > bestLength) {
+            best = line;
+            bestLength = body.length;
+        }
+    }
+    return (best ?? direction.lines[0])?.instruction;
 }
 
-globalThis.breezeDirector = async function (text, voiceId, preset) {
+globalThis.breezeDirector = async function (text, voiceId, preset, hint) {
     const config = settings();
     if (!config.enabled) return null;
 
-    const index = locate(text);
+    // A clone base already fixes the voice; describing it again only fights the
+    // reference audio, so identity words are dropped for one.
+    const cloned = !!(preset?.ref_audio_url && preset?.ref_text);
+    const cast = castFor(hint?.speaker);
+    const voiceLine = cast ? voiceInstruction(cast, cloned) : '';
+
+    // A hint names the paragraph outright; locate() only guesses from the text.
+    const index = Number.isInteger(hint?.messageId) ? hint.messageId : locate(text);
     const message = ctx().chat?.[index];
-    if (!message) return null;
 
-    // If a precompute is still running for this message, wait for it rather
-    // than firing a second call or silently falling back.
-    if (inFlight.has(index)) await inFlight.get(index);
+    let line = '';
+    if (message) {
+        // If a precompute is still running for this message, wait for it rather
+        // than firing a second call or silently falling back.
+        if (inFlight.has(index)) await inFlight.get(index);
 
-    let direction = getDirection(message);
-    if (!direction) {
-        if (config.on_missing !== 'generate') return null;
-        await run(index);
-        direction = getDirection(message);
+        let direction = getDirection(message);
+        if (!direction && config.on_missing === 'generate') {
+            await run(index);
+            direction = getDirection(message);
+        }
+        if (direction) {
+            line = (Number.isInteger(hint?.paragraph)
+                ? direction.lines[hint.paragraph]?.instruction
+                : pickLine(direction, text)) ?? '';
+        }
     }
-    if (!direction) return null;
 
-    const line = pickLine(direction, text);
-    if (!line) return null;
+    // The base's own instruction is the user's description of that voice. It is
+    // superseded by a cast member's, which describes someone specific, unless
+    // the user asked for the two to be combined.
+    const carried = (config.mode === 'append' && preset?.instruction) ? preset.instruction : '';
+    const instruction = [carried, voiceLine, line].map(part => String(part ?? '').trim())
+        .filter(Boolean).join(' ');
+    if (!instruction) return null;
 
-    const base = preset?.instruction;
-    const instruction = (config.mode === 'append' && base) ? `${base} ${line}` : line;
-    return { instruction, cfg_scale: Number(config.cfg_scale) };
+    // A base the user maintains carries its own cfg_scale; respect it.
+    return { instruction, cfg_scale: preset?.cfg_scale ?? Number(config.cfg_scale) };
 };
 
-// ------------------------------------------------------- voices and prefetch
-
-const voiceJobs = new Map();
-
+/** The character card for a name, when the chat has one. */
 function cardFor(name) {
     const characters = ctx().characters ?? [];
     return characters.find(c => c.name === name) ?? null;
 }
 
-function slug(name) {
-    const base = String(name).toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');
-    return base || 'voice';
+// -------------------------------------------------------------- cast storage
+// A speaker keeps one voice for a whole chat: re-picking per message would make
+// the same stranger sound like a different person every paragraph. The casting
+// itself is further down, after identification, which has to run first.
+
+const castJobs = new Map();
+
+// Set by bind(), so the settings roster repaints as speakers are cast.
+let onCastChanged = null;
+
+function currentChatId() {
+    return ctx().getCurrentChatId?.() ?? 'chat';
 }
 
-async function designVoice(name) {
+function castMap() {
+    const config = settings();
+    config.cast = config.cast ?? {};
+    const id = currentChatId();
+    config.cast[id] = config.cast[id] ?? {};
+    return config.cast[id];
+}
+
+/** Keep the cast from accumulating every chat ever opened. */
+function pruneCast() {
+    const config = settings();
+    const chats = Object.keys(config.cast ?? {});
+    for (const stale of chats.slice(0, Math.max(0, chats.length - CAST_CHAT_LIMIT))) {
+        delete config.cast[stale];
+    }
+}
+
+// ------------------------------------------------------------- identification
+// Who speaks each quote is its own question, with its own call. Asking the
+// director to do it alongside the delivery direction gave it two jobs and not
+// enough context for either.
+
+const PROFILE_FIELDS = ['gender', 'age', 'tone', 'accent'];
+
+function cleanProfile(raw) {
+    const profile = {};
+    for (const field of PROFILE_FIELDS) {
+        const value = String(raw?.[field] ?? '').trim();
+        if (value && value.toLowerCase() !== 'unknown') profile[field] = value;
+    }
+    return Object.keys(profile).length ? profile : null;
+}
+
+/** One identification call over paragraphs [from, to). */
+async function askIdentify(message, units, from, to, quotes, known) {
     const config = settings();
     const context = ctx();
-    const breeze = globalThis.breezeTts;
 
-    const card = cardFor(name);
-    const description = [card?.description, card?.personality, card?.scenario]
+    const parts = units.slice(from, to)
+        .map((unit, i) => `${from + i + 1}. ${unit.text}`)
+        .join('\n\n');
+    const list = quotes
+        .map(q => `${q.id} (paragraph ${q.paragraph + 1}): ${q.text}`)
+        .join('\n');
+
+    // Context that actually helps: whose message this is, and who has already
+    // been named — in this message's earlier chunks and in the chat's cast.
+    const card = cardFor(message?.name);
+    const description = [card?.description, card?.personality]
         .map(v => String(v ?? '').trim()).filter(Boolean).join('\n\n');
 
-    if (!description) {
-        console.info(`[Breeze Director] no card text for "${name}", skipping voice design.`);
-        return null;
+    const cast = castMap();
+    const seen = [...new Set([...Object.keys(cast), ...Object.values(known)])]
+        .filter(name => name && name.toLowerCase() !== 'unknown');
+
+    const lines = [];
+    if (description) lines.push(`About ${message?.name}:\n${description}`);
+    if (seen.length) lines.push(`People already named in this scene: ${seen.join(', ')}`);
+    if (from > 0) lines.push(`These are paragraphs ${from + 1}-${to} of a longer message.`);
+    const contextBlock = lines.length ? `\n${lines.join('\n\n')}\n` : '';
+
+    let prompt = put(config.identify_prompt, /{{context}}/g, contextBlock);
+    prompt = put(prompt, /{{parts}}/g, parts);
+    prompt = put(prompt, /{{quotes}}/g, list);
+    prompt = put(prompt, /{{char}}/g, String(message?.name ?? context.name2 ?? ''));
+    prompt = put(prompt, /{{user}}/g, String(context.name1 ?? ''));
+
+    const parsed = await askJson('identification', prompt, 300 + 60 * quotes.length);
+    if (!parsed) return null;
+
+    // Accept either the flat map we ask for or a {speakers:{...}} wrapper.
+    const source = (parsed.speakers && typeof parsed.speakers === 'object')
+        ? parsed.speakers
+        : parsed;
+
+    const speakers = {};
+    for (const [id, name] of Object.entries(source)) {
+        const value = String(name ?? '').trim();
+        if (value) speakers[normalizeQuoteId(id)] = value;
     }
 
-    const prompt = config.voice_prompt
-        .replace(/{{char}}/g, name)
-        .replace(/{{description}}/g, description)
-        .replace(/{{user}}/g, String(context.name1 ?? ''));
-
-    const result = await context.ConnectionManagerRequestService.sendRequest(
-        config.profile, prompt, 200,
-    );
-
-    let line = String(result?.content ?? '')
-        .replace(/<think>[\s\S]*?<\/think>/gi, '')
-        .split('\n').map(l => l.trim()).filter(Boolean)[0] ?? '';
-    line = line.replace(/^["'`]|["'`]$/g, '').trim();
-    if (!line) return null;
-
-    let voiceName = slug(name);
-    let suffix = 2;
-    while (breeze.hasVoice(voiceName)) voiceName = `${slug(name)}-${suffix++}`;
-
-    await breeze.addVoice(voiceName, { instruction: line, cfg_scale: Number(config.cfg_scale) });
-    await breeze.assignVoice(name, voiceName);
-
-    console.info(`[Breeze Director] designed voice "${voiceName}" for ${name}: ${line}`);
-    toastr.success(`Designed a voice for ${name}.`, 'Breeze Director');
-    return voiceName;
+    const missed = quotes.filter(q => !speakers[q.id]).length;
+    console.info(`[Breeze Director] identified ${quotes.length - missed} of ${quotes.length} quotes`
+        + (missed ? ` (${missed} unattributed)` : '') + '.');
+    return speakers;
 }
 
-/** Ensure the character has a voice, designing one from their card if not. */
-async function ensureVoice(name) {
+/**
+ * Attribute every quote in the message, in chunks of `identify_chunk`
+ * paragraphs. -1, 0 or anything larger than the message means one call for the
+ * whole thing. Each chunk is told who earlier chunks already named.
+ */
+async function identifySpeakers(message, units, quotes) {
+    const size = Number(settings().identify_chunk);
+    const step = (!Number.isFinite(size) || size < 1) ? units.length : size;
+
+    const speakers = {};
+    for (let from = 0; from < units.length; from += step) {
+        const to = Math.min(from + step, units.length);
+        const slice = quotes.filter(q => q.paragraph >= from && q.paragraph < to);
+        if (!slice.length) continue;
+
+        Object.assign(speakers, await askIdentify(message, units, from, to, slice, speakers) ?? {});
+    }
+    return speakers;
+}
+
+/**
+ * Cast entries have been three shapes. The oldest was a bare voice name, the
+ * next carried a derived `voice` this extension had written into the provider.
+ * Both are read as a base to build on: the provider's voices are the user's to
+ * manage, and nothing here writes to them.
+ */
+function castEntry(value) {
+    if (!value) return null;
+    if (typeof value === 'string') return { base: value };
+    if (!value.base && value.voice) return { ...value, base: value.voice };
+    return value;
+}
+
+/** The cast entry for a speaker in the current chat, if there is one. */
+function castFor(speaker) {
+    if (!speaker) return null;
+    return castEntry(settings().cast?.[currentChatId()]?.[speaker]);
+}
+
+/**
+ * The Breeze instruction for a cast voice, composed from its profile.
+ *
+ * Identity — gender, age, accent — is dropped when the base is a clone, because
+ * describing a voice that the reference audio already fixes only fights it.
+ * Tone survives either way: it is manner, not timbre.
+ */
+function voiceInstruction(entry, cloned) {
+    const parts = cloned
+        ? [entry.tone]
+        : [
+            [entry.gender, entry.age].map(v => String(v ?? '').trim()).filter(Boolean).join(', '),
+            entry.accent ? `${String(entry.accent).trim()} accent` : '',
+            entry.tone,
+        ];
+
+    const sentence = parts
+        .map(part => String(part ?? '').trim().replace(/\s*[.;,]+$/, ''))
+        .filter(Boolean)
+        .join('. ');
+    return sentence ? `${sentence}.` : '';
+}
+
+/** What Breeze will be told for this cast member, for the sheet to show. */
+function castInstruction(entry) {
+    const inherited = basePreset(entry.base);
+    const cloned = !!(inherited?.ref_audio_url && inherited?.ref_text);
+    return voiceInstruction(entry, cloned);
+}
+
+/**
+ * Put a named speaker on the cast sheet, voiced or not. An entry with no voice
+ * is the sheet's invitation to fill one in by hand, which is better than the
+ * speaker vanishing because nothing could be derived for them automatically.
+ */
+function rememberSpeaker(speaker) {
+    const cast = castMap();
+    const entry = castEntry(cast[speaker]) ?? { voice: null, base: null };
+    cast[speaker] = entry;
+    pruneCast();
+    return entry;
+}
+
+/** Ask the director for this speaker's voice: a base to build on, and a description. */
+async function askCasting(speaker, quotes) {
     const config = settings();
     const breeze = globalThis.breezeTts;
-    if (!name || !breeze?.available || !config.profile) return null;
+    const available = breeze?.listVoices() ?? [];
+    if (!config.profile || !available.length) return null;
 
-    const existing = breeze.voiceForCharacter(name);
-    if (existing) return existing;
-    if (!config.auto_voice) return null;
+    const spoken = quotes
+        .filter(q => q.speaker === speaker)
+        .slice(0, 6)
+        .map(q => `- ${q.text}`)
+        .join('\n');
 
-    if (voiceJobs.has(name)) return voiceJobs.get(name);
-
-    const pending = designVoice(name)
-        .catch(error => {
-            console.error('[Breeze Director] voice design failed:', error);
-            return null;
+    // Showing the running cast is what keeps a scene consistent: the model can
+    // reuse a base for the same person under another name.
+    const cast = castMap();
+    const roster = Object.entries(cast)
+        .filter(([who]) => who !== speaker)
+        .map(([who, value]) => {
+            const entry = castEntry(value);
+            return `- ${who} → base ${entry.base}`;
         })
-        .finally(() => voiceJobs.delete(name));
+        .join('\n');
 
-    voiceJobs.set(name, pending);
+    const card = cardFor(speaker);
+    const description = [card?.description, card?.personality]
+        .map(v => String(v ?? '').trim()).filter(Boolean).join('\n\n');
+
+    let prompt = put(config.voice_cast_prompt, /{{speaker}}/g, speaker);
+    prompt = put(prompt, /{{context}}/g, description ? `\nWhat is known of them:\n${description}\n` : '');
+    prompt = put(prompt, /{{lines}}/g, spoken || '(none recorded)');
+    prompt = put(prompt, /{{voices}}/g, available.map(name => `- ${name}`).join('\n'));
+    prompt = put(prompt, /{{cast}}/g, roster ? put(CAST_BLOCK, /{{list}}/g, roster) : '');
+
+    const parsed = await askJson('casting', prompt, 400);
+    if (!parsed) return null;
+
+    // The model may quote the name or wrap it in a sentence; match generously.
+    const wanted = String(parsed.base ?? '').trim().toLowerCase();
+    const base = available.find(name => name.toLowerCase() === wanted)
+        ?? available.find(name => wanted.includes(name.toLowerCase()))
+        ?? null;
+
+    return { base, profile: cleanProfile(parsed) };
+}
+
+/**
+ * Settle which base a foreign speaker speaks through, and record them on the
+ * cast sheet. A sheet edit pins the entry and wins outright; otherwise a
+ * hand-assigned voice-map entry wins; otherwise the director picks one. Never
+ * throws — the caller falls back to the default voice.
+ */
+async function castVoice(speaker, quotes = []) {
+    const breeze = globalThis.breezeTts;
+    if (!breeze?.available) return null;
+
+    // Record them first: whatever happens next, they belong on the sheet.
+    const entry = rememberSpeaker(speaker);
+    const settle = (base) => {
+        ctx().saveSettingsDebounced();
+        onCastChanged?.();
+        return base;
+    };
+
+    // An edit in the cast sheet pins the entry, and pinning outranks everything.
+    if (entry.pinned && entry.base) return settle(entry.base);
+
+    // Otherwise a hand-assigned voice-map entry beats anything decided here.
+    const mapped = breeze.voiceForCharacter(speaker);
+    if (mapped) {
+        entry.base = mapped;
+        entry.source = 'voicemap';
+        return settle(mapped);
+    }
+
+    if (entry.base && breeze.hasVoice(entry.base)) return settle(entry.base);
+
+    if (castJobs.has(speaker)) return castJobs.get(speaker);
+
+    const pending = (async () => {
+        const casting = await askCasting(speaker, quotes);
+        if (casting?.base) entry.base = casting.base;
+        for (const field of PROFILE_FIELDS) {
+            if (!entry[field] && casting?.profile?.[field]) entry[field] = casting.profile[field];
+        }
+        delete entry.source;
+        return entry.base;
+    })()
+        .then(base => {
+            if (base) {
+                console.info(`[Breeze Director] cast ${speaker} on base "${base}": `
+                    + (castInstruction(entry) || '(no description)'));
+                toastr.info(`Cast ${speaker} on "${base}".`, 'Breeze Director');
+            } else {
+                console.info(`[Breeze Director] ${speaker} is on the cast sheet `
+                    + 'with no base yet — give them one there.');
+            }
+            return settle(base);
+        })
+        .catch(error => {
+            console.error('[Breeze Director] casting failed for', speaker, error);
+            toastr.error(`Could not cast ${speaker}: ${error?.message ?? error}`, 'Breeze Director');
+            return settle(null);
+        })
+        .finally(() => castJobs.delete(speaker));
+
+    castJobs.set(speaker, pending);
     return pending;
+}
+
+/**
+ * Identify and cast the speakers in one message, leaving its direction alone.
+ * This is the casting half of generate(), for when that is all you want.
+ */
+async function castMessage(index) {
+    const message = ctx().chat?.[index];
+    if (!message) return [];
+
+    const units = buildUnits(message.mes);
+    const quotes = collectQuotes(units.map(unit => splitSegments(unit.text)));
+    if (!quotes.length) return [];
+
+    const speakers = await identifySpeakers(message, units, quotes);
+    for (const quote of quotes) {
+        quote.speaker = String(speakers[quote.id] ?? '').trim();
+    }
+
+    const cast = [];
+    for (const quote of quotes) {
+        if (!isForeignSpeaker(quote.speaker, message) || cast.includes(quote.speaker)) continue;
+        cast.push(quote.speaker);
+        await castVoice(quote.speaker, quotes);
+    }
+    return cast;
+}
+
+/** Messages with quoted speech in them, newest first. */
+function quotedMessages(limit) {
+    const chat = ctx().chat ?? [];
+    const found = [];
+    for (let i = chat.length - 1; i >= 0 && found.length < limit; i--) {
+        const quotes = collectQuotes(buildUnits(chat[i]?.mes).map(unit => splitSegments(unit.text)));
+        if (quotes.length) found.push(i);
+    }
+    return found;
 }
 
 /** Generate every clip for a message ahead of playback, sequentially. */
@@ -370,11 +1606,13 @@ async function prefetchMessage(index) {
     const message = ctx().chat?.[index];
     if (!breeze?.available || !message) return;
 
-    const voice = breeze.voiceForCharacter(message.name);
-    if (!voice) return;
+    const direction = getDirection(message);
+    const units = buildUnits(message.mes);
 
-    for (const unit of buildUnits(message.mes)) {
-        await breeze.prefetch(unit.text, voice);
+    for (let i = 0; i < units.length; i++) {
+        for (const clip of clipsFor(message, direction?.lines?.[i] ?? units[i], index, i)) {
+            if (clip.voice) await breeze.prefetch(clip.text, clip.voice, clip.hint);
+        }
     }
 }
 
@@ -387,12 +1625,10 @@ async function prepare(index) {
     if (!message) return;
 
     if (config.auto && !hasDirection(index)) await run(index);
-    await ensureVoice(message.name);
     if (config.prefetch) await prefetchMessage(index);
 }
 
-// ---------------------------------------------------------------- editor UI
-
+// ----------------------------------------------------------- message buttons
 
 const DIRECT_BUTTON_HTML = '<div title="Voice direction" class="mes_button mes_breeze_direct fa-solid fa-masks-theater"></div>';
 const PLAY_BUTTON_HTML = '<div title="Narration player" class="mes_button mes_breeze_play fa-solid fa-headphones"></div>';
@@ -415,7 +1651,7 @@ function addButtons() {
 // ------------------------------------------------------------------- position
 
 function positionKey(messageId) {
-    return `${ctx().getCurrentChatId?.() ?? 'chat'}:${messageId}`;
+    return `${currentChatId()}:${messageId}`;
 }
 
 function savePosition(messageId, index) {
@@ -442,9 +1678,9 @@ function clearPosition(messageId) {
 
 const player = {
     audio: new Audio(),
-    units: [],
-    index: 0,
-    voice: null,
+    units: [],        // paragraphs; each holds the clips it plays in order
+    index: 0,         // paragraph
+    clipIndex: 0,     // segment within the paragraph
     messageId: null,
     url: null,
     onChange: null,
@@ -457,29 +1693,44 @@ const player = {
         const breeze = globalThis.breezeTts;
         if (!breeze?.available) throw new Error('Select the Breeze TTS provider first.');
 
-        const voice = breeze.voiceForCharacter(message.name);
-        if (!voice) throw new Error(`No Breeze voice assigned to ${message.name}.`);
+        if (!defaultVoice(message)) {
+            throw new Error(`No Breeze voice assigned to ${message.name}, and no narrator voice set.`);
+        }
 
         this.stop();
         this.messageId = messageId;
-        this.units = buildUnits(message.mes);
-        this.voice = voice;
+
+        // Paragraph-granular units keep resume keys and panel rows unchanged;
+        // the voice switching lives inside each unit's clip list.
+        const direction = getDirection(message);
+        this.units = buildUnits(message.mes).map((unit, i) => ({
+            text: unit.text,
+            clips: clipsFor(message, direction?.lines?.[i] ?? unit, messageId, i).filter(c => c.voice),
+        }));
+
         this.index = Math.min(loadPosition(messageId), Math.max(this.units.length - 1, 0));
+        this.clipIndex = 0;
         return this.units;
     },
 
-    async playAt(index) {
+    async playAt(index, clipIndex = 0) {
         if (index < 0 || index >= this.units.length) return this.stop();
 
+        const clips = this.units[index].clips;
+        if (clipIndex >= clips.length) return this.playAt(index + 1);
+
         this.index = index;
-        savePosition(this.messageId, index);
+        this.clipIndex = clipIndex;
+        // Resume is paragraph-granular: only record on entering one.
+        if (clipIndex === 0) savePosition(this.messageId, index);
         this.notify('loading');
 
         // Ignore results from any earlier play that is still resolving.
         const token = ++this.loadToken;
         let clip;
         try {
-            clip = await globalThis.breezeTts.getClip(this.units[index].text, this.voice);
+            const wanted = clips[clipIndex];
+            clip = await globalThis.breezeTts.getClip(wanted.text, wanted.voice, wanted.hint);
         } catch (error) {
             toastr.error(String(error?.message ?? error), 'Breeze Player');
             return this.notify('error');
@@ -493,9 +1744,9 @@ const player = {
         await this.audio.play().catch(() => { });
         this.notify('playing');
 
-        // Warm the next clip while this one plays.
-        const next = this.units[index + 1];
-        if (next) globalThis.breezeTts.prefetch(next.text, this.voice);
+        // Warm whatever comes next: the rest of this paragraph, then the next.
+        const next = clips[clipIndex + 1] ?? this.units[index + 1]?.clips?.[0];
+        if (next) globalThis.breezeTts.prefetch(next.text, next.voice, next.hint);
     },
 
     next() { return this.playAt(this.index + 1); },
@@ -503,7 +1754,7 @@ const player = {
 
     toggle() {
         if (this.audio.paused) {
-            if (!this.audio.src) return this.playAt(this.index);
+            if (!this.audio.src) return this.playAt(this.index, this.clipIndex);
             this.audio.play().catch(() => { });
             this.notify('playing');
         } else {
@@ -514,6 +1765,7 @@ const player = {
 
     stop() {
         this.loadToken++;
+        this.clipIndex = 0;
         this.audio.pause();
         this.audio.removeAttribute('src');
         this.revoke();
@@ -526,11 +1778,19 @@ const player = {
     },
 
     notify(state) {
+        // index only: the panel reads clipIndex off the player for the rest.
         if (typeof this.onChange === 'function') this.onChange(state, this.index);
     },
 };
 
 player.audio.addEventListener('ended', () => {
+    // Mid-paragraph the reading always continues; autoplay only governs whether
+    // playback carries on across a paragraph break.
+    const clips = player.units[player.index]?.clips ?? [];
+    if (player.clipIndex + 1 < clips.length) {
+        return player.playAt(player.index, player.clipIndex + 1);
+    }
+
     if (!playerSettings().autoplay_next) return player.notify('paused');
     if (player.index + 1 < player.units.length) {
         player.playAt(player.index + 1);
@@ -540,7 +1800,6 @@ player.audio.addEventListener('ended', () => {
     }
 });
 
-// ------------------------------------------------------------------------- UI
 // ------------------------------------------------------------- inline panel
 // One panel per message, rendered into the message block itself rather than a
 // popup, so the chat stays visible and playback can highlight as it goes.
@@ -571,15 +1830,60 @@ function button(icon, title, handler, label) {
     return element;
 }
 
-/** Bytes as MB or KB, whichever reads better. */
-function size(bytes) {
-    return bytes > 1048576 ? `${(bytes / 1048576).toFixed(1)} MB` : `${Math.round(bytes / 1024)} KB`;
-}
-
 function stamp(ts) {
     if (!ts) return 'earlier take';
     const date = new Date(ts);
     return `${date.toLocaleDateString()} ${date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}`;
+}
+
+/** Who reads each span of a paragraph, with a per-segment voice override. */
+function castRows(message, segments, editable) {
+    const box = document.createElement('div');
+    box.style.cssText = 'margin-top:0.35em;display:flex;flex-direction:column;gap:0.25em;';
+    const available = globalThis.breezeTts?.listVoices?.() ?? [];
+
+    for (const segment of segments) {
+        const line = document.createElement('div');
+        line.style.cssText = 'display:flex;gap:0.4em;align-items:center;'
+            + 'font-size:calc(var(--mainFontSize) * 0.9);';
+
+        const who = document.createElement('span');
+        who.style.cssText = 'opacity:0.7;flex:0 0 auto;';
+        who.textContent = segment.kind === 'dialogue' ? (segment.speaker || 'unattributed') : 'narration';
+
+        const text = document.createElement('span');
+        text.style.cssText = 'flex:1;min-width:0;opacity:0.55;'
+            + 'white-space:nowrap;overflow:hidden;text-overflow:ellipsis;';
+        text.textContent = segment.text;
+
+        const select = document.createElement('select');
+        select.className = 'text_pole';
+        select.style.cssText = 'flex:0 0 auto;width:auto;';
+
+        // "auto" spells out what would play, so an override is an informed choice.
+        const auto = document.createElement('option');
+        auto.value = '';
+        auto.textContent = `auto (${voiceForSegment({ ...segment, voice: null }, message) ?? 'none'})`;
+        select.append(auto);
+        for (const name of available) {
+            const option = document.createElement('option');
+            option.value = name;
+            option.textContent = name;
+            select.append(option);
+        }
+
+        select.value = segment.voice ?? '';
+        select.disabled = !editable;
+        select.addEventListener('change', async () => {
+            if (select.value) segment.voice = select.value;
+            else delete segment.voice;
+            await ctx().saveChat();
+        });
+
+        line.append(who, text, select);
+        box.append(line);
+    }
+    return box;
 }
 
 async function openPanel(messageId, { play = false, expandAll = false } = {}) {
@@ -661,6 +1965,12 @@ async function openPanel(messageId, { play = false, expandAll = false } = {}) {
         const lines = takeLines();
         const editable = viewing === 0;
 
+        // The exact clip on air, so the panel can name the voice reading it.
+        const active = playingIndex >= 0 && player.messageId === messageId
+            ? player.units[playingIndex]?.clips?.[player.clipIndex] ?? null
+            : null;
+        const who = active?.voice ? ` — ${active.speaker ?? 'narration'} in "${active.voice}"` : '';
+
         list.innerHTML = '';
         rows = units.map((unit, i) => {
             const row = document.createElement('div');
@@ -697,6 +2007,26 @@ async function openPanel(messageId, { play = false, expandAll = false } = {}) {
             });
             row.append(headRow);
 
+            // Chips make a multi-voice paragraph visible without expanding it.
+            const voices = [...new Set((lines[i]?.segments ?? [])
+                .map(segment => voiceForSegment(segment, message))
+                .filter(Boolean))];
+            if (voices.length > 1) {
+                const chips = document.createElement('div');
+                chips.style.cssText = 'display:flex;gap:0.3em;flex-wrap:wrap;margin:0.2em 0 0 1.4em;'
+                    + 'font-size:calc(var(--mainFontSize) * 0.85);';
+                for (const name of voices) {
+                    const chip = document.createElement('span');
+                    const live = i === playingIndex && name === active?.voice;
+                    chip.style.cssText = 'border:1px solid var(--white20a);border-radius:4px;'
+                        + `padding:0 0.35em;opacity:${live ? '1' : '0.55'};`
+                        + (live ? 'font-weight:bold;' : '');
+                    chip.textContent = name;
+                    chips.append(chip);
+                }
+                row.append(chips);
+            }
+
             let input = null;
             if (expanded.has(i)) {
                 input = document.createElement('textarea');
@@ -713,6 +2043,9 @@ async function openPanel(messageId, { play = false, expandAll = false } = {}) {
                     await ctx().saveChat();
                 });
                 row.append(input);
+
+                const segments = lines[i]?.segments ?? [];
+                if (segments.length) row.append(castRows(message, segments, editable));
             }
 
             if (i === playingIndex) row.style.background = 'var(--white20a)';
@@ -731,9 +2064,9 @@ async function openPanel(messageId, { play = false, expandAll = false } = {}) {
         status.textContent = !direction
             ? 'No direction yet — press the rotate button to generate one.'
             : state === 'loading'
-                ? `Generating audio for paragraph ${playingIndex + 1}…`
+                ? `Generating audio for paragraph ${playingIndex + 1}…${who}`
                 : playingIndex >= 0
-                    ? `Paragraph ${playingIndex + 1} of ${units.length} — ${state}`
+                    ? `Paragraph ${playingIndex + 1} of ${units.length} — ${state}${who}`
                     : `${units.length} paragraphs`;
     }
 
@@ -819,8 +2152,21 @@ async function eraseClips(messageId) {
     const breeze = globalThis.breezeTts;
     if (!message || !breeze?.available) return;
 
-    const voice = breeze.voiceForCharacter(message.name);
-    if (!voice) return toastr.info(`No Breeze voice assigned to ${message.name}.`, 'Breeze');
+    // A message can now span several voices, and clips are keyed per voice.
+    const direction = getDirection(message);
+    const units = buildUnits(message.mes);
+    const byVoice = new Map();
+    units.forEach((unit, i) => {
+        for (const clip of clipsFor(message, direction?.lines?.[i] ?? unit, messageId, i)) {
+            if (!clip.voice) continue;
+            if (!byVoice.has(clip.voice)) byVoice.set(clip.voice, []);
+            byVoice.get(clip.voice).push(clip.text);
+        }
+    });
+
+    if (!byVoice.size) {
+        return toastr.info(`No Breeze voice assigned to ${message.name}.`, 'Breeze');
+    }
 
     // Older providers only offer an all-or-nothing clear; say so rather than
     // quietly wiping every other message's audio too.
@@ -837,8 +2183,14 @@ async function eraseClips(messageId) {
         return toastr.success(`Cleared ${before.count} clips (${size(before.bytes)}).`, 'Breeze');
     }
 
-    const texts = buildUnits(message.mes).map(unit => unit.text);
-    const { count, bytes } = await breeze.dropClips(texts, voice);
+    let count = 0;
+    let bytes = 0;
+    for (const [voice, texts] of byVoice) {
+        const dropped = await breeze.dropClips(texts, voice);
+        count += dropped.count;
+        bytes += dropped.bytes;
+    }
+
     toastr.success(
         count ? `Erased ${count} clips (${size(bytes)}) for this message.` : 'Nothing cached for this message.',
         'Breeze',
@@ -864,7 +2216,7 @@ function togglePlayback(messageId) {
 
 function resumeLatest() {
     const config = playerSettings();
-    const chatId = ctx().getCurrentChatId?.() ?? 'chat';
+    const chatId = currentChatId();
     const prefix = `${chatId}:`;
 
     const candidates = Object.keys(config.resume)
@@ -878,6 +2230,272 @@ function resumeLatest() {
     }
     openPanel(Math.max(...candidates), { play: true });
 }
+// ------------------------------------------------------------------ cast sheet
+// One row per speaker the director has cast in this chat: the base voice it
+// built them from, and the tone description that separates them from it.
+// Edits apply immediately — there is no save button to forget to press.
+
+async function openCastSheet() {
+    const context = ctx();
+    const breeze = globalThis.breezeTts;
+    if (!breeze?.available) {
+        return toastr.warning('Select the Breeze TTS provider first.', 'Breeze Director');
+    }
+
+    const cast = castMap();
+    const wrapper = document.createElement('div');
+    wrapper.style.cssText = 'text-align:left;';
+
+    const heading = document.createElement('h3');
+    heading.textContent = 'Voice cast';
+    const note = document.createElement('small');
+    note.style.cssText = 'display:block;opacity:0.7;margin-bottom:0.6em;';
+    note.textContent = 'Each speaker speaks through one of your Breeze voices, under a '
+        + 'description of their own. Nothing here changes the Breeze voices themselves — '
+        + 'those are yours to manage. Changes are saved as you make them.';
+    wrapper.append(heading, note);
+
+    // --- toolbar --------------------------------------------------------
+    const bar = document.createElement('div');
+    bar.className = 'flex-container';
+    bar.style.cssText = 'gap:0.4em;align-items:center;flex-wrap:wrap;margin-bottom:0.6em;';
+
+    const addButton = button(null, 'Add a speaker by hand', () => addSpeaker(), 'Add speaker');
+    const scanButton = button(null, 'Find speakers in recent messages', () => scanChat(), 'Scan chat');
+    const progress = document.createElement('small');
+    progress.style.cssText = 'opacity:0.7;flex:1 1 auto;';
+
+    bar.append(addButton, scanButton, progress);
+    wrapper.append(bar);
+
+    const list = document.createElement('div');
+    wrapper.append(list);
+
+    /**
+     * Pre-stage someone who has not spoken yet. Added by hand means chosen
+     * deliberately, so the entry is pinned: nothing later overrides it.
+     */
+    async function addSpeaker() {
+        const name = await context.callGenericPopup(
+            'Name of the speaker to add:', context.POPUP_TYPE.INPUT, '',
+        );
+        const speaker = String(name ?? '').trim();
+        if (!speaker) return;
+        if (cast[speaker]) return toastr.info(`${speaker} is already cast.`, 'Breeze Director');
+
+        cast[speaker] = { voice: null, base: null, pinned: true };
+        context.saveSettingsDebounced();
+        onCastChanged?.();
+        paint();
+    }
+
+    /** Run the casting half of the director over recent messages. */
+    async function scanChat() {
+        if (!settings().profile) {
+            return toastr.warning('Pick a connection profile first.', 'Breeze Director');
+        }
+
+        const targets = quotedMessages(CAST_SCAN_LIMIT);
+        if (!targets.length) {
+            return toastr.info('No quoted speech in this chat yet.', 'Breeze Director');
+        }
+
+        const confirmed = await context.callGenericPopup(
+            `Scan ${targets.length} message${targets.length === 1 ? '' : 's'} for speakers? `
+            + `That is at least ${targets.length} model calls, plus one for each new voice.`,
+            context.POPUP_TYPE.CONFIRM,
+        );
+        if (!confirmed) return;
+
+        scanButton.classList.add('disabled');
+        const named = new Set();
+        try {
+            for (let i = 0; i < targets.length; i++) {
+                progress.textContent = `Scanning message ${i + 1} of ${targets.length}…`;
+                for (const speaker of await castMessage(targets[i])) named.add(speaker);
+                paint();
+            }
+            progress.textContent = named.size
+                ? `Found ${[...named].join(', ')}.`
+                : 'No new speakers found.';
+        } catch (error) {
+            console.error('[Breeze Director] cast scan failed:', error);
+            progress.textContent = 'Scan failed — see the console.';
+        } finally {
+            scanButton.classList.remove('disabled');
+        }
+    }
+
+    function paint() {
+        const available = breeze.listVoices();
+        const speakers = Object.keys(cast).sort();
+
+        list.innerHTML = '';
+        if (!speakers.length) {
+            const empty = document.createElement('small');
+            empty.style.opacity = '0.6';
+            empty.textContent = 'Nobody cast yet. Speakers appear here as the director names them.';
+            list.append(empty);
+            return;
+        }
+
+        for (const speaker of speakers) {
+            const entry = castEntry(cast[speaker]);
+            const row = document.createElement('div');
+            row.style.cssText = 'border-top:1px solid var(--white20a);padding:0.6em 0;';
+
+            const head = document.createElement('div');
+            head.style.cssText = 'display:flex;gap:0.4em;align-items:center;flex-wrap:wrap;';
+
+            const who = document.createElement('b');
+            who.style.cssText = 'flex:1 1 8em;min-width:0;';
+            who.textContent = speaker;
+
+            const voiced = !!entry.base && breeze.hasVoice(entry.base);
+            const voice = document.createElement('small');
+            voice.style.cssText = 'opacity:0.6;flex:0 0 auto;';
+            voice.textContent = voiced
+                ? (entry.source === 'voicemap' ? 'from voice map' : 'ready')
+                : (entry.base ? `base "${entry.base}" is missing` : 'no base yet');
+
+            head.append(who, voice);
+
+            // Base voice: timbre this character was built from.
+            const baseSelect = document.createElement('select');
+            baseSelect.className = 'text_pole';
+            baseSelect.style.cssText = 'flex:0 0 auto;width:auto;';
+            const none = document.createElement('option');
+            none.value = '';
+            none.textContent = '— no base —';
+            baseSelect.append(none);
+            for (const name of available) {
+                const option = document.createElement('option');
+                option.value = name;
+                option.textContent = name;
+                baseSelect.append(option);
+            }
+            baseSelect.value = available.includes(entry.base) ? entry.base : '';
+            baseSelect.addEventListener('change', async () => {
+                entry.base = baseSelect.value || null;
+                cast[speaker] = entry;
+                await rederive(speaker, entry);
+                context.saveSettingsDebounced();
+                paint();
+            });
+
+            const preview = button('fa-play', `Hear ${speaker}`, async () => {
+                if (!voiced) {
+                    return toastr.info('Pick a base voice for them first.', 'Breeze Director');
+                }
+                try {
+                    // Composed on the fly: nothing about this member is stored
+                    // in the provider's voices, which are yours to manage.
+                    await breeze.previewWith(
+                        entry.base,
+                        castInstruction(entry),
+                        basePreset(entry.base)?.cfg_scale ?? Number(settings().cfg_scale),
+                    );
+                } catch (error) {
+                    toastr.error(String(error?.message ?? error), 'Breeze');
+                }
+            });
+            if (!voiced) preview.style.opacity = '0.4';
+
+            const recast = button('fa-rotate', 'Choose a base voice again', async () => {
+                const base = await askCasting(speaker, [], entry);
+                if (!base) return toastr.warning('Nothing usable came back.', 'Breeze Director');
+                entry.base = base;
+                cast[speaker] = entry;
+                await rederive(speaker, entry);
+                context.saveSettingsDebounced();
+                paint();
+            });
+
+            const forget = button('fa-xmark', 'Forget this speaker', () => {
+                delete cast[speaker];
+                context.saveSettingsDebounced();
+                onCastChanged?.();
+                paint();
+            });
+
+            head.append(baseSelect, preview, recast, forget);
+            row.append(head);
+
+            // The fields the director filled in, all editable.
+            const fields = document.createElement('div');
+            fields.style.cssText = 'display:flex;gap:0.4em;flex-wrap:wrap;margin-top:0.35em;';
+            for (const field of ['gender', 'age', 'accent']) {
+                const input = document.createElement('input');
+                input.className = 'text_pole';
+                input.type = 'text';
+                input.style.cssText = 'flex:1 1 7em;min-width:5em;';
+                input.placeholder = field;
+                input.value = entry[field] ?? '';
+                input.addEventListener('change', async () => {
+                    const value = input.value.trim();
+                    if (value) entry[field] = value;
+                    else delete entry[field];
+                    cast[speaker] = entry;
+                    await rederive(speaker, entry);
+                    context.saveSettingsDebounced();
+                    paint();
+                });
+                fields.append(input);
+            }
+            row.append(fields);
+
+            const tone = document.createElement('textarea');
+            tone.className = 'text_pole textarea_compact';
+            tone.rows = 2;
+            tone.style.marginTop = '0.35em';
+            tone.placeholder = 'tone and manner of speaking';
+            tone.value = entry.tone ?? '';
+            tone.addEventListener('change', async () => {
+                const value = tone.value.trim();
+                if (value) entry.tone = value;
+                else delete entry.tone;
+                cast[speaker] = entry;
+                await rederive(speaker, entry);
+                context.saveSettingsDebounced();
+                paint();
+            });
+            row.append(tone);
+
+            // What Breeze is actually told, so an edit's effect is visible.
+            const built = document.createElement('small');
+            built.style.cssText = 'display:block;opacity:0.6;margin-top:0.25em;';
+            const instruction = castInstruction(entry);
+            built.textContent = instruction
+                ? `Breeze hears: ${instruction}`
+                : 'Nothing to send yet — pick a base voice or describe their tone.';
+            row.append(built);
+
+            list.append(row);
+        }
+    }
+
+    /**
+     * Record an edit. Nothing is written to the provider — a cast member is a
+     * base plus a description, composed when a line is generated. Editing pins
+     * the entry, so a hand-assigned voice-map entry no longer overrides it: the
+     * edit was an explicit choice and should stick.
+     */
+    function rederive(speaker, entry) {
+        entry.pinned = true;
+        delete entry.source;
+        onCastChanged?.();
+    }
+
+    paint();
+    // .popup-content is overflow:hidden unless the popup opts in, so without
+    // allowVerticalScrolling a cast longer than the dialog is simply unreachable.
+    await context.callGenericPopup(wrapper, context.POPUP_TYPE.DISPLAY, '', {
+        wide: true,
+        large: true,
+        allowVerticalScrolling: true,
+    });
+}
+
 const SETTINGS_HTML = `
 <div class="breeze-director-settings">
   <div class="inline-drawer">
@@ -890,8 +2508,12 @@ const SETTINGS_HTML = `
       <label class="checkbox_label"><input id="bd_auto" type="checkbox"> Generate automatically on new character messages</label>
       <label class="checkbox_label"><input id="bd_auto_user" type="checkbox"> …and on user messages</label>
       <label class="checkbox_label"><input id="bd_prefetch" type="checkbox"> Pre-generate audio after directing</label>
-      <label class="checkbox_label"><input id="bd_auto_voice" type="checkbox"> Design a voice from the character card when one is missing</label>
+      <label class="checkbox_label"><input id="bd_cast" type="checkbox"> Give quoted speech its own voice per speaker</label>
       <small>Click the masks icon on any message to view, generate, or edit its direction.</small>
+      <small id="bd_paragraph_warn" style="color:var(--golden);display:block;"></small>
+
+      <label for="bd_narrator">Narrator voice (everything outside quotes):</label>
+      <select id="bd_narrator" class="text_pole"></select>
 
       <label for="bd_profile">Connection Profile:</label>
       <select id="bd_profile" class="text_pole"></select>
@@ -908,6 +2530,11 @@ const SETTINGS_HTML = `
         <option value="append">Append to it</option>
       </select>
 
+      <label for="bd_identify_chunk">Paragraphs per speaker-identification call:</label>
+      <input id="bd_identify_chunk" type="number" min="-1" step="1" class="text_pole">
+      <small>-1 sends the whole message in one call, which gives the most context.
+      Lower it only if long messages lose track of who is who.</small>
+
       <label for="bd_cfg">CFG scale:</label>
       <input id="bd_cfg" type="number" min="1" max="10" step="1" class="text_pole">
 
@@ -919,9 +2546,28 @@ const SETTINGS_HTML = `
       <textarea id="bd_prompt" class="text_pole textarea_compact" rows="14"></textarea>
       <input id="bd_reset" class="menu_button" type="button" value="Reset prompt">
 
-      <label for="bd_voice_prompt">Voice design prompt (<code>{{char}}</code>, <code>{{description}}</code>):</label>
-      <textarea id="bd_voice_prompt" class="text_pole textarea_compact" rows="10"></textarea>
-      <input id="bd_voice_reset" class="menu_button" type="button" value="Reset voice prompt">
+      <label for="bd_identify_prompt">Speaker identification prompt (<code>{{context}}</code>,
+      <code>{{parts}}</code>, <code>{{quotes}}</code>, <code>{{char}}</code>,
+      <code>{{user}}</code>):</label>
+      <textarea id="bd_identify_prompt" class="text_pole textarea_compact" rows="12"></textarea>
+      <input id="bd_identify_reset" class="menu_button" type="button" value="Reset identification prompt">
+
+      <label for="bd_voice_cast_prompt">Voice casting prompt (<code>{{speaker}}</code>,
+      <code>{{card}}</code>, <code>{{lines}}</code>, <code>{{voices}}</code>,
+      <code>{{cast}}</code>):</label>
+      <textarea id="bd_voice_cast_prompt" class="text_pole textarea_compact" rows="10"></textarea>
+      <input id="bd_voice_cast_reset" class="menu_button" type="button" value="Reset casting prompt">
+      <small id="bd_cast_prompt_warn" style="color:var(--golden);display:block;"></small>
+
+      <hr>
+      <b>Cast for this chat</b>
+      <small>Each speaker the director names is given one of your Breeze voices as a
+      base, plus a description of their own. Breeze's own voices are never modified.</small>
+      <div class="flex-container" style="gap:0.5em;align-items:center;margin-top:0.4em;">
+        <input id="bd_cast_open" class="menu_button" type="button" value="Open voice cast">
+        <input id="bd_cast_clear" class="menu_button" type="button" value="Forget whole cast">
+        <span id="bd_cast_count" class="flex1"></span>
+      </div>
 
       <hr>
       <b>Player</b>
@@ -955,18 +2601,83 @@ function bind() {
     checkbox('#bd_auto', 'auto');
     checkbox('#bd_auto_user', 'auto_user');
     checkbox('#bd_prefetch', 'prefetch');
-    checkbox('#bd_auto_voice', 'auto_voice');
+    checkbox('#bd_cast', 'cast_enabled');
     field('#bd_missing', 'on_missing');
     field('#bd_mode', 'mode');
     field('#bd_cfg', 'cfg_scale', Number);
     field('#bd_tokens', 'max_tokens', Number);
+    field('#bd_identify_chunk', 'identify_chunk', Number);
+    field('#bd_identify_prompt', 'identify_prompt');
     field('#bd_prompt', 'prompt');
-    field('#bd_voice_prompt', 'voice_prompt');
+    field('#bd_voice_cast_prompt', 'voice_cast_prompt');
+
+    // Two silent-failure modes worth naming: a saved prompt from before casting
+    // never returns speakers, and with ST's own paragraph narration off it hands
+    // the provider the whole message as one job.
+    const warn = () => {
+        $('#bd_cast_prompt_warn').text(config.voice_cast_prompt.includes('{{cast}}')
+            ? ''
+            : 'This saved casting prompt cannot see the existing cast — click '
+                + '"Reset casting prompt" so the director keeps voices consistent.');
+        $('#bd_paragraph_warn').text(ctx().extensionSettings?.tts?.narrate_by_paragraphs
+            ? ''
+            : 'SillyTavern\'s "Narrate by paragraphs" is off, so its own narration reads '
+                + 'each message as a single job. The player here is unaffected.');
+    };
+    warn();
+    $('#bd_prompt').on('input', warn);
+
+    // Voices come from the provider's JSON, which the user can edit at any time.
+    const fillVoices = () => {
+        const available = globalThis.breezeTts?.listVoices?.() ?? [];
+        const select = $('#bd_narrator');
+        select.empty().append($('<option/>').val('').text('— the character\'s own voice —'));
+        for (const name of available) select.append($('<option/>').val(name).text(name));
+        select.val(available.includes(config.narrator_voice) ? config.narrator_voice : '');
+    };
+    fillVoices();
+    $('#bd_narrator').on('focus', fillVoices).on('change', function () {
+        config.narrator_voice = String($(this).val() ?? '');
+        save();
+    });
+
+    // The sheet is the editor; the panel only reports and opens it.
+    const renderCast = () => {
+        const cast = settings().cast?.[currentChatId()] ?? {};
+        const count = Object.keys(cast).length;
+        $('#bd_cast_count').text(count ? `${count} cast` : 'nobody cast yet');
+    };
+    renderCast();
+    onCastChanged = renderCast;
+
+    $('#bd_cast_open').on('click', openCastSheet);
+
+    $('#bd_cast_clear').on('click', () => {
+        const cast = settings().cast?.[currentChatId()] ?? {};
+        for (const speaker of Object.keys(cast)) delete cast[speaker];
+        save();
+        renderCast();
+        toastr.info('Cast forgotten for this chat.', 'Breeze Director');
+    });
 
     $('#bd_reset').on('click', () => {
         config.prompt = DEFAULT_PROMPT;
         $('#bd_prompt').val(DEFAULT_PROMPT);
         save();
+        warn();
+    });
+
+    $('#bd_identify_reset').on('click', () => {
+        config.identify_prompt = DEFAULT_IDENTIFY_PROMPT;
+        $('#bd_identify_prompt').val(DEFAULT_IDENTIFY_PROMPT);
+        save();
+    });
+
+    $('#bd_voice_cast_reset').on('click', () => {
+        config.voice_cast_prompt = DEFAULT_VOICE_CAST_PROMPT;
+        $('#bd_voice_cast_prompt').val(DEFAULT_VOICE_CAST_PROMPT);
+        save();
+        warn();
     });
     const playerConfig = playerSettings();
     $('#bp_autoplay').prop('checked', playerConfig.autoplay_next).on('change', function () {
@@ -984,12 +2695,6 @@ function bind() {
         await globalThis.breezeTts?.clearCache?.();
         showCacheSize();
         toastr.success('Cached audio erased.', 'Breeze');
-    });
-
-    $('#bd_voice_reset').on('click', () => {
-        config.voice_prompt = DEFAULT_VOICE_PROMPT;
-        $('#bd_voice_prompt').val(DEFAULT_VOICE_PROMPT);
-        save();
     });
 
     try {
@@ -1029,6 +2734,13 @@ jQuery(async () => {
     });
 
     $('#tts_wand_container').append(`
+        <div id="breezeVoiceCast" class="list-group-item flex-container flexGap5" title="Voices cast in this chat">
+            <div class="extensionsMenuExtensionButton fa-solid fa-users"></div>
+            <span>Voice cast</span>
+        </div>`);
+    $('#breezeVoiceCast').on('click', openCastSheet);
+
+    $('#tts_wand_container').append(`
         <div id="breezePlayerResume" class="list-group-item flex-container flexGap5" title="Resume Breeze narration">
             <div class="extensionsMenuExtensionButton fa-solid fa-headphones"></div>
             <span>Resume narration</span>
@@ -1055,7 +2767,8 @@ jQuery(async () => {
     });
     eventSource.on(event_types.CHAT_CHANGED, () => {
         inFlight.clear();
-        voiceJobs.clear();
+        castJobs.clear();
+        onCastChanged?.();
         player.stop();
         closeAllPanels();
         addButtons();
