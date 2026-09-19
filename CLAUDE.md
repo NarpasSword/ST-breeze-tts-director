@@ -342,7 +342,9 @@ Three views, because a wrong voice is otherwise invisible until you hear it:
 The sheet itself is `openCastSheet()`, opened from the wand menu's **Voice
 cast** entry or the settings button. One row per speaker: base voice, gender,
 age, accent, tone, the composed instruction, preview, re-base, forget. Its
-toolbar has two chat-level actions:
+toolbar has two chat-level actions. It opens with `allowVerticalScrolling`,
+without which SillyTavern's `.popup-content` stays `overflow: hidden`
+(`css/popup.css`) and any cast taller than the dialog is unreachable:
 
 - **Add speaker** pre-stages someone who has not spoken yet. A hand-added entry
   is `pinned`, so when the director eventually names them it reuses the entry

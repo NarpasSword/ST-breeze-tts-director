@@ -79,7 +79,11 @@ const context = {
     chat: [], characters: [], name1: 'You', name2: 'Char',
     getCurrentChatId: () => 'chat-1',
     saveSettingsDebounced() {}, saveChat: async () => {},
-    callGenericPopup: async () => true,
+    popups: [],
+    callGenericPopup: async (content, type, value, options) => {
+        context.popups.push({ type, options: options ?? {} });
+        return true;
+    },
     POPUP_TYPE: { CONFIRM: 1 },
     eventSource: { on() {} },
     event_types: {
@@ -594,6 +598,10 @@ function runCastScenarios() {
             await sheet.openCastSheet();
             const rows = built.length - marker;
             eq('builds rows for every entry', rows > 10, true);
+
+            // A cast longer than the dialog is unreachable without this: ST's
+            // .popup-content is overflow:hidden unless the popup opts in.
+            eq('opens scrollable', context.popups.at(-1)?.options.allowVerticalScrolling, true);
 
             const fired = await fireAll(marker, 'cast sheet');
             eq('handlers were bound and ran', fired > 5, true);

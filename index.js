@@ -2487,7 +2487,13 @@ async function openCastSheet() {
     }
 
     paint();
-    await context.callGenericPopup(wrapper, context.POPUP_TYPE.DISPLAY, '', { wide: true, large: true });
+    // .popup-content is overflow:hidden unless the popup opts in, so without
+    // allowVerticalScrolling a cast longer than the dialog is simply unreachable.
+    await context.callGenericPopup(wrapper, context.POPUP_TYPE.DISPLAY, '', {
+        wide: true,
+        large: true,
+        allowVerticalScrolling: true,
+    });
 }
 
 const SETTINGS_HTML = `
