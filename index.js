@@ -678,6 +678,10 @@ Already cast in this scene:
 {{list}}
 `;
 
+// Horizontal rules: --- *** ___ ===, and rows of tildes. Page furniture, not
+// speech, and Breeze reads them aloud as a run of dashes.
+const DEFAULT_EXCLUSIONS = '^[-*_=~]{3,}$';
+
 const DEFAULTS = {
     enabled: true,
     auto: true,
@@ -694,6 +698,8 @@ const DEFAULTS = {
     voice_cast_prompt: DEFAULT_VOICE_CAST_PROMPT,
     identify_prompt: DEFAULT_IDENTIFY_PROMPT,
     identify_chunk: -1,   // paragraphs per identification call; -1 = whole message
+    exclusions: DEFAULT_EXCLUSIONS,  // one regex per line; matching lines go unread
+    skip_tags: true,      // drop <tag>…</tag> blocks, as SillyTavern's own TTS does
     cast: {},             // chatId -> { speaker: { voice, base, tone } }
     prompt_stamps: {},    // key -> hash of the default it was written from
 };
@@ -797,10 +803,50 @@ const BLANK_EDGES = new RegExp(`^${BLANK.source}+|${BLANK.source}+$`, 'g');
  * and ST's own path finds them by matching text.
  */
 function splitLines(mes) {
-    return String(mes ?? '')
+    return readableText(mes)
         .split('\n')
         .map(line => line.replace(BLANK_EDGES, ''))
-        .filter(Boolean);
+        .filter(line => line && !isExcluded(line));
+}
+
+// Tag blocks can span lines, so they have to go before the text is split. The
+// pattern is SillyTavern's own (tts/index.js:682), so that checking this box
+// removes exactly what checking theirs would.
+const TAG_BLOCK = /<.*?>[\s\S]*?<\/.*?>/g;
+
+/** The message as it should be read aloud, with anything unspoken removed. */
+function readableText(mes) {
+    const text = String(mes ?? '');
+    return settings().skip_tags ? text.replace(TAG_BLOCK, '') : text;
+}
+
+// Compiling per line would be wasteful — splitLines runs on every repaint — so
+// the compiled set is kept until the setting text itself changes.
+let compiledExclusions = { source: null, patterns: [] };
+
+function exclusionPatterns() {
+    const source = String(settings().exclusions ?? '');
+    if (compiledExclusions.source === source) return compiledExclusions.patterns;
+
+    const patterns = [];
+    for (const line of source.split('\n')) {
+        const pattern = line.trim();
+        if (!pattern) continue;
+        try {
+            patterns.push(new RegExp(pattern));
+        } catch (error) {
+            // One bad pattern must not silence the rest, or the whole message.
+            console.warn(`[Breeze Director] ignoring invalid exclusion /${pattern}/:`, error.message);
+        }
+    }
+
+    compiledExclusions = { source, patterns };
+    return patterns;
+}
+
+/** Is this line page furniture rather than something to read aloud? */
+function isExcluded(line) {
+    return exclusionPatterns().some(pattern => pattern.test(line));
 }
 
 /** A narration unit is one paragraph: exactly how TTS splits jobs by line. */
@@ -995,6 +1041,13 @@ function getDirection(message) {
     const stored = message?.extra?.breeze_direction;
     if (!stored) return null;
     if ((stored.swipe_id ?? 0) !== (message.swipe_id ?? 0)) return null;
+
+    // Paragraphs are addressed by index, so a take with a different number of
+    // them belongs to different text — an edited message, or an exclusion or tag
+    // setting changed since. Regenerating beats reading paragraph four's
+    // direction over paragraph three.
+    if ((stored.lines?.length ?? 0) !== splitLines(message.mes).length) return null;
+
     return stored;
 }
 
@@ -2784,6 +2837,15 @@ const SETTINGS_HTML = `
       <small>-1 sends the whole message in one call, which gives the most context.
       Lower it only if long messages lose track of who is who.</small>
 
+      <label class="checkbox_label"><input id="bd_skip_tags" type="checkbox"> Skip
+      <code>&lt;tag&gt;…&lt;/tag&gt;</code> blocks, as SillyTavern's own TTS does</label>
+
+      <label for="bd_exclusions">Never read lines matching (one regex per line):</label>
+      <textarea id="bd_exclusions" class="text_pole textarea_compact" rows="3"></textarea>
+      <input id="bd_exclusions_reset" class="menu_button" type="button" value="Reset exclusions">
+      <small>Matched against the trimmed line. The default catches horizontal rules
+      like <code>---</code>, which Breeze otherwise reads as a run of dashes.</small>
+
       <label for="bd_cfg">CFG scale:</label>
       <input id="bd_cfg" type="number" min="1" max="10" step="1" class="text_pole">
 
@@ -2856,6 +2918,8 @@ function bind() {
     field('#bd_cfg', 'cfg_scale', Number);
     field('#bd_tokens', 'max_tokens', Number);
     field('#bd_identify_chunk', 'identify_chunk', Number);
+    field('#bd_exclusions', 'exclusions');
+    checkbox('#bd_skip_tags', 'skip_tags');
     field('#bd_identify_prompt', 'identify_prompt');
     field('#bd_prompt', 'prompt');
     field('#bd_voice_cast_prompt', 'voice_cast_prompt');
@@ -2914,6 +2978,12 @@ function bind() {
         $('#bd_prompt').val(DEFAULT_PROMPT);
         save();
         warn();
+    });
+
+    $('#bd_exclusions_reset').on('click', () => {
+        config.exclusions = DEFAULT_EXCLUSIONS;
+        $('#bd_exclusions').val(DEFAULT_EXCLUSIONS);
+        save();
     });
 
     $('#bd_identify_reset').on('click', () => {

@@ -270,6 +270,27 @@ per speaker with `addVoice()`. It worked, but it meant the extension owned
 entries in a list the user curates, and the two drifted. `castEntry()` migrates
 those old entries by reading their derived `voice` as a `base`.
 
+### What never gets read
+
+Three filters, applied in order inside `splitLines()`:
+
+1. **Tag blocks.** `skip_tags` (on by default) drops `<tag>…</tag>` using
+   SillyTavern's own pattern (`tts/index.js:682`), so ticking this box removes
+   exactly what ticking theirs would. It runs on the whole message before
+   splitting, because a tag block can span lines.
+2. **Blank-looking lines**, as described above.
+3. **Exclusions.** `exclusions` is a newline-separated list of regexes; any line
+   matching one is dropped. The default is `^[-*_=~]{3,}$` — horizontal rules,
+   which Breeze otherwise reads aloud as a run of dashes. Patterns match the
+   **trimmed** line, are compiled once and cached until the setting text
+   changes, and one that fails to compile is logged and skipped rather than
+   silencing the message.
+
+All three change what paragraph three means, and paragraphs are addressed by
+index, so `getDirection()` drops a stored take whose line count no longer
+matches the message. That also covers an edited message, which would otherwise
+read one paragraph's direction over another.
+
 ### Skipping paragraphs
 
 Each row in the message panel has a checkbox. Checked means read aloud, and

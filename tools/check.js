@@ -349,12 +349,14 @@ function eq(label, got, want) {
 
 async function runAssertions() {
 const api = new Function(source + `;return {
+    isExcluded, readableText, getDirection, DEFAULT_EXCLUSIONS, settings,
     splitSegments, collectQuotes, isNamedSpeaker, parseDirection,
     normalize, pickLine, castEntry, hash, syncPrompts, skipped, isSkipped, setSkipped,
     voiceInstruction, cleanProfile, PROFILE_FIELDS, splitLines, buildUnits, targetMessage,
     extractJson, normalizeQuoteId,
     DEFAULT_PROMPT, DEFAULT_VOICE_CAST_PROMPT };`)();
-const { splitSegments, collectQuotes, isNamedSpeaker, parseDirection,
+const { isExcluded, readableText, getDirection,
+        splitSegments, collectQuotes, isNamedSpeaker, parseDirection,
         normalize, pickLine, castEntry, hash, syncPrompts, skipped, isSkipped, setSkipped,
         voiceInstruction, cleanProfile, splitLines, buildUnits, targetMessage,
         extractJson, normalizeQuoteId } = api;
@@ -408,6 +410,50 @@ print('collectQuotes');
 eq('numbering', collectQuotes([splitSegments('A "one" B'), splitSegments('"two" C "three"')]),
    [{ id: 'Q1', paragraph: 0, at: 1, text: 'one' }, { id: 'Q2', paragraph: 1, at: 0, text: 'two' },
     { id: 'Q3', paragraph: 1, at: 2, text: 'three' }]);
+
+print('exclusions');
+const config = api.settings();
+config.exclusions = api.DEFAULT_EXCLUSIONS;
+config.skip_tags = false;
+eq('three dashes', isExcluded('---'), true);
+eq('a long rule', isExcluded('--------'), true);
+eq('asterisk rule', isExcluded('***'), true);
+eq('underscore rule', isExcluded('___'), true);
+eq('two dashes are not a rule', isExcluded('--'), false);
+eq('an em dash in prose', isExcluded('He turned\u2014and left.'), false);
+eq('a rule with words is read', isExcluded('--- Chapter 2 ---'), false);
+eq('ordinary prose', isExcluded('The first thing visible is smoke.'), false);
+eq('rules drop out of the units', splitLines('one\n---\ntwo'), ['one', 'two']);
+
+config.exclusions = '^\\[.*\\]$\n(((';
+eq('custom pattern applies', isExcluded('[scene break]'), true);
+eq('an invalid pattern is skipped, not fatal', isExcluded('---'), false);
+config.exclusions = api.DEFAULT_EXCLUSIONS;
+
+print('skip tags');
+config.skip_tags = true;
+eq('a tag block goes', readableText('before<div>hidden</div>after'), 'beforeafter');
+eq('across lines too', readableText('a\n<i>\nhidden\n</i>\nb'), 'a\n\nb');
+eq('prose with a less-than survives', readableText('2 < 3 and 4 > 1'), '2 < 3 and 4 > 1');
+eq('a lone tag is not a block', readableText('a <br> b'), 'a <br> b');
+eq('whole lines of tags leave no paragraph',
+   splitLines('one\n<note>skip me</note>\ntwo'), ['one', 'two']);
+config.skip_tags = false;
+eq('off, the tag is read', readableText('before<div>hidden</div>after'),
+   'before<div>hidden</div>after');
+
+print('getDirection');
+const withLines = (mes, lines, swipe = 0) => ({
+    mes, swipe_id: swipe,
+    extra: { breeze_direction: { swipe_id: 0, lines: lines.map(t => ({ text: t, instruction: 'x' })) } },
+});
+eq('matching take is kept', !!getDirection(withLines('one\ntwo', ['one', 'two'])), true);
+eq('take from a different swipe is dropped',
+   getDirection(withLines('one\ntwo', ['one', 'two'], 1)), null);
+eq('take with the wrong paragraph count is dropped',
+   getDirection(withLines('one\ntwo', ['one', 'two', 'three'])), null);
+eq('a take written before an exclusion existed is dropped',
+   getDirection(withLines('one\n---\ntwo', ['one', '---', 'two'])), null);
 
 print('skipping paragraphs');
 const skipMsg = { mes: 'one\ntwo\nthree', extra: {} };
