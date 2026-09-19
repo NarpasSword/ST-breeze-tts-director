@@ -112,9 +112,11 @@ function runAssertions() {
 const api = new Function(source + `;return {
     splitSegments, collectQuotes, isForeignSpeaker, parseDirection,
     normalize, pickLine, castEntry, hash, syncPrompts,
+    voiceInstruction, cleanProfile, PROFILE_FIELDS,
     DEFAULT_PROMPT, DEFAULT_VOICE_CAST_PROMPT };`)();
 const { splitSegments, collectQuotes, isForeignSpeaker, parseDirection,
-        normalize, pickLine, castEntry, hash, syncPrompts } = api;
+        normalize, pickLine, castEntry, hash, syncPrompts,
+        voiceInstruction, cleanProfile } = api;
 
 let fails = 0;
 function eq(label, got, want) {
@@ -164,10 +166,30 @@ eq('exact wins', pickLine(dir, 'Later, softly: "Yes."'), 'B');
 eq('ambiguous takes longest', pickLine(dir, 'Yes.'), 'A');
 
 print('castEntry');
-eq('legacy string', castEntry('villain'), { voice: 'villain', base: null, tone: null });
-eq('object passes through', castEntry({ voice: 'bob', base: 'villain', tone: 'Gruff.' }),
-   { voice: 'bob', base: 'villain', tone: 'Gruff.' });
+eq('legacy string', castEntry('villain'), { voice: 'villain', base: null });
+eq('object passes through',
+   castEntry({ voice: 'bob', base: 'villain', gender: 'male', tone: 'Gruff.' }),
+   { voice: 'bob', base: 'villain', gender: 'male', tone: 'Gruff.' });
 eq('empty', castEntry(undefined), null);
+
+print('cleanProfile');
+eq('keeps filled fields', cleanProfile({ gender: 'male', age: ' 40s ', tone: 'Gruff.', accent: '' }),
+   { gender: 'male', age: '40s', tone: 'Gruff.' });
+eq('drops unknown', cleanProfile({ gender: 'unknown', tone: 'Soft.' }), { tone: 'Soft.' });
+eq('drops unlisted keys', cleanProfile({ tone: 'Soft.', mood: 'angry' }), { tone: 'Soft.' });
+eq('all empty is null', cleanProfile({ gender: '', age: '  ' }), null);
+eq('missing is null', cleanProfile(undefined), null);
+
+print('voiceInstruction');
+const bob = { gender: 'male', age: 'late forties', accent: 'Scottish', tone: 'Gruff and clipped.' };
+eq('design mode composes everything', voiceInstruction(bob, false),
+   'male, late forties. Scottish accent. Gruff and clipped.');
+eq('clone mode keeps tone only', voiceInstruction(bob, true), 'Gruff and clipped.');
+eq('skips absent fields', voiceInstruction({ tone: 'Soft.' }, false), 'Soft.');
+eq('trailing punctuation not doubled', voiceInstruction({ gender: 'female', tone: 'Wry;' }, false),
+   'female. Wry.');
+eq('empty profile', voiceInstruction({}, false), '');
+eq('clone mode with no tone', voiceInstruction({ gender: 'male' }, true), '');
 
 print('syncPrompts');
 const shipped = api.DEFAULT_PROMPT;

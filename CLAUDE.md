@@ -11,9 +11,11 @@ shared splitting rule:
 - **Director** — one LLM call per chat message writes a delivery instruction for
   every paragraph, stored in the chat file. The TTS provider picks those up while
   narrating.
-- **Casting** — the same call attributes each quoted span to a speaker, and each
-  speaker is routed to its own Breeze voice. Non-quote text reads in a
-  configurable narrator voice.
+- **Identification** — its own call, or several, works out who speaks each
+  quoted span and sketches a voice profile for anyone new.
+- **Casting** — each identified speaker gets their own Breeze voice, built from
+  a base voice plus their profile. Non-quote text reads in a configurable
+  narrator voice.
 - **Player** — an inline panel per message with paragraph-level seek, per-message
   resume, per-segment voice overrides, and take history.
 
@@ -207,13 +209,12 @@ Resolution order, each step falling through on failure:
 1. `breezeTts.voiceForCharacter(speaker)` — a hand-assigned voice-map entry
    always beats the director.
 2. The chat's cast cache.
-3. `askCasting()` asks the model for a **base voice** and a **tone
-   description**, showing it the speaker's card text, their own lines, the
-   available voices and the running cast.
-4. `deriveVoice()` writes a new provider voice named after the speaker: the
-   base's `cfg_scale`, and its `ref_audio_url`/`ref_text` when it has both, with
-   the tone as the `instruction`. Several characters may share a base — the
-   description is what tells them apart.
+3. `askCasting()` picks a **base voice**, shown the speaker's profile, their own
+   lines, the available voices and the running cast.
+4. `applyCast()` writes a provider voice named after the speaker, via
+   `castPreset()`: the base's `cfg_scale`, its `ref_audio_url`/`ref_text` when it
+   has **both**, and `voiceInstruction()` as the instruction. Several characters
+   may share a base — the profile is what tells them apart.
 5. Null → the caller falls back to `voiceForSegment()`'s live resolution.
 
 Non-quote text uses `defaultVoice()`: the configured `narrator_voice` if it
@@ -225,9 +226,35 @@ asks it to reuse a base when the speaker is someone already cast under another
 name. That is what keeps a long scene consistent, so a saved casting prompt
 without `{{cast}}` is a real regression — `bind()` warns until it is reset.
 
-A cast entry is `{ voice, base, tone }`. `castEntry()` normalises the bare
-voice-name strings written before base and tone existed, so old chats keep
-working.
+A cast entry is `{ voice, base }` plus the profile fields in `PROFILE_FIELDS`
+(`gender`, `age`, `tone`, `accent`), each present only when filled.
+`castEntry()` normalises the bare voice-name strings written before profiles
+existed, so old chats keep working.
+
+### Who speaks: its own call
+
+`identifySpeakers()` attributes the quotes, in chunks of `identify_chunk`
+paragraphs — `-1`, `0` or anything larger than the message means one call for
+the whole thing, which gives the most context. Each chunk is told the message
+character's card text, everyone named so far (earlier chunks plus the chat's
+cast), and where in the message it sits.
+
+It returns `{ speakers, profiles }`: `Q1 → name` for every quote, and for each
+new speaker a `{ gender, age, tone, accent }` sketch, `cleanProfile()`-filtered
+so blanks and `"unknown"` never reach the cast.
+
+This used to ride along on the director prompt. It was two jobs in one call with
+too little context for either; the director prompt now only directs, and its
+`{{quotes}}` placeholder is gone.
+
+### Composing a voice instruction
+
+`voiceInstruction(entry, cloned)` builds what Breeze is actually told. When the
+base is a **clone** — `ref_audio_url` and `ref_text` both present — it emits the
+tone alone. Identity words (gender, age, accent) would describe a voice the
+reference audio has already fixed, and fight it. In design mode, with no
+reference to contradict, the whole profile composes. The cast sheet prints the
+result under each speaker, so an edit's effect is visible before you hear it.
 
 ### Prompts upgrade themselves now
 
@@ -254,8 +281,8 @@ Three views, because a wrong voice is otherwise invisible until you hear it:
 `castVoice()` toasts what it cast, matching `designVoice()`'s existing toast.
 
 The sheet itself is `openCastSheet()`, opened from the wand menu's **Voice
-cast** entry or the settings button. One row per speaker: base voice, tone
-description, preview, re-cast, forget. Edits apply immediately and re-derive the
+cast** entry or the settings button. One row per speaker: base voice, gender,
+age, accent, tone, the composed instruction, preview, re-base, forget. Edits apply immediately and re-derive the
 speaker's provider voice **under its existing name**, so segments already stored
 in the chat keep pointing at it. The settings panel only reports the count and
 opens the sheet — one editor, not two.

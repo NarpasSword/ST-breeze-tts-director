@@ -22,32 +22,42 @@ For each paragraph, write ONE short sentence describing how to deliver it: tone,
 Describe delivery only — never the speaker's age, gender, accent, or timbre.
 Let the direction develop across the paragraphs so the reading has an arc.
 Do not summarise or quote the text.
-{{quotes}}
-Reply with ONLY a JSON object, no commentary, no code fences:
-{"directions": [exactly {{count}} strings, one per paragraph], "speakers": {"Q1": "name", ...}}
+
+Reply with ONLY a JSON array of exactly {{count}} strings, no commentary, no code fences.
 
 Character: {{char}}
 
 Paragraphs:
 {{parts}}`;
 
-/** Spliced into the prompt at {{quotes}} when the message has quoted speech. */
-const QUOTES_BLOCK = `
-Each quote below is spoken aloud. Name who speaks it, exactly as the text names them.
-Use "{{char}}" when {{char}} is the one speaking, and "unknown" when the text does not say.
+const DEFAULT_IDENTIFY_PROMPT = `Work out who speaks each line of quoted speech in this passage.
+{{context}}
+Passage:
+{{parts}}
 
-Quotes:
-{{list}}
-`;
+Quoted lines to attribute:
+{{quotes}}
 
-const DEFAULT_VOICE_CAST_PROMPT = `Cast a voice for a character who has just spoken.
+For each quote, name the speaker. Use the name exactly as the passage gives it.
+Use "{{char}}" when {{char}} is speaking and "{{user}}" for {{user}}.
+Use "unknown" only when the passage genuinely does not say.
 
-Pick the closest-sounding voice from the list as their base, then write ONE sentence
-describing how this character's voice differs from it: texture, pitch, age, accent,
-and their habitual manner of speaking. Describe the voice itself, not the scene.
+For every distinct speaker who is neither {{char}} nor {{user}}, describe their voice:
+apparent gender, approximate age, the tone and manner of their speech, and an accent
+only if the passage implies one. Leave a field as "" when the passage gives no basis
+for it — do not invent.
+
+Reply with ONLY a JSON object, no commentary, no code fences:
+{"speakers": {"Q1": "name"},
+ "profiles": {"name": {"gender": "", "age": "", "tone": "", "accent": ""}}}`;
+
+const DEFAULT_VOICE_CAST_PROMPT = `Choose which existing voice to build a character's voice on.
+
+Pick the closest match from the list. Its timbre becomes their starting point; their
+own description is what sets them apart, so several characters may share one base.
 
 Character: {{speaker}}
-{{card}}
+{{profile}}
 Lines they speak:
 {{lines}}
 
@@ -55,11 +65,8 @@ Available base voices:
 {{voices}}
 {{cast}}
 If this character is someone already cast under a different name, reuse that base.
-Otherwise pick whichever base is closest — several characters may share one, since
-your description is what tells them apart.
 
-Reply with ONLY a JSON object, no commentary, no code fences:
-{"base": "<a voice name from the list>", "tone": "<one sentence>"}`;
+Reply with ONLY the voice name, copied exactly from the list. Nothing else.`;
 
 /** Spliced into the casting prompt at {{cast}} once anyone has been cast. */
 const CAST_BLOCK = `
@@ -95,6 +102,8 @@ const DEFAULTS = {
     cast_enabled: true,
     narrator_voice: '',   // '' = the character's own voice
     voice_cast_prompt: DEFAULT_VOICE_CAST_PROMPT,
+    identify_prompt: DEFAULT_IDENTIFY_PROMPT,
+    identify_chunk: -1,   // paragraphs per identification call; -1 = whole message
     cast: {},             // chatId -> { speaker: { voice, base, tone } }
     prompt_stamps: {},    // key -> hash of the default it was written from
 };
@@ -109,6 +118,7 @@ const SHIPPED_PROMPTS = {
     prompt: () => DEFAULT_PROMPT,
     voice_prompt: () => DEFAULT_VOICE_PROMPT,
     voice_cast_prompt: () => DEFAULT_VOICE_CAST_PROMPT,
+    identify_prompt: () => DEFAULT_IDENTIFY_PROMPT,
 };
 
 function hash(text) {
@@ -311,17 +321,11 @@ function put(template, token, value) {
     return template.replace(token, () => value);
 }
 
-function buildPrompt(message, units, quotes) {
+function buildPrompt(message, units) {
     const context = ctx();
     const parts = units.map((unit, i) => `${i + 1}. ${unit.text}`).join('\n\n');
-    const block = quotes.length
-        ? put(QUOTES_BLOCK, /{{list}}/g,
-            quotes.map(q => `${q.id} (paragraph ${q.paragraph + 1}): ${q.text}`).join('\n'))
-        : '';
 
-    // {{quotes}} first: the block it splices in carries {{char}} of its own.
-    let prompt = put(settings().prompt, /{{quotes}}/g, block);
-    prompt = put(prompt, /{{parts}}/g, parts);
+    let prompt = put(settings().prompt, /{{parts}}/g, parts);
     prompt = put(prompt, /{{count}}/g, String(units.length));
     prompt = put(prompt, /{{message}}/g, String(message?.mes ?? ''));
     prompt = put(prompt, /{{char}}/g, String(message?.name ?? context.name2 ?? ''));
@@ -404,16 +408,19 @@ async function generate(index, { quiet = true } = {}) {
     const quotes = collectQuotes(layout);
     const attribute = config.cast_enabled && quotes.length > 0;
 
+    // Who speaks gets its own call, or several: one job per prompt, and each
+    // chunk knows who the ones before it named.
+    const cast = attribute
+        ? await identifySpeakers(message, units, quotes)
+        : { speakers: {}, profiles: {} };
+
     // A reasoning model can spend the whole budget thinking and return nothing,
     // so floor the request at enough room to think and still write every line.
-    const budget = Math.max(
-        Number(config.max_tokens) || 0,
-        600 + 80 * units.length + 20 * (attribute ? quotes.length : 0),
-    );
+    const budget = Math.max(Number(config.max_tokens) || 0, 600 + 80 * units.length);
 
     const result = await context.ConnectionManagerRequestService.sendRequest(
         config.profile,
-        buildPrompt(message, units, attribute ? quotes : []),
+        buildPrompt(message, units),
         budget,
     );
 
@@ -435,12 +442,7 @@ async function generate(index, { quiet = true } = {}) {
 
     // askCasting quotes a speaker's own lines back at the model; tag them now.
     for (const quote of quotes) {
-        quote.speaker = attribute ? String(parsed.speakers[quote.id] ?? '').trim() : '';
-    }
-
-    if (attribute && !Object.keys(parsed.speakers).length) {
-        console.info('[Breeze Director] no speaker attribution came back — if the saved '
-            + 'prompt predates casting, click "Reset prompt".');
+        quote.speaker = String(cast.speakers[quote.id] ?? '').trim();
     }
 
     const lines = [];
@@ -458,12 +460,12 @@ async function generate(index, { quiet = true } = {}) {
 
                 if (segment.kind === 'dialogue') {
                     const quote = quotes.find(q => q.paragraph === i && q.at === at);
-                    const speaker = attribute ? String(parsed.speakers[quote?.id] ?? '').trim() : '';
+                    const speaker = String(cast.speakers[quote?.id] ?? '').trim();
                     entry.speaker = speaker || null;
                     // Only a foreign speaker gets a voice pinned; the character's
                     // own lines resolve live so voice-map edits keep working.
                     if (isForeignSpeaker(speaker, message)) {
-                        entry.voice = await castVoice(speaker, quotes);
+                        entry.voice = await castVoice(speaker, quotes, cast.profiles[speaker]);
                     }
                 }
                 line.segments.push(entry);
@@ -661,11 +663,167 @@ function pruneCast() {
     }
 }
 
-/** Cast entries were bare voice names before base and tone existed. */
+// ------------------------------------------------------------- identification
+// Who speaks each quote is its own question, with its own call. Asking the
+// director to do it alongside the delivery direction gave it two jobs and not
+// enough context for either.
+
+const PROFILE_FIELDS = ['gender', 'age', 'tone', 'accent'];
+
+function cleanProfile(raw) {
+    const profile = {};
+    for (const field of PROFILE_FIELDS) {
+        const value = String(raw?.[field] ?? '').trim();
+        if (value && value.toLowerCase() !== 'unknown') profile[field] = value;
+    }
+    return Object.keys(profile).length ? profile : null;
+}
+
+/** One identification call over paragraphs [from, to). */
+async function askIdentify(message, units, from, to, quotes, known) {
+    const config = settings();
+    const context = ctx();
+
+    const parts = units.slice(from, to)
+        .map((unit, i) => `${from + i + 1}. ${unit.text}`)
+        .join('\n\n');
+    const list = quotes
+        .map(q => `${q.id} (paragraph ${q.paragraph + 1}): ${q.text}`)
+        .join('\n');
+
+    // Context that actually helps: whose message this is, and who has already
+    // been named — in this message's earlier chunks and in the chat's cast.
+    const card = cardFor(message?.name);
+    const description = [card?.description, card?.personality]
+        .map(v => String(v ?? '').trim()).filter(Boolean).join('\n\n');
+
+    const cast = castMap();
+    const seen = [...new Set([...Object.keys(cast), ...Object.values(known)])]
+        .filter(name => name && name.toLowerCase() !== 'unknown');
+
+    const lines = [];
+    if (description) lines.push(`About ${message?.name}:\n${description}`);
+    if (seen.length) lines.push(`People already named in this scene: ${seen.join(', ')}`);
+    if (from > 0) lines.push(`These are paragraphs ${from + 1}-${to} of a longer message.`);
+    const contextBlock = lines.length ? `\n${lines.join('\n\n')}\n` : '';
+
+    let prompt = put(config.identify_prompt, /{{context}}/g, contextBlock);
+    prompt = put(prompt, /{{parts}}/g, parts);
+    prompt = put(prompt, /{{quotes}}/g, list);
+    prompt = put(prompt, /{{char}}/g, String(message?.name ?? context.name2 ?? ''));
+    prompt = put(prompt, /{{user}}/g, String(context.name1 ?? ''));
+
+    const budget = 400 + 120 * quotes.length;
+    const result = await context.ConnectionManagerRequestService.sendRequest(
+        config.profile, prompt, budget,
+    );
+
+    const text = String(result?.content ?? '')
+        .replace(/<think>[\s\S]*?<\/think>/gi, '')
+        .replace(/```(?:json)?/gi, '')
+        .trim();
+
+    const start = text.indexOf('{');
+    const end = text.lastIndexOf('}');
+    if (start === -1 || end <= start) {
+        console.warn('[Breeze Director] identification returned nothing usable:', text || result);
+        return null;
+    }
+
+    try {
+        const parsed = JSON.parse(text.slice(start, end + 1));
+        const speakers = {};
+        for (const [id, name] of Object.entries(parsed?.speakers ?? {})) {
+            speakers[String(id).trim().toUpperCase()] = String(name ?? '').trim();
+        }
+        const profiles = {};
+        for (const [name, raw] of Object.entries(parsed?.profiles ?? {})) {
+            const profile = cleanProfile(raw);
+            if (profile) profiles[String(name).trim()] = profile;
+        }
+        return { speakers, profiles };
+    } catch (error) {
+        console.warn('[Breeze Director] could not parse identification:', text, error);
+        return null;
+    }
+}
+
+/**
+ * Attribute every quote in the message, in chunks of `identify_chunk`
+ * paragraphs. -1, 0 or anything larger than the message means one call for the
+ * whole thing. Each chunk is told who earlier chunks already named.
+ */
+async function identifySpeakers(message, units, quotes) {
+    const size = Number(settings().identify_chunk);
+    const step = (!Number.isFinite(size) || size < 1) ? units.length : size;
+
+    const speakers = {};
+    const profiles = {};
+
+    for (let from = 0; from < units.length; from += step) {
+        const to = Math.min(from + step, units.length);
+        const slice = quotes.filter(q => q.paragraph >= from && q.paragraph < to);
+        if (!slice.length) continue;
+
+        const result = await askIdentify(message, units, from, to, slice, speakers);
+        if (!result) continue;
+
+        Object.assign(speakers, result.speakers);
+        // First description of someone wins; later chunks see less of them.
+        for (const [name, profile] of Object.entries(result.profiles)) {
+            if (!profiles[name]) profiles[name] = profile;
+        }
+    }
+
+    return { speakers, profiles };
+}
+
+/** Cast entries were bare voice names before base and profile existed. */
 function castEntry(value) {
     if (!value) return null;
-    if (typeof value === 'string') return { voice: value, base: null, tone: null };
+    if (typeof value === 'string') return { voice: value, base: null };
     return value;
+}
+
+/**
+ * The Breeze instruction for a cast voice, composed from its profile.
+ *
+ * Identity — gender, age, accent — is dropped when the base is a clone, because
+ * describing a voice that the reference audio already fixes only fights it.
+ * Tone survives either way: it is manner, not timbre.
+ */
+function voiceInstruction(entry, cloned) {
+    const parts = cloned
+        ? [entry.tone]
+        : [
+            [entry.gender, entry.age].map(v => String(v ?? '').trim()).filter(Boolean).join(', '),
+            entry.accent ? `${String(entry.accent).trim()} accent` : '',
+            entry.tone,
+        ];
+
+    const sentence = parts
+        .map(part => String(part ?? '').trim().replace(/\s*[.;,]+$/, ''))
+        .filter(Boolean)
+        .join('. ');
+    return sentence ? `${sentence}.` : '';
+}
+
+/** Build the provider preset for a cast entry: base timbre, composed instruction. */
+function castPreset(entry) {
+    const breeze = globalThis.breezeTts;
+    const inherited = entry.base ? breeze.voicePreset(entry.base) : null;
+    // Clone mode needs both halves, so carry them together or not at all.
+    const cloned = !!(inherited?.ref_audio_url && inherited?.ref_text);
+
+    const preset = {
+        instruction: voiceInstruction(entry, cloned),
+        cfg_scale: Number(inherited?.cfg_scale ?? settings().cfg_scale),
+    };
+    if (cloned) {
+        preset.ref_audio_url = inherited.ref_audio_url;
+        preset.ref_text = inherited.ref_text;
+    }
+    return preset;
 }
 
 /** A free voice name derived from the speaker's, not colliding with an existing one. */
@@ -678,32 +836,18 @@ function freeVoiceName(speaker) {
     return name;
 }
 
-/**
- * Write a voice for this speaker: the chosen base's timbre settings with their
- * own tone as the instruction. Several characters can share a base — the
- * description is what separates them.
- */
-async function deriveVoice(speaker, base, tone) {
+/** Write (or rewrite) the provider voice for a cast entry. */
+async function applyCast(speaker, entry) {
     const breeze = globalThis.breezeTts;
-    const inherited = base ? breeze.voicePreset(base) : null;
-
-    const preset = {
-        instruction: tone,
-        cfg_scale: Number(inherited?.cfg_scale ?? settings().cfg_scale),
-    };
-    // Clone mode only works with both halves, so carry them together or not at all.
-    if (inherited?.ref_audio_url && inherited?.ref_text) {
-        preset.ref_audio_url = inherited.ref_audio_url;
-        preset.ref_text = inherited.ref_text;
-    }
-
-    const name = freeVoiceName(speaker);
-    await breeze.addVoice(name, preset);
+    // Reuse the existing name so segments already stored keep pointing at it.
+    const name = entry.voice && breeze.hasVoice(entry.voice) ? entry.voice : freeVoiceName(speaker);
+    await breeze.addVoice(name, castPreset(entry));
+    entry.voice = name;
     return name;
 }
 
-/** Ask the director for a base voice and a tone description for this speaker. */
-async function askCasting(speaker, quotes) {
+/** Ask the director which existing voice to build this speaker's timbre on. */
+async function askCasting(speaker, quotes, profile) {
     const config = settings();
     const breeze = globalThis.breezeTts;
     const available = breeze?.listVoices() ?? [];
@@ -725,47 +869,28 @@ async function askCasting(speaker, quotes) {
         })
         .join('\n');
 
-    const card = cardFor(speaker);
-    const description = [card?.description, card?.personality]
-        .map(v => String(v ?? '').trim()).filter(Boolean).join('\n\n');
+    const described = PROFILE_FIELDS
+        .map(field => (profile?.[field] ? `${field}: ${profile[field]}` : ''))
+        .filter(Boolean)
+        .join('\n');
 
     let prompt = put(config.voice_cast_prompt, /{{speaker}}/g, speaker);
-    prompt = put(prompt, /{{card}}/g, description ? `\nWhat is known of them:\n${description}\n` : '');
+    prompt = put(prompt, /{{profile}}/g, described ? `\nWhat is known of their voice:\n${described}\n` : '');
     prompt = put(prompt, /{{lines}}/g, spoken || '(none recorded)');
     prompt = put(prompt, /{{voices}}/g, available.map(name => `- ${name}`).join('\n'));
     prompt = put(prompt, /{{cast}}/g, roster ? put(CAST_BLOCK, /{{list}}/g, roster) : '');
 
-    const result = await ctx().ConnectionManagerRequestService.sendRequest(config.profile, prompt, 400);
-    const text = String(result?.content ?? '')
+    const result = await ctx().ConnectionManagerRequestService.sendRequest(config.profile, prompt, 80);
+    const answer = String(result?.content ?? '')
         .replace(/<think>[\s\S]*?<\/think>/gi, '')
-        .replace(/```(?:json)?/gi, '')
-        .trim();
-    if (!text) return null;
+        .trim()
+        .toLowerCase();
+    if (!answer) return null;
 
-    const match = (wanted) => {
-        const needle = String(wanted ?? '').trim().toLowerCase();
-        if (!needle) return null;
-        return available.find(name => name.toLowerCase() === needle)
-            ?? available.find(name => needle.includes(name.toLowerCase()))
-            ?? null;
-    };
-
-    const objectStart = text.indexOf('{');
-    const objectEnd = text.lastIndexOf('}');
-    if (objectStart !== -1 && objectEnd > objectStart) {
-        try {
-            const parsed = JSON.parse(text.slice(objectStart, objectEnd + 1));
-            const tone = String(parsed?.tone ?? '').trim();
-            if (tone) return { base: match(parsed?.base), tone };
-        } catch { /* fall through to the bare-name form */ }
-    }
-
-    // A saved prompt from before base/tone just names a voice; honour it.
-    const named = match(text.split('\n')[0]);
-    if (named) return { base: named, tone: null };
-
-    console.warn('[Breeze Director] could not read a casting reply:', text);
-    return null;
+    // The model may quote the name or wrap it in a sentence; match generously.
+    return available.find(name => name.toLowerCase() === answer)
+        ?? available.find(name => answer.includes(name.toLowerCase()))
+        ?? null;
 }
 
 /**
@@ -773,7 +898,7 @@ async function askCasting(speaker, quotes) {
  * the chat's cast, then a freshly derived voice. Never throws: the caller falls
  * back to the default voice.
  */
-async function castVoice(speaker, quotes = []) {
+async function castVoice(speaker, quotes = [], profile = null) {
     const breeze = globalThis.breezeTts;
     if (!breeze?.available) return null;
 
@@ -788,14 +913,14 @@ async function castVoice(speaker, quotes = []) {
     if (castJobs.has(speaker)) return castJobs.get(speaker);
 
     const pending = (async () => {
-        const casting = await askCasting(speaker, quotes);
-        if (!casting) return null;
+        const base = await askCasting(speaker, quotes, profile);
+        const entry = { voice: null, base, ...(profile ?? {}) };
 
-        // No tone means a legacy reply that only named an existing voice.
-        if (!casting.tone) return { voice: casting.base, base: casting.base, tone: null };
+        // Nothing to say about them and no base to borrow: not worth a voice.
+        if (!base && !voiceInstruction(entry, false)) return null;
 
-        const voice = await deriveVoice(speaker, casting.base, casting.tone);
-        return { voice, base: casting.base, tone: casting.tone };
+        await applyCast(speaker, entry);
+        return entry;
     })()
         .then(entry => {
             if (!entry?.voice) return null;
@@ -1568,11 +1693,10 @@ async function openCastSheet() {
                 }
             });
 
-            const recast = button('fa-rotate', 'Cast this speaker again', async () => {
-                const fresh = await askCasting(speaker, []);
-                if (!fresh?.tone) return toastr.warning('Nothing usable came back.', 'Breeze Director');
-                entry.base = fresh.base;
-                entry.tone = fresh.tone;
+            const recast = button('fa-rotate', 'Choose a base voice again', async () => {
+                const base = await askCasting(speaker, [], entry);
+                if (!base) return toastr.warning('Nothing usable came back.', 'Breeze Director');
+                entry.base = base;
                 cast[speaker] = entry;
                 await rederive(speaker, entry);
                 context.saveSettingsDebounced();
@@ -1589,40 +1713,65 @@ async function openCastSheet() {
             head.append(baseSelect, preview, recast, forget);
             row.append(head);
 
+            // The fields the director filled in, all editable.
+            const fields = document.createElement('div');
+            fields.style.cssText = 'display:flex;gap:0.4em;flex-wrap:wrap;margin-top:0.35em;';
+            for (const field of ['gender', 'age', 'accent']) {
+                const input = document.createElement('input');
+                input.className = 'text_pole';
+                input.type = 'text';
+                input.style.cssText = 'flex:1 1 7em;min-width:5em;';
+                input.placeholder = field;
+                input.value = entry[field] ?? '';
+                input.addEventListener('change', async () => {
+                    const value = input.value.trim();
+                    if (value) entry[field] = value;
+                    else delete entry[field];
+                    cast[speaker] = entry;
+                    await rederive(speaker, entry);
+                    context.saveSettingsDebounced();
+                    paint();
+                });
+                fields.append(input);
+            }
+            row.append(fields);
+
             const tone = document.createElement('textarea');
             tone.className = 'text_pole textarea_compact';
             tone.rows = 2;
             tone.style.marginTop = '0.35em';
-            tone.placeholder = 'How this voice differs from its base';
+            tone.placeholder = 'tone and manner of speaking';
             tone.value = entry.tone ?? '';
             tone.addEventListener('change', async () => {
-                entry.tone = tone.value.trim();
+                const value = tone.value.trim();
+                if (value) entry.tone = value;
+                else delete entry.tone;
                 cast[speaker] = entry;
                 await rederive(speaker, entry);
                 context.saveSettingsDebounced();
+                paint();
             });
             row.append(tone);
+
+            // What Breeze is actually told, so an edit's effect is visible.
+            const built = document.createElement('small');
+            built.style.cssText = 'display:block;opacity:0.6;margin-top:0.25em;';
+            const preset = breeze.hasVoice(entry.base ?? '') || !entry.base
+                ? castPreset(entry)
+                : { instruction: voiceInstruction(entry, false) };
+            built.textContent = preset.instruction
+                ? `Breeze hears: ${preset.instruction}`
+                : 'Nothing to send yet — fill in a tone.';
+            row.append(built);
 
             list.append(row);
         }
     }
 
-    /** Rewrite the speaker's provider voice after a base or tone change. */
+    /** Rewrite the speaker's provider voice after any edit. */
     async function rederive(speaker, entry) {
-        if (!entry.tone) return;
-        const inherited = entry.base ? breeze.voicePreset(entry.base) : null;
-        const preset = {
-            instruction: entry.tone,
-            cfg_scale: Number(inherited?.cfg_scale ?? settings().cfg_scale),
-        };
-        if (inherited?.ref_audio_url && inherited?.ref_text) {
-            preset.ref_audio_url = inherited.ref_audio_url;
-            preset.ref_text = inherited.ref_text;
-        }
-        // Reuse the existing name so stored segments keep pointing at it.
-        const name = breeze.hasVoice(entry.voice) ? entry.voice : freeVoiceName(speaker);
-        await breeze.addVoice(name, preset);
-        entry.voice = name;
+        if (!voiceInstruction(entry, false)) return;
+        await applyCast(speaker, entry);
         onCastChanged?.();
     }
 
@@ -1665,6 +1814,11 @@ const SETTINGS_HTML = `
         <option value="append">Append to it</option>
       </select>
 
+      <label for="bd_identify_chunk">Paragraphs per speaker-identification call:</label>
+      <input id="bd_identify_chunk" type="number" min="-1" step="1" class="text_pole">
+      <small>-1 sends the whole message in one call, which gives the most context.
+      Lower it only if long messages lose track of who is who.</small>
+
       <label for="bd_cfg">CFG scale:</label>
       <input id="bd_cfg" type="number" min="1" max="10" step="1" class="text_pole">
 
@@ -1675,7 +1829,12 @@ const SETTINGS_HTML = `
       <code>{{message}}</code>, <code>{{char}}</code>, <code>{{user}}</code>):</label>
       <textarea id="bd_prompt" class="text_pole textarea_compact" rows="14"></textarea>
       <input id="bd_reset" class="menu_button" type="button" value="Reset prompt">
-      <small id="bd_prompt_warn" style="color:var(--golden);display:block;"></small>
+
+      <label for="bd_identify_prompt">Speaker identification prompt (<code>{{context}}</code>,
+      <code>{{parts}}</code>, <code>{{quotes}}</code>, <code>{{char}}</code>,
+      <code>{{user}}</code>):</label>
+      <textarea id="bd_identify_prompt" class="text_pole textarea_compact" rows="12"></textarea>
+      <input id="bd_identify_reset" class="menu_button" type="button" value="Reset identification prompt">
 
       <label for="bd_voice_prompt">Voice design prompt (<code>{{char}}</code>, <code>{{description}}</code>):</label>
       <textarea id="bd_voice_prompt" class="text_pole textarea_compact" rows="10"></textarea>
@@ -1736,6 +1895,8 @@ function bind() {
     field('#bd_mode', 'mode');
     field('#bd_cfg', 'cfg_scale', Number);
     field('#bd_tokens', 'max_tokens', Number);
+    field('#bd_identify_chunk', 'identify_chunk', Number);
+    field('#bd_identify_prompt', 'identify_prompt');
     field('#bd_prompt', 'prompt');
     field('#bd_voice_prompt', 'voice_prompt');
     field('#bd_voice_cast_prompt', 'voice_cast_prompt');
@@ -1744,9 +1905,6 @@ function bind() {
     // never returns speakers, and with ST's own paragraph narration off it hands
     // the provider the whole message as one job.
     const warn = () => {
-        $('#bd_prompt_warn').text(config.prompt.includes('{{quotes}}')
-            ? ''
-            : 'This saved prompt predates speaker casting — click "Reset prompt" to enable it.');
         $('#bd_cast_prompt_warn').text(config.voice_cast_prompt.includes('{{cast}}')
             ? ''
             : 'This saved casting prompt cannot see the existing cast — click '
@@ -1797,6 +1955,12 @@ function bind() {
         $('#bd_prompt').val(DEFAULT_PROMPT);
         save();
         warn();
+    });
+
+    $('#bd_identify_reset').on('click', () => {
+        config.identify_prompt = DEFAULT_IDENTIFY_PROMPT;
+        $('#bd_identify_prompt').val(DEFAULT_IDENTIFY_PROMPT);
+        save();
     });
 
     $('#bd_voice_cast_reset').on('click', () => {
