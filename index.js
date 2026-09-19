@@ -20,7 +20,18 @@
 // director deployed against a months-old provider fails silently, because an
 // exception inside casting is indistinguishable from the model declining.
 // Shipping them together removes that failure mode entirely.
-import { registerTtsProvider, getPreviewString, saveTtsProviderSettings, initVoiceMap } from '../../tts/index.js';
+//
+// The provider's voices are the user's to curate, in its own settings box.
+// Nothing here writes one: a cast member is one of those voices as a base, plus
+// a description, composed into an instruction when a line is generated.
+import { registerTtsProvider, getPreviewString, saveTtsProviderSettings } from '../../tts/index.js';
+
+// Shared by both halves. Pure formatting, no concern of either.
+
+/** Bytes as MB or KB, whichever reads better. */
+function size(bytes) {
+    return bytes > 1048576 ? `${(bytes / 1048576).toFixed(1)} MB` : `${Math.round(bytes / 1024)} KB`;
+}
 
 // ===========================================================================
 // PROVIDER
@@ -225,14 +236,10 @@ globalThis.breezeTts = {
     get available() { return !!this._provider; },
     listVoices() { return this._provider?.listVoices() ?? []; },
     hasVoice(name) { return this._provider?.hasVoice(name) ?? false; },
-    addVoice(name, preset) { return this._provider?.addVoice(name, preset); },
-    assignVoice(character, voice) { return this._provider?.assignVoice(character, voice); },
     voiceForCharacter(character) { return this._provider?.voiceForCharacter(character) ?? null; },
     prefetch(text, voice, hint) { return this._provider?.prefetch(text, voice, hint) ?? Promise.resolve(false); },
     getClip(text, voice, hint) { return this._provider?._clip(text, voice, hint); },
-    cacheCount() { return cache.count(); },
     cacheStats() { return cache.stats(); },
-    preview(voice) { return this._provider?.previewTtsVoice(voice); },
     /** Play a base voice under an instruction that is not stored anywhere. */
     previewWith(voice, instruction, cfgScale) {
         return this._provider?.previewTtsVoice(voice, { instruction, cfg_scale: cfgScale });
@@ -334,10 +341,7 @@ class BreezeTtsProvider {
 
     async refreshCacheCount() {
         const { count, bytes } = await cache.stats();
-        const size = bytes > 1048576
-            ? `${(bytes / 1048576).toFixed(1)} MB`
-            : `${Math.round(bytes / 1024)} KB`;
-        $('#breeze_cache_count').text(count ? `${count} clips — ${size}` : 'cache empty');
+        $('#breeze_cache_count').text(count ? `${count} clips — ${size(bytes)}` : 'cache empty');
     }
 
     dispose() { }
@@ -556,27 +560,6 @@ class BreezeTtsProvider {
 
     voicePreset(name) {
         return this._presets()[name] ?? null;
-    }
-
-    /** Add or replace a voice preset and persist it. */
-    async addVoice(name, preset) {
-        const presets = this._presets();
-        presets[name] = preset;
-        this.settings.voices_json = JSON.stringify(presets, null, 2);
-        $('#breeze_voices').val(this.settings.voices_json);
-        this.voices = [];
-        saveTtsProviderSettings();
-        await initVoiceMap();
-        return name;
-    }
-
-    /** Point a character at a voice in the TTS voice map. */
-    async assignVoice(character, voiceName) {
-        this.settings.voiceMap = this.settings.voiceMap ?? {};
-        this.settings.voiceMap[character] = voiceName;
-        saveTtsProviderSettings();
-        await initVoiceMap();
-        return voiceName;
     }
 
     /** Resolve which voice a character narrates with, following the default marker. */
@@ -835,24 +818,11 @@ function isForeignSpeaker(speaker, message) {
     return name !== String(message?.name ?? '').trim().toLowerCase();
 }
 
-// The provider is a separate extension, deployed separately, so it can be older
-// than this one. These are the methods added after the first release: without
-// them the feature they serve degrades, but nothing may throw — an exception
-// here lands in castVoice's catch and looks exactly like "the model said no".
-const PROVIDER_FEATURES = ['voicePreset', 'preview', 'dropClips'];
-
-function missingProviderFeatures() {
-    const breeze = globalThis.breezeTts;
-    if (!breeze?.available) return [];
-    return PROVIDER_FEATURES.filter(name => typeof breeze[name] !== 'function');
-}
-
-/** A base voice's preset, or null if this provider is too old to offer them. */
+/** A base voice's preset. Null rather than throwing: the voices JSON is hand-edited. */
 function basePreset(name) {
-    const breeze = globalThis.breezeTts;
-    if (!name || typeof breeze?.voicePreset !== 'function') return null;
+    if (!name) return null;
     try {
-        return breeze.voicePreset(name);
+        return globalThis.breezeTts?.voicePreset(name) ?? null;
     } catch (error) {
         console.warn('[Breeze Director] could not read base voice', name, error);
         return null;
@@ -1300,9 +1270,10 @@ function cardFor(name) {
     return characters.find(c => c.name === name) ?? null;
 }
 
-// -------------------------------------------------------------------- casting
+// -------------------------------------------------------------- cast storage
 // A speaker keeps one voice for a whole chat: re-picking per message would make
-// the same stranger sound like a different person every paragraph.
+// the same stranger sound like a different person every paragraph. The casting
+// itself is further down, after identification, which has to run first.
 
 const castJobs = new Map();
 
@@ -1529,9 +1500,10 @@ async function askCasting(speaker, quotes) {
 }
 
 /**
- * The voice a foreign speaker should use. Manual voice-map entries win, then
- * the chat's cast, then a freshly derived voice. Never throws: the caller falls
- * back to the default voice.
+ * Settle which base a foreign speaker speaks through, and record them on the
+ * cast sheet. A sheet edit pins the entry and wins outright; otherwise a
+ * hand-assigned voice-map entry wins; otherwise the director picks one. Never
+ * throws — the caller falls back to the default voice.
  */
 async function castVoice(speaker, quotes = []) {
     const breeze = globalThis.breezeTts;
@@ -1656,8 +1628,7 @@ async function prepare(index) {
     if (config.prefetch) await prefetchMessage(index);
 }
 
-// ---------------------------------------------------------------- editor UI
-
+// ----------------------------------------------------------- message buttons
 
 const DIRECT_BUTTON_HTML = '<div title="Voice direction" class="mes_button mes_breeze_direct fa-solid fa-masks-theater"></div>';
 const PLAY_BUTTON_HTML = '<div title="Narration player" class="mes_button mes_breeze_play fa-solid fa-headphones"></div>';
@@ -1680,7 +1651,7 @@ function addButtons() {
 // ------------------------------------------------------------------- position
 
 function positionKey(messageId) {
-    return `${ctx().getCurrentChatId?.() ?? 'chat'}:${messageId}`;
+    return `${currentChatId()}:${messageId}`;
 }
 
 function savePosition(messageId, index) {
@@ -1829,7 +1800,6 @@ player.audio.addEventListener('ended', () => {
     }
 });
 
-// ------------------------------------------------------------------------- UI
 // ------------------------------------------------------------- inline panel
 // One panel per message, rendered into the message block itself rather than a
 // popup, so the chat stays visible and playback can highlight as it goes.
@@ -1858,11 +1828,6 @@ function button(icon, title, handler, label) {
     element.style.flex = '0 0 auto';
     element.addEventListener('click', handler);
     return element;
-}
-
-/** Bytes as MB or KB, whichever reads better. */
-function size(bytes) {
-    return bytes > 1048576 ? `${(bytes / 1048576).toFixed(1)} MB` : `${Math.round(bytes / 1024)} KB`;
 }
 
 function stamp(ts) {
@@ -2251,7 +2216,7 @@ function togglePlayback(messageId) {
 
 function resumeLatest() {
     const config = playerSettings();
-    const chatId = ctx().getCurrentChatId?.() ?? 'chat';
+    const chatId = currentChatId();
     const prefix = `${chatId}:`;
 
     const candidates = Object.keys(config.resume)
@@ -2540,7 +2505,6 @@ const SETTINGS_HTML = `
       <label class="checkbox_label"><input id="bd_cast" type="checkbox"> Give quoted speech its own voice per speaker</label>
       <small>Click the masks icon on any message to view, generate, or edit its direction.</small>
       <small id="bd_paragraph_warn" style="color:var(--golden);display:block;"></small>
-      <small id="bd_provider_warn" style="color:var(--golden);display:block;"></small>
 
       <label for="bd_narrator">Narrator voice (everything outside quotes):</label>
       <select id="bd_narrator" class="text_pole"></select>
@@ -2645,12 +2609,6 @@ function bind() {
     // never returns speakers, and with ST's own paragraph narration off it hands
     // the provider the whole message as one job.
     const warn = () => {
-        // The two extensions deploy separately, so they can drift apart.
-        const missing = missingProviderFeatures();
-        $('#bd_provider_warn').text(missing.length
-            ? `The Breeze provider is missing ${missing.join(', ')} — redeploy breeze-tts `
-                + 'alongside this extension, or casting and previews will not work.'
-            : '');
         $('#bd_cast_prompt_warn').text(config.voice_cast_prompt.includes('{{cast}}')
             ? ''
             : 'This saved casting prompt cannot see the existing cast — click '
@@ -2747,15 +2705,6 @@ jQuery(async () => {
     $('#extensions_settings2').append(SETTINGS_HTML);
     bind();
     addButtons();
-
-    // Deployed separately, so check rather than assume they match.
-    const missing = missingProviderFeatures();
-    if (missing.length) {
-        console.warn(`[Breeze Director] the Breeze provider is missing ${missing.join(', ')}. `
-            + 'Redeploy breeze-tts from the same checkout as this extension.');
-        toastr.warning(`Breeze provider is out of date (missing ${missing.join(', ')}).`,
-            'Breeze Director');
-    }
 
     $(document).on('click', '.mes_breeze_direct', function () {
         const index = Number($(this).closest('.mes').attr('mesid'));

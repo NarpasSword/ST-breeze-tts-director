@@ -17,15 +17,43 @@
 
 const GLib = imports.gi.GLib;
 
+// Every element built through document.createElement is kept, with the handlers
+// bound to it, so a test can fire them. Registering a handler proves nothing;
+// running it is what catches a name that no longer resolves inside it.
+const built = [];
+
 function el() {
-    return {
+    const node = {
+        handlers: {},
         style: { cssText: '', setProperty() {} },
         classList: { add() {}, remove() {}, toggle() {}, contains: () => false },
-        append() {}, appendChild() {}, addEventListener() {}, remove() {},
+        append() {}, appendChild() {}, remove() {},
+        addEventListener(type, fn) { (this.handlers[type] ??= []).push(fn); },
         querySelector: () => el(), querySelectorAll: () => [],
         textContent: '', innerHTML: '', value: '', className: '', title: '',
         rows: 0, placeholder: '', readOnly: false, disabled: false, hidden: false,
     };
+    built.push(node);
+    return node;
+}
+
+/** Fire every handler bound since the marker, reporting any that throw. */
+async function fireAll(from, label) {
+    let fired = 0;
+    for (const node of built.slice(from)) {
+        for (const [type, fns] of Object.entries(node.handlers)) {
+            for (const fn of fns) {
+                fired++;
+                try {
+                    await fn({ stopPropagation() {}, preventDefault() {} });
+                } catch (error) {
+                    fails++;
+                    print(`  FAIL ${label}: a ${type} handler threw: ${error}`);
+                }
+            }
+        }
+    }
+    return fired;
 }
 
 let readyFn = null;
@@ -85,7 +113,6 @@ let registeredProvider = null;
 globalThis.registerTtsProvider = (name, cls) => { registeredProvider = { name, cls }; };
 globalThis.getPreviewString = () => 'preview';
 globalThis.saveTtsProviderSettings = () => {};
-globalThis.initVoiceMap = async () => {};
 
 
 const [, bytes] = GLib.file_get_contents(ARGV[0] || 'index.js');
@@ -418,8 +445,8 @@ function runCastScenarios() {
            raw: 'Hmm {let me see}. Here:\n{"1":"Alice","q2":"Bob"}' },
          { cast: ['Bob'], base: 'villain' }],
 
-        ['casts against a provider too old to expose voicePreset',
-         { map: { Alice: 'narrator' }, noVoicePreset: true,
+        ['casts when a base voice cannot be read',
+         { map: { Alice: 'narrator' }, unreadableBase: true,
            identify: { Q1: 'Alice', Q2: 'Bob' } },
          { cast: ['Bob'], base: 'villain', tone: 'Gruff.' }],
 
@@ -465,8 +492,12 @@ function runCastScenarios() {
             prefetch: async () => true,
             getClip: async () => null,
         };
-        // An older provider simply does not have the newer methods.
-        if (setup.noVoicePreset) delete globalThis.breezeTts.voicePreset;
+        // The voices JSON is hand-edited, so reading a preset can throw.
+        if (setup.unreadableBase) {
+            globalThis.breezeTts.voicePreset = () => {
+                throw new SyntaxError('Voices JSON is not valid.');
+            };
+        }
         const config = api.settings();
         config.profile = 'test';
         config.cast = {};
@@ -529,6 +560,48 @@ function runCastScenarios() {
         } catch (error) {
             fails++;
             print('  FAIL castMessage threw: ' + error);
+        }
+
+        // The cast sheet builds a lot of DOM and is otherwise untested; opening
+        // it here catches a reference error in any of its rows or handlers.
+        print('\ncast sheet');
+        try {
+            const sheet = new Function(source + ';return { settings, castMap, openCastSheet };')();
+
+            // Loading the module republishes the real breezeTts, so the stub
+            // has to go back afterwards or the sheet bails at its guard.
+            globalThis.breezeTts = {
+                available: true,
+                listVoices: () => [...BASE, ...added.keys()],
+                hasVoice: (n) => BASE.includes(n) || added.has(n),
+                addVoice: async (n, preset) => { added.set(n, preset); return n; },
+                voiceForCharacter: () => null,
+                voicePreset: (n) => (BASE.includes(n) ? { cfg_scale: 4 } : null),
+                previewWith: async () => {},
+                prefetch: async () => true,
+                getClip: async () => null,
+            };
+
+            const config = sheet.settings();
+            config.profile = 'test';
+            config.cast = {};
+            Object.assign(sheet.castMap(), {
+                Bob: { base: 'villain', gender: 'male', tone: 'Gruff.' },
+                Carol: { base: 'nope', pinned: true },
+                Dave: {},
+            });
+            const marker = built.length;
+            await sheet.openCastSheet();
+            const rows = built.length - marker;
+            eq('builds rows for every entry', rows > 10, true);
+
+            const fired = await fireAll(marker, 'cast sheet');
+            eq('handlers were bound and ran', fired > 5, true);
+            eq('provider voices untouched by the sheet', [...added.keys()], []);
+        } catch (error) {
+            fails++;
+            print('  FAIL cast sheet threw: ' + error);
+            print(String(error.stack || '').split('\n').slice(0, 4).join('\n'));
         }
     }).then(finish, (error) => {
         fails++;

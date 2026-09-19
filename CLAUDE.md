@@ -43,6 +43,13 @@ indistinguishable from the model declining, so casting quietly does nothing.
 Shipping them together removes the failure mode; the globals keep the seam
 legible.
 
+The provider API is deliberately read-only about voices: `listVoices`,
+`hasVoice`, `voicePreset`, `voiceForCharacter`, plus clip work (`getClip`,
+`prefetch`, `dropClips`, `cacheStats`, `clearCache`, `previewWith`). `addVoice`
+and `assignVoice` were removed once nothing called them — with them gone there
+is no code path that writes the voices JSON at all, which is the invariant
+rather than a convention.
+
 `registerTtsProvider` throws if the name is already taken, which is exactly what
 happens when the old standalone `breeze-tts` extension is still installed.
 Unguarded, that aborts the whole file and the extension vanishes from the UI, so
@@ -386,6 +393,16 @@ another declaration pattern, not an allowlist entry.
 Note the regex-literal handling is load-bearing: `normalize()`'s pattern
 contains a backtick inside a character class, and without it the scanner reads
 half the file as one template literal.
+
+### The cast sheet is exercised, not just built
+
+`openCastSheet()` is the largest function here and builds a lot of DOM. The
+check tool opens it against a cast with a normal entry, one whose base is
+missing, and one that is empty, then **fires every handler it bound** — the
+element stub records listeners so they can be invoked. Registering a handler
+proves nothing; running it is what catches a name that stopped resolving inside
+it. That pass also asserts the provider's voice list comes back untouched, so
+the no-writes invariant is checked from the UI as well as from `generate()`.
 
 ## Known issues / gotchas
 
