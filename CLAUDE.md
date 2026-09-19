@@ -219,8 +219,10 @@ Resolution order, each step falling through on failure:
    otherwise beats the director. The entry records it with
    `source: 'voicemap'`, so the sheet still lists the speaker.
 3. The chat's cast cache.
-4. `askCasting()` picks a **base voice**, shown the speaker's profile, their own
-   lines, the available voices and the running cast.
+4. `askCasting()` answers with both a **base voice** and a **profile**, shown the
+   speaker's card text, their own lines, the available voices and the running
+   cast. This is the only call that describes a voice, and it runs once per
+   speaker.
 5. `applyCast()` writes a provider voice named after the speaker, via
    `castPreset()`: the base's `cfg_scale`, its `ref_audio_url`/`ref_text` when it
    has **both**, and `voiceInstruction()` as the instruction — falling back to

@@ -119,12 +119,12 @@ function runAssertions() {
 const api = new Function(source + `;return {
     splitSegments, collectQuotes, isForeignSpeaker, parseDirection,
     normalize, pickLine, castEntry, hash, syncPrompts,
-    voiceInstruction, cleanProfile, profileFor, PROFILE_FIELDS,
+    voiceInstruction, cleanProfile, PROFILE_FIELDS,
     extractJson, normalizeQuoteId,
     DEFAULT_PROMPT, DEFAULT_VOICE_CAST_PROMPT };`)();
 const { splitSegments, collectQuotes, isForeignSpeaker, parseDirection,
         normalize, pickLine, castEntry, hash, syncPrompts,
-        voiceInstruction, cleanProfile, profileFor,
+        voiceInstruction, cleanProfile,
         extractJson, normalizeQuoteId } = api;
 
 
@@ -199,12 +199,6 @@ eq('bare number', normalizeQuoteId('3'), 'Q3');
 eq('padded', normalizeQuoteId(' q4 '), 'Q4');
 eq('non-numeric left alone', normalizeQuoteId('Alice'), 'ALICE');
 
-print('profileFor');
-eq('exact key', profileFor({ Bob: { tone: 'a' } }, 'Bob'), { tone: 'a' });
-eq('different casing', profileFor({ bob: { tone: 'a' } }, 'Bob'), { tone: 'a' });
-eq('surrounding space', profileFor({ ' Bob ': { tone: 'a' } }, 'Bob'), { tone: 'a' });
-eq('absent', profileFor({ Carol: { tone: 'a' } }, 'Bob'), null);
-
 print('voiceInstruction');
 const bob = { gender: 'male', age: 'late forties', accent: 'Scottish', tone: 'Gruff and clipped.' };
 eq('design mode composes everything', voiceInstruction(bob, false),
@@ -247,45 +241,39 @@ function runCastScenarios() {
 
     const scenarios = [
         ['new speaker is cast',
-         { map: { Alice: 'narrator' }, casting: 'villain',
-           identify: { speakers: { Q1: 'Alice', Q2: 'Bob' },
-                       profiles: { Bob: { gender: 'male', tone: 'Gruff.' } } } },
-         { cast: ['Bob'], added: ['bob'] }],
+         { map: { Alice: 'narrator' }, casting: { base: 'villain', gender: 'male', tone: 'Gruff.' },
+           identify: { Q1: 'Alice', Q2: 'Bob' } },
+         { cast: ['Bob'], added: ['bob'], tone: 'Gruff.' }],
 
         ['speaker with a voice-map entry is still listed',
-         { map: { Alice: 'narrator', Bob: 'villain' }, casting: 'villain',
-           identify: { speakers: { Q1: 'Alice', Q2: 'Bob' },
-                       profiles: { Bob: { gender: 'male', tone: 'Gruff.' } } } },
+         { map: { Alice: 'narrator', Bob: 'villain' },
+           identify: { Q1: 'Alice', Q2: 'Bob' } },
          { cast: ['Bob'], added: [] }],
 
-        ['profile filed under different casing is kept',
-         { map: { Alice: 'narrator' }, casting: 'villain',
-           identify: { speakers: { Q1: 'Alice', Q2: 'Bob' },
-                       profiles: { bob: { gender: 'male', tone: 'Gruff.' } } } },
+        ['answer recovered from the reasoning channel',
+         { map: { Alice: 'narrator' },
+           raw: '',
+           reasoning: 'Working through it... {"Q1":"Alice","Q2":"Bob"}' },
          { cast: ['Bob'], added: ['bob'], tone: 'Gruff.' }],
 
         ['speaker is listed even when nothing can be derived',
-         { map: { Alice: 'narrator' }, casting: 'no such voice',
-           identify: { speakers: { Q1: 'Alice', Q2: 'Bob' }, profiles: {} } },
+         { map: { Alice: 'narrator' }, casting: { base: 'no such voice' },
+           identify: { Q1: 'Alice', Q2: 'Bob' } },
          { cast: ['Bob'], added: [] }],
 
         ['a pre-staged speaker is reused, not re-cast',
-         { map: { Alice: 'narrator' }, casting: 'villain',
+         { map: { Alice: 'narrator' }, casting: { base: 'villain', gender: 'male', tone: 'Gruff.' },
            prestage: { Bob: { voice: 'villain', base: 'villain', pinned: true, tone: 'Mine.' } },
-           identify: { speakers: { Q1: 'Alice', Q2: 'Bob' },
-                       profiles: { Bob: { gender: 'male', tone: 'Gruff.' } } } },
+           identify: { Q1: 'Alice', Q2: 'Bob' } },
          { cast: ['Bob'], added: [], tone: 'Mine.', voice: 'villain' }],
 
         ['survives a reasoning preamble and odd quote ids',
-         { map: { Alice: 'narrator' }, casting: 'villain',
-           raw: 'Hmm {let me see}. Here:\n{"speakers":{"1":"Alice","q2":"Bob"},'
-                + '"profiles":{"Bob":{"gender":"male","tone":"Gruff."}}}',
-           identify: null },
+         { map: { Alice: 'narrator' }, casting: { base: 'villain', gender: 'male', tone: 'Gruff.' },
+           raw: 'Hmm {let me see}. Here:\n{"1":"Alice","q2":"Bob"}' },
          { cast: ['Bob'], added: ['bob'] }],
 
         ['unattributed quotes are ignored',
-         { map: { Alice: 'narrator' }, casting: 'villain',
-           identify: { speakers: { Q1: 'Alice', Q2: 'unknown' }, profiles: {} } },
+         { map: { Alice: 'narrator' }, identify: { Q1: 'Alice', Q2: 'unknown' } },
          { cast: [], added: [] }],
     ];
 
@@ -294,15 +282,20 @@ function runCastScenarios() {
     // Strictly sequential: every scenario rewrites the same global stubs, so
     // running them concurrently has each one generating against another's model.
     return scenarios.reduce((chain, [label, setup, want]) => chain.then(async () => {
+        // Scenarios that do not care what casting answers still need it to answer.
+        setup.casting = setup.casting ?? { base: 'villain', gender: 'male', tone: 'Gruff.' };
         const added = new Map();
         const budgets = [];
         context.chat = [{ name: 'Alice', swipe_id: 0, extra: {}, mes: MES }];
         context.ConnectionManagerRequestService.sendRequest = async (profile, prompt, maxTokens) => {
             budgets.push([prompt.split('\n')[0].slice(0, 20), maxTokens]);
             if (prompt.includes('who speaks each line')) {
-                return { content: setup.raw ?? JSON.stringify(setup.identify) };
+                return { content: setup.raw ?? JSON.stringify(setup.identify),
+                         reasoning: setup.reasoning };
             }
-            if (prompt.includes('Choose which existing voice')) return { content: setup.casting };
+            if (prompt.includes("Describe a character's voice")) {
+                return { content: JSON.stringify(setup.casting) };
+            }
             return { content: JSON.stringify(['Weary.', 'Flat and final.']) };
         };
         globalThis.breezeTts = {
@@ -345,12 +338,11 @@ function runCastScenarios() {
         context.chat = [{ name: 'Alice', swipe_id: 0, extra: {}, mes: MES }];
         context.ConnectionManagerRequestService.sendRequest = async (profile, prompt) => {
             if (prompt.includes('who speaks each line')) {
-                return { content: JSON.stringify({
-                    speakers: { Q1: 'Alice', Q2: 'Bob' },
-                    profiles: { Bob: { gender: 'male', tone: 'Gruff.' } },
-                }) };
+                return { content: JSON.stringify({ Q1: 'Alice', Q2: 'Bob' }) };
             }
-            if (prompt.includes('Choose which existing voice')) return { content: 'villain' };
+            if (prompt.includes("Describe a character's voice")) {
+                return { content: JSON.stringify({ base: 'villain', tone: 'Gruff.' }) };
+            }
             throw new Error('castMessage should not ask for direction');
         };
         globalThis.breezeTts = {

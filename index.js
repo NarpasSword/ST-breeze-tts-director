@@ -38,35 +38,33 @@ Passage:
 Quoted lines to attribute:
 {{quotes}}
 
-For each quote, name the speaker. Use the name exactly as the passage gives it.
-Use "{{char}}" when {{char}} is speaking and "{{user}}" for {{user}}.
-Use "unknown" only when the passage genuinely does not say.
+Name the speaker of each quote, exactly as the passage gives it. Use "{{char}}" when
+{{char}} is speaking and "{{user}}" for {{user}}. Use "unknown" only when the passage
+genuinely does not say.
 
-For every distinct speaker who is neither {{char}} nor {{user}}, describe their voice:
-apparent gender, approximate age, the tone and manner of their speech, and an accent
-only if the passage implies one. Leave a field as "" when the passage gives no basis
-for it — do not invent.
+Reply with ONLY a JSON object mapping each label to a name, no commentary, no code fences:
+{"Q1": "name", "Q2": "name"}`;
 
-Reply with ONLY a JSON object, no commentary, no code fences:
-{"speakers": {"Q1": "name"},
- "profiles": {"name": {"gender": "", "age": "", "tone": "", "accent": ""}}}`;
-
-const DEFAULT_VOICE_CAST_PROMPT = `Choose which existing voice to build a character's voice on.
-
-Pick the closest match from the list. Its timbre becomes their starting point; their
-own description is what sets them apart, so several characters may share one base.
+const DEFAULT_VOICE_CAST_PROMPT = `Describe a character's voice, and choose an existing voice to build it on.
 
 Character: {{speaker}}
-{{profile}}
+{{context}}
 Lines they speak:
 {{lines}}
 
 Available base voices:
 {{voices}}
 {{cast}}
-If this character is someone already cast under a different name, reuse that base.
+Pick the closest base from the list. Several characters may share one, since your
+description is what tells them apart. If this character is someone already cast under
+a different name, reuse their base.
 
-Reply with ONLY the voice name, copied exactly from the list. Nothing else.`;
+Then describe their voice: apparent gender, approximate age, the tone and manner of
+their speech, and an accent only if there is a basis for one. Leave a field as ""
+when there is no basis — do not invent.
+
+Reply with ONLY a JSON object, no commentary, no code fences:
+{"base": "<a voice name from the list>", "gender": "", "age": "", "tone": "", "accent": ""}`;
 
 /** Spliced into the casting prompt at {{cast}} once anyone has been cast. */
 const CAST_BLOCK = `
@@ -329,25 +327,55 @@ function hasDirection(index) {
  * budgets of 80 and 200 tokens. The floor is therefore the user's own
  * max_tokens, never the caller's estimate of how long the answer is.
  */
-async function askModel(label, prompt, minTokens) {
+async function callModel(label, prompt, minTokens, roomy) {
     const config = settings();
-    const budget = Math.max(Number(config.max_tokens) || 0, minTokens);
+    // Reasoning is billed against the same budget, so the retry buys thinking
+    // room rather than a longer answer.
+    const budget = Math.max(Number(config.max_tokens) || 0, minTokens) * (roomy ? 3 : 1);
 
     const result = await ctx().ConnectionManagerRequestService.sendRequest(
         config.profile, prompt, budget,
     );
 
-    const text = String(result?.content ?? '')
+    const clean = (value) => String(value ?? '')
         .replace(/<think>[\s\S]*?<\/think>/gi, '')
         .replace(/```(?:json)?/gi, '')
         .trim();
 
-    if (!text) {
-        console.warn(`[Breeze Director] ${label}: empty completion at budget ${budget}. `
-            + 'A reasoning model may have spent it all thinking — raise Max response '
-            + 'tokens, or use a non-reasoning connection profile.', result);
+    return { content: clean(result?.content), reasoning: clean(result?.reasoning), budget };
+}
+
+/** Plain text from the model, retried once with more room if it comes back empty. */
+async function askModel(label, prompt, minTokens) {
+    let reply = await callModel(label, prompt, minTokens);
+    if (!reply.content) {
+        console.warn(`[Breeze Director] ${label}: empty at budget ${reply.budget}, `
+            + 'retrying with room to think.');
+        reply = await callModel(label, prompt, minTokens, true);
     }
-    return text;
+    if (!reply.content) {
+        console.warn(`[Breeze Director] ${label}: still empty at budget ${reply.budget}. `
+            + 'Raise Max response tokens, or use a non-reasoning connection profile.');
+    }
+    return reply.content;
+}
+
+/**
+ * A JSON object from the model. Falls back to the reasoning channel, because a
+ * model that runs out of room mid-thought has often already written the answer
+ * there — and retries once with a larger budget before giving up.
+ */
+async function askJson(label, prompt, minTokens) {
+    for (const roomy of [false, true]) {
+        const reply = await callModel(label, prompt, minTokens, roomy);
+        const parsed = extractJson(reply.content) ?? extractJson(reply.reasoning);
+        if (parsed) return parsed;
+
+        console.warn(`[Breeze Director] ${label}: no usable JSON at budget ${reply.budget}`
+            + (roomy ? '. Giving up.' : ', retrying with room to think.'),
+            reply.content || '(empty completion)');
+    }
+    return null;
 }
 
 /**
@@ -480,9 +508,7 @@ async function generate(index, { quiet = true } = {}) {
 
     // Who speaks gets its own call, or several: one job per prompt, and each
     // chunk knows who the ones before it named.
-    const cast = attribute
-        ? await identifySpeakers(message, units, quotes)
-        : { speakers: {}, profiles: {} };
+    const speakers = attribute ? await identifySpeakers(message, units, quotes) : {};
 
     const completion = await askModel('direction', buildPrompt(message, units), 600 + 80 * units.length);
     if (!completion) {
@@ -499,7 +525,7 @@ async function generate(index, { quiet = true } = {}) {
 
     // askCasting quotes a speaker's own lines back at the model; tag them now.
     for (const quote of quotes) {
-        quote.speaker = String(cast.speakers[quote.id] ?? '').trim();
+        quote.speaker = String(speakers[quote.id] ?? '').trim();
     }
 
     const lines = [];
@@ -517,12 +543,12 @@ async function generate(index, { quiet = true } = {}) {
 
                 if (segment.kind === 'dialogue') {
                     const quote = quotes.find(q => q.paragraph === i && q.at === at);
-                    const speaker = String(cast.speakers[quote?.id] ?? '').trim();
+                    const speaker = String(speakers[quote?.id] ?? '').trim();
                     entry.speaker = speaker || null;
                     // Only a foreign speaker gets a voice pinned; the character's
                     // own lines resolve live so voice-map edits keep working.
                     if (isForeignSpeaker(speaker, message)) {
-                        entry.voice = await castVoice(speaker, quotes, profileFor(cast.profiles, speaker));
+                        entry.voice = await castVoice(speaker, quotes);
                     }
                 }
                 line.segments.push(entry);
@@ -722,14 +748,6 @@ function pruneCast() {
 
 const PROFILE_FIELDS = ['gender', 'age', 'tone', 'accent'];
 
-/** Find a profile however the model cased the name it filed it under. */
-function profileFor(profiles, speaker) {
-    if (profiles?.[speaker]) return profiles[speaker];
-    const needle = String(speaker ?? '').trim().toLowerCase();
-    const hit = Object.keys(profiles ?? {}).find(name => name.trim().toLowerCase() === needle);
-    return hit ? profiles[hit] : null;
-}
-
 function cleanProfile(raw) {
     const profile = {};
     for (const field of PROFILE_FIELDS) {
@@ -773,28 +791,24 @@ async function askIdentify(message, units, from, to, quotes, known) {
     prompt = put(prompt, /{{char}}/g, String(message?.name ?? context.name2 ?? ''));
     prompt = put(prompt, /{{user}}/g, String(context.name1 ?? ''));
 
-    const text = await askModel('identification', prompt, 400 + 120 * quotes.length);
-    if (!text) return null;
+    const parsed = await askJson('identification', prompt, 300 + 60 * quotes.length);
+    if (!parsed) return null;
 
-    const parsed = extractJson(text);
-    if (!parsed) {
-        console.warn('[Breeze Director] identification returned no usable JSON:', text);
-        return null;
-    }
+    // Accept either the flat map we ask for or a {speakers:{...}} wrapper.
+    const source = (parsed.speakers && typeof parsed.speakers === 'object')
+        ? parsed.speakers
+        : parsed;
 
     const speakers = {};
-    for (const [id, name] of Object.entries(parsed?.speakers ?? {})) {
-        speakers[normalizeQuoteId(id)] = String(name ?? '').trim();
-    }
-    const profiles = {};
-    for (const [name, raw] of Object.entries(parsed?.profiles ?? {})) {
-        const profile = cleanProfile(raw);
-        if (profile) profiles[String(name).trim()] = profile;
+    for (const [id, name] of Object.entries(source)) {
+        const value = String(name ?? '').trim();
+        if (value) speakers[normalizeQuoteId(id)] = value;
     }
 
-    console.info(`[Breeze Director] identified ${Object.keys(speakers).length}`
-        + ` of ${quotes.length} quotes.`);
-    return { speakers, profiles };
+    const missed = quotes.filter(q => !speakers[q.id]).length;
+    console.info(`[Breeze Director] identified ${quotes.length - missed} of ${quotes.length} quotes`
+        + (missed ? ` (${missed} unattributed)` : '') + '.');
+    return speakers;
 }
 
 /**
@@ -807,24 +821,14 @@ async function identifySpeakers(message, units, quotes) {
     const step = (!Number.isFinite(size) || size < 1) ? units.length : size;
 
     const speakers = {};
-    const profiles = {};
-
     for (let from = 0; from < units.length; from += step) {
         const to = Math.min(from + step, units.length);
         const slice = quotes.filter(q => q.paragraph >= from && q.paragraph < to);
         if (!slice.length) continue;
 
-        const result = await askIdentify(message, units, from, to, slice, speakers);
-        if (!result) continue;
-
-        Object.assign(speakers, result.speakers);
-        // First description of someone wins; later chunks see less of them.
-        for (const [name, profile] of Object.entries(result.profiles)) {
-            if (!profiles[name]) profiles[name] = profile;
-        }
+        Object.assign(speakers, await askIdentify(message, units, from, to, slice, speakers) ?? {});
     }
-
-    return { speakers, profiles };
+    return speakers;
 }
 
 /** Cast entries were bare voice names before base and profile existed. */
@@ -892,12 +896,9 @@ function freeVoiceName(speaker) {
  * is the sheet's invitation to fill one in by hand, which is better than the
  * speaker vanishing because nothing could be derived for them automatically.
  */
-function rememberSpeaker(speaker, profile) {
+function rememberSpeaker(speaker) {
     const cast = castMap();
     const entry = castEntry(cast[speaker]) ?? { voice: null, base: null };
-    for (const field of PROFILE_FIELDS) {
-        if (!entry[field] && profile?.[field]) entry[field] = profile[field];
-    }
     cast[speaker] = entry;
     pruneCast();
     return entry;
@@ -913,8 +914,8 @@ async function applyCast(speaker, entry) {
     return name;
 }
 
-/** Ask the director which existing voice to build this speaker's timbre on. */
-async function askCasting(speaker, quotes, profile) {
+/** Ask the director for this speaker's voice: a base to build on, and a description. */
+async function askCasting(speaker, quotes) {
     const config = settings();
     const breeze = globalThis.breezeTts;
     const available = breeze?.listVoices() ?? [];
@@ -922,7 +923,7 @@ async function askCasting(speaker, quotes, profile) {
 
     const spoken = quotes
         .filter(q => q.speaker === speaker)
-        .slice(0, 4)
+        .slice(0, 6)
         .map(q => `- ${q.text}`)
         .join('\n');
 
@@ -930,30 +931,33 @@ async function askCasting(speaker, quotes, profile) {
     // reuse a base for the same person under another name.
     const cast = castMap();
     const roster = Object.entries(cast)
+        .filter(([who]) => who !== speaker)
         .map(([who, value]) => {
             const entry = castEntry(value);
             return `- ${who} → base ${entry.base ?? entry.voice}`;
         })
         .join('\n');
 
-    const described = PROFILE_FIELDS
-        .map(field => (profile?.[field] ? `${field}: ${profile[field]}` : ''))
-        .filter(Boolean)
-        .join('\n');
+    const card = cardFor(speaker);
+    const description = [card?.description, card?.personality]
+        .map(v => String(v ?? '').trim()).filter(Boolean).join('\n\n');
 
     let prompt = put(config.voice_cast_prompt, /{{speaker}}/g, speaker);
-    prompt = put(prompt, /{{profile}}/g, described ? `\nWhat is known of their voice:\n${described}\n` : '');
+    prompt = put(prompt, /{{context}}/g, description ? `\nWhat is known of them:\n${description}\n` : '');
     prompt = put(prompt, /{{lines}}/g, spoken || '(none recorded)');
     prompt = put(prompt, /{{voices}}/g, available.map(name => `- ${name}`).join('\n'));
     prompt = put(prompt, /{{cast}}/g, roster ? put(CAST_BLOCK, /{{list}}/g, roster) : '');
 
-    const answer = (await askModel('base voice', prompt, 120)).toLowerCase();
-    if (!answer) return null;
+    const parsed = await askJson('casting', prompt, 400);
+    if (!parsed) return null;
 
     // The model may quote the name or wrap it in a sentence; match generously.
-    return available.find(name => name.toLowerCase() === answer)
-        ?? available.find(name => answer.includes(name.toLowerCase()))
+    const wanted = String(parsed.base ?? '').trim().toLowerCase();
+    const base = available.find(name => name.toLowerCase() === wanted)
+        ?? available.find(name => wanted.includes(name.toLowerCase()))
         ?? null;
+
+    return { base, profile: cleanProfile(parsed) };
 }
 
 /**
@@ -961,12 +965,12 @@ async function askCasting(speaker, quotes, profile) {
  * the chat's cast, then a freshly derived voice. Never throws: the caller falls
  * back to the default voice.
  */
-async function castVoice(speaker, quotes = [], profile = null) {
+async function castVoice(speaker, quotes = []) {
     const breeze = globalThis.breezeTts;
     if (!breeze?.available) return null;
 
     // Record them first: whatever happens next, they belong on the sheet.
-    const entry = rememberSpeaker(speaker, profile);
+    const entry = rememberSpeaker(speaker);
     const settle = (voice) => {
         ctx().saveSettingsDebounced();
         onCastChanged?.();
@@ -990,8 +994,11 @@ async function castVoice(speaker, quotes = [], profile = null) {
     if (castJobs.has(speaker)) return castJobs.get(speaker);
 
     const pending = (async () => {
-        const base = await askCasting(speaker, quotes, entry);
-        if (base) entry.base = base;
+        const casting = await askCasting(speaker, quotes);
+        if (casting?.base) entry.base = casting.base;
+        for (const field of PROFILE_FIELDS) {
+            if (!entry[field] && casting?.profile?.[field]) entry[field] = casting.profile[field];
+        }
 
         // Nothing to build on: leave them unvoiced rather than dropping them.
         if (!entry.base && !voiceInstruction(entry, false)) return null;
@@ -1033,16 +1040,16 @@ async function castMessage(index) {
     const quotes = collectQuotes(units.map(unit => splitSegments(unit.text)));
     if (!quotes.length) return [];
 
-    const found = await identifySpeakers(message, units, quotes);
+    const speakers = await identifySpeakers(message, units, quotes);
     for (const quote of quotes) {
-        quote.speaker = String(found.speakers[quote.id] ?? '').trim();
+        quote.speaker = String(speakers[quote.id] ?? '').trim();
     }
 
     const cast = [];
     for (const quote of quotes) {
         if (!isForeignSpeaker(quote.speaker, message) || cast.includes(quote.speaker)) continue;
         cast.push(quote.speaker);
-        await castVoice(quote.speaker, quotes, profileFor(found.profiles, quote.speaker));
+        await castVoice(quote.speaker, quotes);
     }
     return cast;
 }
