@@ -233,6 +233,10 @@ globalThis.breezeTts = {
     cacheCount() { return cache.count(); },
     cacheStats() { return cache.stats(); },
     preview(voice) { return this._provider?.previewTtsVoice(voice); },
+    /** Play a base voice under an instruction that is not stored anywhere. */
+    previewWith(voice, instruction, cfgScale) {
+        return this._provider?.previewTtsVoice(voice, { instruction, cfg_scale: cfgScale });
+    },
     /** A copy of a voice's raw preset, for deriving another voice from it. */
     voicePreset(name) {
         const preset = this._provider?.voicePreset(name);
@@ -389,8 +393,14 @@ class BreezeTtsProvider {
         let instruction = preset.instruction ?? '';
         let cfgScale = preset.cfg_scale ?? 1;
 
-        // `bypass` is for previews: play the voice as written, undirected.
-        if (!hint?.bypass && preset.dynamic !== false && typeof globalThis.breezeDirector === 'function') {
+        // An explicit instruction settles it: the cast sheet previewing a voice
+        // it has composed, with no message to direct from.
+        if (hint?.instruction) {
+            instruction = hint.instruction;
+            cfgScale = hint.cfg_scale ?? cfgScale;
+        // `bypass` plays the voice as written, undirected.
+        } else if (!hint?.bypass && preset.dynamic !== false
+            && typeof globalThis.breezeDirector === 'function') {
             try {
                 const directed = await globalThis.breezeDirector(text, voiceId, preset, hint);
                 if (directed?.instruction) {
@@ -523,11 +533,11 @@ class BreezeTtsProvider {
         });
     }
 
-    async previewTtsVoice(voiceId) {
+    async previewTtsVoice(voiceId, hint = { bypass: true }) {
         this.audioElement.pause();
         this.audioElement.currentTime = 0;
 
-        const clip = await this._clip(getPreviewString('en-US'), voiceId, { bypass: true });
+        const clip = await this._clip(getPreviewString('en-US'), voiceId, hint);
         const url = URL.createObjectURL(clip);
         this.audioElement.src = url;
         this.audioElement.onended = () => URL.revokeObjectURL(url);
@@ -655,18 +665,6 @@ Already cast in this scene:
 {{list}}
 `;
 
-const DEFAULT_VOICE_PROMPT = `Design a speaking voice for the character below.
-
-Write ONE sentence describing the voice itself: apparent age, texture, pitch, accent if the
-description implies one, and their default manner of speaking.
-Describe the voice only — no plot, no backstory, no character name.
-Output the sentence and nothing else.
-
-Name: {{char}}
-
-Description:
-{{description}}`;
-
 const DEFAULTS = {
     enabled: true,
     auto: true,
@@ -677,8 +675,6 @@ const DEFAULTS = {
     mode: 'replace',      // replace | append
     on_missing: 'static', // static | generate
     prompt: DEFAULT_PROMPT,
-    auto_voice: true,
-    voice_prompt: DEFAULT_VOICE_PROMPT,
     prefetch: true,
     cast_enabled: true,
     narrator_voice: '',   // '' = the character's own voice
@@ -701,7 +697,6 @@ const CAST_SCAN_LIMIT = 20;
 // If it does not, the user customised it and it is left alone.
 const SHIPPED_PROMPTS = {
     prompt: () => DEFAULT_PROMPT,
-    voice_prompt: () => DEFAULT_VOICE_PROMPT,
     voice_cast_prompt: () => DEFAULT_VOICE_CAST_PROMPT,
     identify_prompt: () => DEFAULT_IDENTIFY_PROMPT,
 };
@@ -883,8 +878,18 @@ function defaultVoice(message) {
  * narrator setting or the voice map keeps working on old messages.
  */
 function voiceForSegment(segment, message) {
+    const breeze = globalThis.breezeTts;
     if (segment?.kind !== 'dialogue') return defaultVoice(message);
-    if (segment.voice && globalThis.breezeTts?.hasVoice(segment.voice)) return segment.voice;
+
+    // A voice picked by hand in the panel wins outright.
+    if (segment.voice && breeze?.hasVoice(segment.voice)) return segment.voice;
+
+    // Otherwise the speaker's cast entry names the base to speak through. This
+    // is resolved at play time, not stored, so editing the cast reaches
+    // messages already in the chat.
+    const entry = castFor(segment.speaker);
+    if (entry?.base && breeze?.hasVoice(entry.base)) return entry.base;
+
     return charVoice(message) ?? defaultVoice(message);
 }
 
@@ -894,17 +899,26 @@ function voiceForSegment(segment, message) {
  * instruction outright instead of matching a fragment back to it.
  */
 function clipsFor(message, line, messageId, paragraph) {
-    const hint = { messageId, paragraph };
     const segments = line?.segments;
     if (!segments?.length) {
-        return [{ text: line?.text ?? '', voice: defaultVoice(message), speaker: null, hint }];
+        return [{
+            text: line?.text ?? '',
+            voice: defaultVoice(message),
+            speaker: null,
+            hint: { messageId, paragraph, speaker: null },
+        }];
     }
-    return segments.map(segment => ({
-        text: segment.text,
-        voice: voiceForSegment(segment, message),
-        speaker: segment.kind === 'dialogue' ? (segment.speaker || null) : null,
-        hint,
-    }));
+    return segments.map(segment => {
+        const speaker = segment.kind === 'dialogue' ? (segment.speaker || null) : null;
+        return {
+            text: segment.text,
+            voice: voiceForSegment(segment, message),
+            speaker,
+            // The speaker rides along so the director can lay their voice
+            // description over the paragraph's delivery direction.
+            hint: { messageId, paragraph, speaker },
+        };
+    });
 }
 
 // Strips quote marks so a segment matches the paragraph it came from. Asterisks
@@ -1152,11 +1166,10 @@ async function generate(index, { quiet = true } = {}) {
                     const quote = quotes.find(q => q.paragraph === i && q.at === at);
                     const speaker = String(speakers[quote?.id] ?? '').trim();
                     entry.speaker = speaker || null;
-                    // Only a foreign speaker gets a voice pinned; the character's
-                    // own lines resolve live so voice-map edits keep working.
-                    if (isForeignSpeaker(speaker, message)) {
-                        entry.voice = await castVoice(speaker, quotes);
-                    }
+                    // Casting records the speaker; which base they speak
+                    // through is resolved at play time from the cast, so
+                    // editing it reaches messages already in the chat.
+                    if (isForeignSpeaker(speaker, message)) await castVoice(speaker, quotes);
                 }
                 line.segments.push(entry);
             }
@@ -1241,81 +1254,50 @@ globalThis.breezeDirector = async function (text, voiceId, preset, hint) {
     const config = settings();
     if (!config.enabled) return null;
 
+    // A clone base already fixes the voice; describing it again only fights the
+    // reference audio, so identity words are dropped for one.
+    const cloned = !!(preset?.ref_audio_url && preset?.ref_text);
+    const cast = castFor(hint?.speaker);
+    const voiceLine = cast ? voiceInstruction(cast, cloned) : '';
+
     // A hint names the paragraph outright; locate() only guesses from the text.
     const index = Number.isInteger(hint?.messageId) ? hint.messageId : locate(text);
     const message = ctx().chat?.[index];
-    if (!message) return null;
 
-    // If a precompute is still running for this message, wait for it rather
-    // than firing a second call or silently falling back.
-    if (inFlight.has(index)) await inFlight.get(index);
+    let line = '';
+    if (message) {
+        // If a precompute is still running for this message, wait for it rather
+        // than firing a second call or silently falling back.
+        if (inFlight.has(index)) await inFlight.get(index);
 
-    let direction = getDirection(message);
-    if (!direction) {
-        if (config.on_missing !== 'generate') return null;
-        await run(index);
-        direction = getDirection(message);
+        let direction = getDirection(message);
+        if (!direction && config.on_missing === 'generate') {
+            await run(index);
+            direction = getDirection(message);
+        }
+        if (direction) {
+            line = (Number.isInteger(hint?.paragraph)
+                ? direction.lines[hint.paragraph]?.instruction
+                : pickLine(direction, text)) ?? '';
+        }
     }
-    if (!direction) return null;
 
-    const line = Number.isInteger(hint?.paragraph)
-        ? direction.lines[hint.paragraph]?.instruction
-        : pickLine(direction, text);
-    if (!line) return null;
+    // The base's own instruction is the user's description of that voice. It is
+    // superseded by a cast member's, which describes someone specific, unless
+    // the user asked for the two to be combined.
+    const carried = (config.mode === 'append' && preset?.instruction) ? preset.instruction : '';
+    const instruction = [carried, voiceLine, line].map(part => String(part ?? '').trim())
+        .filter(Boolean).join(' ');
+    if (!instruction) return null;
 
-    const base = preset?.instruction;
-    const instruction = (config.mode === 'append' && base) ? `${base} ${line}` : line;
-    return { instruction, cfg_scale: Number(config.cfg_scale) };
+    // A base the user maintains carries its own cfg_scale; respect it.
+    return { instruction, cfg_scale: preset?.cfg_scale ?? Number(config.cfg_scale) };
 };
 
-// ------------------------------------------------------- voices and prefetch
-
-const voiceJobs = new Map();
-
+/** The character card for a name, when the chat has one. */
 function cardFor(name) {
     const characters = ctx().characters ?? [];
     return characters.find(c => c.name === name) ?? null;
-}
-
-function slug(name) {
-    const base = String(name).toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');
-    return base || 'voice';
-}
-
-async function designVoice(name) {
-    const config = settings();
-    const context = ctx();
-    const breeze = globalThis.breezeTts;
-
-    const card = cardFor(name);
-    const description = [card?.description, card?.personality, card?.scenario]
-        .map(v => String(v ?? '').trim()).filter(Boolean).join('\n\n');
-
-    if (!description) {
-        console.info(`[Breeze Director] no card text for "${name}", skipping voice design.`);
-        return null;
-    }
-
-    const prompt = config.voice_prompt
-        .replace(/{{char}}/g, name)
-        .replace(/{{description}}/g, description)
-        .replace(/{{user}}/g, String(context.name1 ?? ''));
-
-    const text = await askModel('voice design', prompt, 300);
-    let line = text.split('\n').map(l => l.trim()).filter(Boolean)[0] ?? '';
-    line = line.replace(/^["'`]|["'`]$/g, '').trim();
-    if (!line) return null;
-
-    let voiceName = slug(name);
-    let suffix = 2;
-    while (breeze.hasVoice(voiceName)) voiceName = `${slug(name)}-${suffix++}`;
-
-    await breeze.addVoice(voiceName, { instruction: line, cfg_scale: Number(config.cfg_scale) });
-    await breeze.assignVoice(name, voiceName);
-
-    console.info(`[Breeze Director] designed voice "${voiceName}" for ${name}: ${line}`);
-    toastr.success(`Designed a voice for ${name}.`, 'Breeze Director');
-    return voiceName;
 }
 
 // -------------------------------------------------------------------- casting
@@ -1438,11 +1420,23 @@ async function identifySpeakers(message, units, quotes) {
     return speakers;
 }
 
-/** Cast entries were bare voice names before base and profile existed. */
+/**
+ * Cast entries have been three shapes. The oldest was a bare voice name, the
+ * next carried a derived `voice` this extension had written into the provider.
+ * Both are read as a base to build on: the provider's voices are the user's to
+ * manage, and nothing here writes to them.
+ */
 function castEntry(value) {
     if (!value) return null;
-    if (typeof value === 'string') return { voice: value, base: null };
+    if (typeof value === 'string') return { base: value };
+    if (!value.base && value.voice) return { ...value, base: value.voice };
     return value;
+}
+
+/** The cast entry for a speaker in the current chat, if there is one. */
+function castFor(speaker) {
+    if (!speaker) return null;
+    return castEntry(settings().cast?.[currentChatId()]?.[speaker]);
 }
 
 /**
@@ -1468,33 +1462,11 @@ function voiceInstruction(entry, cloned) {
     return sentence ? `${sentence}.` : '';
 }
 
-/** Build the provider preset for a cast entry: base timbre, composed instruction. */
-function castPreset(entry) {
+/** What Breeze will be told for this cast member, for the sheet to show. */
+function castInstruction(entry) {
     const inherited = basePreset(entry.base);
-    // Clone mode needs both halves, so carry them together or not at all.
     const cloned = !!(inherited?.ref_audio_url && inherited?.ref_text);
-
-    // With nothing said about them, fall back to the base's own instruction so
-    // they at least sound like it, rather than like nothing at all.
-    const preset = {
-        instruction: voiceInstruction(entry, cloned) || String(inherited?.instruction ?? ''),
-        cfg_scale: Number(inherited?.cfg_scale ?? settings().cfg_scale),
-    };
-    if (cloned) {
-        preset.ref_audio_url = inherited.ref_audio_url;
-        preset.ref_text = inherited.ref_text;
-    }
-    return preset;
-}
-
-/** A free voice name derived from the speaker's, not colliding with an existing one. */
-function freeVoiceName(speaker) {
-    const breeze = globalThis.breezeTts;
-    const base = slug(speaker);
-    let name = base;
-    let suffix = 2;
-    while (breeze.hasVoice(name)) name = `${base}-${suffix++}`;
-    return name;
+    return voiceInstruction(entry, cloned);
 }
 
 /**
@@ -1508,16 +1480,6 @@ function rememberSpeaker(speaker) {
     cast[speaker] = entry;
     pruneCast();
     return entry;
-}
-
-/** Write (or rewrite) the provider voice for a cast entry. */
-async function applyCast(speaker, entry) {
-    const breeze = globalThis.breezeTts;
-    // Reuse the existing name so segments already stored keep pointing at it.
-    const name = entry.voice && breeze.hasVoice(entry.voice) ? entry.voice : freeVoiceName(speaker);
-    await breeze.addVoice(name, castPreset(entry));
-    entry.voice = name;
-    return name;
 }
 
 /** Ask the director for this speaker's voice: a base to build on, and a description. */
@@ -1540,7 +1502,7 @@ async function askCasting(speaker, quotes) {
         .filter(([who]) => who !== speaker)
         .map(([who, value]) => {
             const entry = castEntry(value);
-            return `- ${who} → base ${entry.base ?? entry.voice}`;
+            return `- ${who} → base ${entry.base}`;
         })
         .join('\n');
 
@@ -1577,25 +1539,24 @@ async function castVoice(speaker, quotes = []) {
 
     // Record them first: whatever happens next, they belong on the sheet.
     const entry = rememberSpeaker(speaker);
-    const settle = (voice) => {
+    const settle = (base) => {
         ctx().saveSettingsDebounced();
         onCastChanged?.();
-        return voice;
+        return base;
     };
 
     // An edit in the cast sheet pins the entry, and pinning outranks everything.
-    if (entry.pinned && breeze.hasVoice(entry.voice)) return settle(entry.voice);
+    if (entry.pinned && entry.base) return settle(entry.base);
 
-    // Otherwise a hand-assigned voice-map entry beats anything decided here —
-    // but the speaker is still listed, with where the voice came from.
+    // Otherwise a hand-assigned voice-map entry beats anything decided here.
     const mapped = breeze.voiceForCharacter(speaker);
     if (mapped) {
-        entry.voice = mapped;
+        entry.base = mapped;
         entry.source = 'voicemap';
         return settle(mapped);
     }
 
-    if (entry.voice && breeze.hasVoice(entry.voice)) return settle(entry.voice);
+    if (entry.base && breeze.hasVoice(entry.base)) return settle(entry.base);
 
     if (castJobs.has(speaker)) return castJobs.get(speaker);
 
@@ -1605,24 +1566,19 @@ async function castVoice(speaker, quotes = []) {
         for (const field of PROFILE_FIELDS) {
             if (!entry[field] && casting?.profile?.[field]) entry[field] = casting.profile[field];
         }
-
-        // Nothing to build on: leave them unvoiced rather than dropping them.
-        if (!entry.base && !voiceInstruction(entry, false)) return null;
-
         delete entry.source;
-        await applyCast(speaker, entry);
-        return entry.voice;
+        return entry.base;
     })()
-        .then(voice => {
-            if (voice) {
-                console.info(`[Breeze Director] cast ${speaker} as "${voice}"`
-                    + (entry.base ? ` from base "${entry.base}"` : '') + '.');
-                toastr.info(`Cast ${speaker} as "${voice}".`, 'Breeze Director');
+        .then(base => {
+            if (base) {
+                console.info(`[Breeze Director] cast ${speaker} on base "${base}": `
+                    + (castInstruction(entry) || '(no description)'));
+                toastr.info(`Cast ${speaker} on "${base}".`, 'Breeze Director');
             } else {
                 console.info(`[Breeze Director] ${speaker} is on the cast sheet `
-                    + 'with no voice yet — give them one there.');
+                    + 'with no base yet — give them one there.');
             }
-            return settle(voice);
+            return settle(base);
         })
         .catch(error => {
             console.error('[Breeze Director] casting failed for', speaker, error);
@@ -1672,29 +1628,6 @@ function quotedMessages(limit) {
     return found;
 }
 
-/** Ensure the character has a voice, designing one from their card if not. */
-async function ensureVoice(name) {
-    const config = settings();
-    const breeze = globalThis.breezeTts;
-    if (!name || !breeze?.available || !config.profile) return null;
-
-    const existing = breeze.voiceForCharacter(name);
-    if (existing) return existing;
-    if (!config.auto_voice) return null;
-
-    if (voiceJobs.has(name)) return voiceJobs.get(name);
-
-    const pending = designVoice(name)
-        .catch(error => {
-            console.error('[Breeze Director] voice design failed:', error);
-            return null;
-        })
-        .finally(() => voiceJobs.delete(name));
-
-    voiceJobs.set(name, pending);
-    return pending;
-}
-
 /** Generate every clip for a message ahead of playback, sequentially. */
 async function prefetchMessage(index) {
     const breeze = globalThis.breezeTts;
@@ -1720,7 +1653,6 @@ async function prepare(index) {
     if (!message) return;
 
     if (config.auto && !hasDirection(index)) await run(index);
-    await ensureVoice(message.name);
     if (config.prefetch) await prefetchMessage(index);
 }
 
@@ -2353,8 +2285,9 @@ async function openCastSheet() {
     heading.textContent = 'Voice cast';
     const note = document.createElement('small');
     note.style.cssText = 'display:block;opacity:0.7;margin-bottom:0.6em;';
-    note.textContent = 'Each speaker gets a base voice for timbre and a tone description '
-        + 'of their own. Changes are saved as you make them.';
+    note.textContent = 'Each speaker speaks through one of your Breeze voices, under a '
+        + 'description of their own. Nothing here changes the Breeze voices themselves — '
+        + 'those are yours to manage. Changes are saved as you make them.';
     wrapper.append(heading, note);
 
     // --- toolbar --------------------------------------------------------
@@ -2453,12 +2386,12 @@ async function openCastSheet() {
             who.style.cssText = 'flex:1 1 8em;min-width:0;';
             who.textContent = speaker;
 
-            const voiced = !!entry.voice && breeze.hasVoice(entry.voice);
+            const voiced = !!entry.base && breeze.hasVoice(entry.base);
             const voice = document.createElement('small');
             voice.style.cssText = 'opacity:0.6;flex:0 0 auto;';
             voice.textContent = voiced
-                ? (entry.source === 'voicemap' ? `${entry.voice} (from voice map)` : entry.voice)
-                : (entry.voice ? `${entry.voice} (missing)` : 'no voice yet');
+                ? (entry.source === 'voicemap' ? 'from voice map' : 'ready')
+                : (entry.base ? `base "${entry.base}" is missing` : 'no base yet');
 
             head.append(who, voice);
 
@@ -2487,14 +2420,16 @@ async function openCastSheet() {
 
             const preview = button('fa-play', `Hear ${speaker}`, async () => {
                 if (!voiced) {
-                    return toastr.info('Give them a base voice or a tone first.', 'Breeze Director');
-                }
-                if (typeof breeze.preview !== 'function') {
-                    return toastr.warning('This build of the Breeze provider cannot preview. '
-                        + 'Redeploy breeze-tts.', 'Breeze Director');
+                    return toastr.info('Pick a base voice for them first.', 'Breeze Director');
                 }
                 try {
-                    await breeze.preview(entry.voice);
+                    // Composed on the fly: nothing about this member is stored
+                    // in the provider's voices, which are yours to manage.
+                    await breeze.previewWith(
+                        entry.base,
+                        castInstruction(entry),
+                        basePreset(entry.base)?.cfg_scale ?? Number(settings().cfg_scale),
+                    );
                 } catch (error) {
                     toastr.error(String(error?.message ?? error), 'Breeze');
                 }
@@ -2564,9 +2499,7 @@ async function openCastSheet() {
             // What Breeze is actually told, so an edit's effect is visible.
             const built = document.createElement('small');
             built.style.cssText = 'display:block;opacity:0.6;margin-top:0.25em;';
-            const instruction = (!entry.base || breeze.hasVoice(entry.base))
-                ? castPreset(entry).instruction
-                : voiceInstruction(entry, false);
+            const instruction = castInstruction(entry);
             built.textContent = instruction
                 ? `Breeze hears: ${instruction}`
                 : 'Nothing to send yet — pick a base voice or describe their tone.';
@@ -2577,15 +2510,14 @@ async function openCastSheet() {
     }
 
     /**
-     * Rewrite the speaker's provider voice after any edit. Editing here pins the
-     * entry, so a hand-assigned voice-map entry no longer overrides it — the
+     * Record an edit. Nothing is written to the provider — a cast member is a
+     * base plus a description, composed when a line is generated. Editing pins
+     * the entry, so a hand-assigned voice-map entry no longer overrides it: the
      * edit was an explicit choice and should stick.
      */
-    async function rederive(speaker, entry) {
-        if (!entry.base && !voiceInstruction(entry, false)) return;
+    function rederive(speaker, entry) {
         entry.pinned = true;
         delete entry.source;
-        await applyCast(speaker, entry);
         onCastChanged?.();
     }
 
@@ -2605,7 +2537,6 @@ const SETTINGS_HTML = `
       <label class="checkbox_label"><input id="bd_auto" type="checkbox"> Generate automatically on new character messages</label>
       <label class="checkbox_label"><input id="bd_auto_user" type="checkbox"> …and on user messages</label>
       <label class="checkbox_label"><input id="bd_prefetch" type="checkbox"> Pre-generate audio after directing</label>
-      <label class="checkbox_label"><input id="bd_auto_voice" type="checkbox"> Design a voice from the character card when one is missing</label>
       <label class="checkbox_label"><input id="bd_cast" type="checkbox"> Give quoted speech its own voice per speaker</label>
       <small>Click the masks icon on any message to view, generate, or edit its direction.</small>
       <small id="bd_paragraph_warn" style="color:var(--golden);display:block;"></small>
@@ -2651,10 +2582,6 @@ const SETTINGS_HTML = `
       <textarea id="bd_identify_prompt" class="text_pole textarea_compact" rows="12"></textarea>
       <input id="bd_identify_reset" class="menu_button" type="button" value="Reset identification prompt">
 
-      <label for="bd_voice_prompt">Voice design prompt (<code>{{char}}</code>, <code>{{description}}</code>):</label>
-      <textarea id="bd_voice_prompt" class="text_pole textarea_compact" rows="10"></textarea>
-      <input id="bd_voice_reset" class="menu_button" type="button" value="Reset voice prompt">
-
       <label for="bd_voice_cast_prompt">Voice casting prompt (<code>{{speaker}}</code>,
       <code>{{card}}</code>, <code>{{lines}}</code>, <code>{{voices}}</code>,
       <code>{{cast}}</code>):</label>
@@ -2664,8 +2591,8 @@ const SETTINGS_HTML = `
 
       <hr>
       <b>Cast for this chat</b>
-      <small>Each speaker the director names gets a base voice and a tone description
-      of their own.</small>
+      <small>Each speaker the director names is given one of your Breeze voices as a
+      base, plus a description of their own. Breeze's own voices are never modified.</small>
       <div class="flex-container" style="gap:0.5em;align-items:center;margin-top:0.4em;">
         <input id="bd_cast_open" class="menu_button" type="button" value="Open voice cast">
         <input id="bd_cast_clear" class="menu_button" type="button" value="Forget whole cast">
@@ -2704,7 +2631,6 @@ function bind() {
     checkbox('#bd_auto', 'auto');
     checkbox('#bd_auto_user', 'auto_user');
     checkbox('#bd_prefetch', 'prefetch');
-    checkbox('#bd_auto_voice', 'auto_voice');
     checkbox('#bd_cast', 'cast_enabled');
     field('#bd_missing', 'on_missing');
     field('#bd_mode', 'mode');
@@ -2713,7 +2639,6 @@ function bind() {
     field('#bd_identify_chunk', 'identify_chunk', Number);
     field('#bd_identify_prompt', 'identify_prompt');
     field('#bd_prompt', 'prompt');
-    field('#bd_voice_prompt', 'voice_prompt');
     field('#bd_voice_cast_prompt', 'voice_cast_prompt');
 
     // Two silent-failure modes worth naming: a saved prompt from before casting
@@ -2808,12 +2733,6 @@ function bind() {
         toastr.success('Cached audio erased.', 'Breeze');
     });
 
-    $('#bd_voice_reset').on('click', () => {
-        config.voice_prompt = DEFAULT_VOICE_PROMPT;
-        $('#bd_voice_prompt').val(DEFAULT_VOICE_PROMPT);
-        save();
-    });
-
     try {
         ctx().ConnectionManagerRequestService.handleDropdown('#bd_profile', config.profile, profile => {
             config.profile = profile?.id ?? '';
@@ -2893,7 +2812,6 @@ jQuery(async () => {
     });
     eventSource.on(event_types.CHAT_CHANGED, () => {
         inFlight.clear();
-        voiceJobs.clear();
         castJobs.clear();
         onCastChanged?.();
         player.stop();

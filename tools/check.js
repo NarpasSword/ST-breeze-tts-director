@@ -114,6 +114,131 @@ if (!readyFn) {
     imports.system.exit(1);
 }
 
+checkForOrphanedCalls(source);
+
+/**
+ * Every name called in the file must be declared somewhere in it, or be a
+ * known global. Removing a function while a caller survives is a
+ * ReferenceError that only fires when that path runs — invisible to a load
+ * check and to unit tests, and it has slipped through repeatedly during
+ * refactors that cut whole regions out of the file.
+ */
+function checkForOrphanedCalls(src) {
+    const code = stripLiterals(src);
+
+    const declared = new Set();
+    for (const re of [
+        /(?:^|\s)(?:async\s+)?function\s+([A-Za-z_$][\w$]*)/g,
+        /(?:^|\s)(?:const|let|var)\s+([A-Za-z_$][\w$]*)/g,
+        /(?:^|\s)class\s+([A-Za-z_$][\w$]*)/g,
+        /([A-Za-z_$][\w$]*)\s*(?:=|:)\s*(?:async\s*)?(?:function|\()/g,
+        // Class and object-literal shorthand methods, including get/set.
+        /(?:^|[\s,{])(?:async\s+)?\*?\s*(?:get\s+|set\s+)?([A-Za-z_$][\w$]*)\s*\([^()]*\)\s*\{/g,
+    ]) {
+        for (const m of code.matchAll(re)) declared.add(m[1]);
+    }
+
+    const known = new Set([
+        'if', 'for', 'while', 'switch', 'catch', 'return', 'typeof', 'new', 'await',
+        'else', 'do', 'try', 'function', 'of', 'in', 'delete', 'void', 'yield', 'case',
+        'async', 'await', 'static', 'get', 'set',
+        'Object', 'Array', 'String', 'Number', 'Boolean', 'JSON', 'Math', 'Promise',
+        'Set', 'Map', 'WeakMap', 'Date', 'RegExp', 'Error', 'Symbol', 'BigInt',
+        'parseInt', 'parseFloat', 'isNaN', 'isFinite', 'setTimeout', 'clearTimeout',
+        'fetch', 'Blob', 'Response', 'Request', 'FormData', 'DataView', 'ArrayBuffer',
+        'Uint8Array', 'Int16Array', 'TextDecoder', 'TextEncoder', 'URL', 'indexedDB',
+        'IDBKeyRange', 'structuredClone', 'encodeURIComponent', 'decodeURIComponent',
+        'require', 'import', 'super', 'constructor',
+    ]);
+
+    // Destructured bindings: const [key, shipped] of ..., const { a, b } = ...
+    for (const m of code.matchAll(/(?:const|let|var)\s*[[{]([^\]}]*)[\]}]/g)) {
+        for (const part of m[1].split(',')) {
+            const name = part.trim().split(/[\s:=]/).pop();
+            if (/^[A-Za-z_$][\w$]*$/.test(name)) declared.add(name);
+        }
+    }
+
+    // Parameter names are bindings too: (resolve, reject) => ... declares both.
+    for (const m of code.matchAll(/\(([^()]*)\)\s*(?:=>|\{)/g)) {
+        for (const part of m[1].split(',')) {
+            const name = part.trim().replace(/^\.\.\./, '').split(/[\s=]/)[0];
+            if (/^[A-Za-z_$][\w$]*$/.test(name)) declared.add(name);
+        }
+    }
+
+    const orphans = new Set();
+    for (const m of code.matchAll(/(?<![.\w$])([A-Za-z_$][\w$]*)\s*\(/g)) {
+        const name = m[1];
+        if (declared.has(name) || known.has(name)) continue;
+        if (name in globalThis) continue;
+        orphans.add(name);
+    }
+
+    if (orphans.size) {
+        print('orphaned      CALLED BUT NEVER DECLARED: ' + [...orphans].sort().join(', '));
+        imports.system.exit(1);
+    }
+    print('orphaned      none');
+}
+
+/** A slash here opens a regex, not a division, judging by what came before. */
+function startsRegex(before) {
+    const prev = before.replace(/\s+$/, '').slice(-1);
+    return prev === '' || '(,=:[!&|?{};+-*%~^'.includes(prev);
+}
+
+/** Blank out comments and string/template/regex literals so they cannot look like code. */
+function stripLiterals(src) {
+    let out = '';
+    for (let i = 0; i < src.length;) {
+        const c = src[i];
+        const next = src[i + 1];
+        if (c === '/' && next === '/') {
+            while (i < src.length && src[i] !== '\n') i++;
+            continue;
+        }
+        if (c === '/' && next === '*') {
+            i += 2;
+            while (i < src.length && !(src[i] === '*' && src[i + 1] === '/')) i++;
+            i += 2;
+            continue;
+        }
+        // A regex literal can hold quotes and backticks in a character class —
+        // normalize()'s does — so it must be consumed as one token, or the rest
+        // of the file is read as one enormous string.
+        if (c === '/' && startsRegex(out)) {
+            i++;
+            let inClass = false;
+            while (i < src.length) {
+                if (src[i] === '\\') { i += 2; continue; }
+                if (src[i] === '[') inClass = true;
+                else if (src[i] === ']') inClass = false;
+                else if (src[i] === '/' && !inClass) { i++; break; }
+                else if (src[i] === '\n') break;
+                i++;
+            }
+            while (i < src.length && /[a-z]/.test(src[i])) i++;
+            out += '/re/';
+            continue;
+        }
+        if (c === '"' || c === "'" || c === '`') {
+            const quote = c;
+            i++;
+            while (i < src.length) {
+                if (src[i] === '\\') { i += 2; continue; }
+                if (src[i] === quote) { i++; break; }
+                i++;
+            }
+            out += '""';
+            continue;
+        }
+        out += c;
+        i++;
+    }
+    return out;
+}
+
 readyFn().then(
     () => {
         print('ready handler OK\n');
@@ -187,10 +312,13 @@ eq('exact wins', pickLine(dir, 'Later, softly: "Yes."'), 'B');
 eq('ambiguous takes longest', pickLine(dir, 'Yes.'), 'A');
 
 print('castEntry');
-eq('legacy string', castEntry('villain'), { voice: 'villain', base: null });
+eq('legacy string becomes a base', castEntry('villain'), { base: 'villain' });
+eq('a derived voice is read as a base',
+   castEntry({ voice: 'bob', base: null, tone: 'Gruff.' }),
+   { voice: 'bob', base: 'bob', tone: 'Gruff.' });
 eq('object passes through',
-   castEntry({ voice: 'bob', base: 'villain', gender: 'male', tone: 'Gruff.' }),
-   { voice: 'bob', base: 'villain', gender: 'male', tone: 'Gruff.' });
+   castEntry({ base: 'villain', gender: 'male', tone: 'Gruff.' }),
+   { base: 'villain', gender: 'male', tone: 'Gruff.' });
 eq('empty', castEntry(undefined), null);
 
 print('cleanProfile');
@@ -261,43 +389,43 @@ function runCastScenarios() {
         ['new speaker is cast',
          { map: { Alice: 'narrator' }, casting: { base: 'villain', gender: 'male', tone: 'Gruff.' },
            identify: { Q1: 'Alice', Q2: 'Bob' } },
-         { cast: ['Bob'], added: ['bob'], tone: 'Gruff.' }],
+         { cast: ['Bob'], base: 'villain', tone: 'Gruff.' }],
 
         ['speaker with a voice-map entry is still listed',
          { map: { Alice: 'narrator', Bob: 'villain' },
            identify: { Q1: 'Alice', Q2: 'Bob' } },
-         { cast: ['Bob'], added: [] }],
+         { cast: ['Bob'] }],
 
         ['answer recovered from the reasoning channel',
          { map: { Alice: 'narrator' },
            raw: '',
            reasoning: 'Working through it... {"Q1":"Alice","Q2":"Bob"}' },
-         { cast: ['Bob'], added: ['bob'], tone: 'Gruff.' }],
+         { cast: ['Bob'], base: 'villain', tone: 'Gruff.' }],
 
         ['speaker is listed even when nothing can be derived',
          { map: { Alice: 'narrator' }, casting: { base: 'no such voice' },
            identify: { Q1: 'Alice', Q2: 'Bob' } },
-         { cast: ['Bob'], added: [] }],
+         { cast: ['Bob'] }],
 
         ['a pre-staged speaker is reused, not re-cast',
          { map: { Alice: 'narrator' }, casting: { base: 'villain', gender: 'male', tone: 'Gruff.' },
            prestage: { Bob: { voice: 'villain', base: 'villain', pinned: true, tone: 'Mine.' } },
            identify: { Q1: 'Alice', Q2: 'Bob' } },
-         { cast: ['Bob'], added: [], tone: 'Mine.', voice: 'villain' }],
+         { cast: ['Bob'], base: 'villain', tone: 'Mine.' }],
 
         ['survives a reasoning preamble and odd quote ids',
          { map: { Alice: 'narrator' }, casting: { base: 'villain', gender: 'male', tone: 'Gruff.' },
            raw: 'Hmm {let me see}. Here:\n{"1":"Alice","q2":"Bob"}' },
-         { cast: ['Bob'], added: ['bob'] }],
+         { cast: ['Bob'], base: 'villain' }],
 
         ['casts against a provider too old to expose voicePreset',
          { map: { Alice: 'narrator' }, noVoicePreset: true,
            identify: { Q1: 'Alice', Q2: 'Bob' } },
-         { cast: ['Bob'], added: ['bob'], tone: 'Gruff.' }],
+         { cast: ['Bob'], base: 'villain', tone: 'Gruff.' }],
 
         ['unattributed quotes are ignored',
          { map: { Alice: 'narrator' }, identify: { Q1: 'Alice', Q2: 'unknown' } },
-         { cast: [], added: [] }],
+         { cast: [] }],
     ];
 
     print('\ncast scenarios');
@@ -348,9 +476,11 @@ function runCastScenarios() {
             await api.generate(0, { quiet: true });
             const cast = api.castMap();
             eq(label + ' — cast', Object.keys(cast), want.cast);
-            eq(label + ' — voices added', [...added.keys()], want.added);
+            // The provider's voices are the user's to manage: this extension
+            // composes on top of them and must never write one.
+            eq(label + ' — provider voices untouched', [...added.keys()], []);
+            if (want.base) eq(label + ' — base chosen', cast.Bob?.base, want.base);
             if (want.tone) eq(label + ' — profile kept', cast.Bob?.tone, want.tone);
-            if (want.voice) eq(label + ' — voice kept', cast.Bob?.voice, want.voice);
             // The original bug: auxiliary calls sized for the answer, not for a
             // reasoning model's thinking, came back empty and failed silently.
             const starved = budgets.filter(([, max]) => max < config.max_tokens);
@@ -393,6 +523,7 @@ function runCastScenarios() {
             const named = await api.castMessage(0);
             eq('castMessage — names the speaker', named, ['Bob']);
             eq('castMessage — casts them', Object.keys(api.castMap()), ['Bob']);
+            eq('castMessage — adds no provider voices', [...added.keys()], []);
             eq('castMessage — leaves direction alone',
                context.chat[0].extra.breeze_direction ?? null, null);
         } catch (error) {

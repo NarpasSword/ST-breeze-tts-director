@@ -10,12 +10,14 @@ A SillyTavern third-party extension: **Breeze TTS, Director & Player**. One
 
 - **Provider** — registers `Breeze` in the TTS provider dropdown, wraps its raw
   24 kHz PCM in a WAV header, caches clips in IndexedDB keyed by content, and
-  publishes `globalThis.breezeTts`.
+  publishes `globalThis.breezeTts`. **Its voices are the user's to manage;
+  nothing in this extension writes one.**
 - **Director** — one LLM call per message writes a delivery instruction for
   every paragraph, stored in the chat file.
 - **Identification and casting** — a second call works out who speaks each
-  quoted span; a third, per new speaker, gives them a base voice and a profile.
-  Non-quote text reads in a configurable narrator voice.
+  quoted span; a third, per new speaker, picks one of the Breeze voices as their
+  **base** and writes a description of them. Non-quote text reads in a
+  configurable narrator voice.
 - **Player** — an inline panel per message with paragraph-level seek,
   per-message resume, per-segment voice overrides, and take history.
 
@@ -61,8 +63,9 @@ gjs tools/check.js index.js
 
 It strips the `import` line (a `new Function()` body cannot hold one, so the
 imported names are stubbed as globals), loads `index.js` under stubs for the
-browser and SillyTavern globals, checks the provider registered, runs the
-jQuery ready handler, asserts the pure logic against the file as loaded,
+browser and SillyTavern globals, checks the provider registered, **checks that
+every name called in the file is declared in it**, runs the jQuery ready
+handler, asserts the pure logic against the file as loaded,
 then drives `generate()` end to end against a stubbed model and provider. Those
 last scenarios exist because the cast sheet can sit empty while attribution
 works perfectly — a failure no unit test sees. They share global stubs, so they
@@ -211,6 +214,34 @@ were once separate extensions. Keep both keys — renaming drops users' configs.
 duplicate calls, and two paragraphs naming the same stranger cannot race into
 two different voices.
 
+### The cast layers on top; it never writes a voice
+
+A cast member is a **base** — one of the user's own Breeze voices, giving
+timbre, reference audio and `cfg_scale` — plus a description of their own. The
+two are composed into an instruction at the moment a line is generated, by
+`breezeDirector()`, and nothing is stored in the provider's voices JSON.
+
+The composed instruction is, in order:
+
+1. the base's own instruction, **only** when `mode` is `append` — a base
+   describes a voice, and a cast member's description supersedes it;
+2. `voiceInstruction(castEntry, cloned)`, the speaker's own description, with
+   identity words dropped when the base is a clone;
+3. the paragraph's delivery direction.
+
+`cfg_scale` comes from the base when it sets one, since the base is
+hand-maintained, falling back to the director's setting.
+
+This resolves at play time, not at generation time: `clipsFor()` puts the
+`speaker` in the hint and `voiceForSegment()` looks up their base. So editing a
+cast member reaches messages already in the chat, and the provider's cache keys
+change with the instruction, so edited voices regenerate rather than replay.
+
+**Do not reintroduce voice writing.** An earlier design derived a provider voice
+per speaker with `addVoice()`. It worked, but it meant the extension owned
+entries in a list the user curates, and the two drifted. `castEntry()` migrates
+those old entries by reading their derived `voice` as a `base`.
+
 ### Casting a quoted speaker
 
 `castVoice()` is only ever called for a speaker `isForeignSpeaker()` accepts.
@@ -230,14 +261,11 @@ Resolution order, each step falling through on failure:
    speaker's card text, their own lines, the available voices and the running
    cast. This is the only call that describes a voice, and it runs once per
    speaker.
-5. `applyCast()` writes a provider voice named after the speaker, via
-   `castPreset()`: the base's `cfg_scale`, its `ref_audio_url`/`ref_text` when it
-   has **both**, and `voiceInstruction()` as the instruction — falling back to
-   the base's own instruction when the profile is empty, so a speaker with a
-   base always sounds like something. Several characters may share a base — the
-   profile is what tells them apart.
-6. No base and nothing said about them → the entry stays on the sheet with no
-   voice, and playback falls back to `voiceForSegment()`'s live resolution.
+5. The base and profile are stored on the cast entry. Nothing is written to the
+   provider. Several characters may share a base — the profile is what tells
+   them apart.
+6. No base and nothing said about them → the entry stays on the sheet unvoiced,
+   and playback falls back to `voiceForSegment()`'s live resolution.
 
 Non-quote text uses `defaultVoice()`: the configured `narrator_voice` if it
 still exists in the provider's JSON, else the character's own voice. Leaving the
@@ -340,6 +368,24 @@ using the model's first line for every paragraph. Keep it forgiving.
 Instructions must describe **delivery only** — never age, gender, accent, or
 timbre, which would fight the reference audio in the provider's voice-clone
 mode. The voice-design prompt is the one place that *does* describe the voice.
+
+### The orphaned-call check
+
+Deleting a function while a caller survives is a `ReferenceError` that only
+fires when that path runs. It is invisible to a load check, to unit tests, and
+to a syntax check, and it slipped through five times during one afternoon of
+refactors that cut whole regions out of this file — `designVoice`, `cardFor`,
+`rememberSpeaker`, `voiceJobs` and `applyCast` all became calls to nothing.
+
+`checkForOrphanedCalls()` in `tools/check.js` now blanks comments and string,
+template and regex literals, collects every declaration (including class and
+object methods, parameters and destructured bindings), and fails on any name
+that is called but declared nowhere. If it reports a false positive, the fix is
+another declaration pattern, not an allowlist entry.
+
+Note the regex-literal handling is load-bearing: `normalize()`'s pattern
+contains a backtick inside a character class, and without it the scanner reads
+half the file as one template literal.
 
 ## Known issues / gotchas
 
