@@ -1651,20 +1651,41 @@ function quotedMessages(limit) {
     return found;
 }
 
-/** Generate every clip for a message ahead of playback, sequentially. */
+/**
+ * Generate every clip for a message ahead of playback, sequentially. Returns how
+ * many were produced, which is what the pre-generate button and command report.
+ */
 async function prefetchMessage(index) {
     const breeze = globalThis.breezeTts;
     const message = ctx().chat?.[index];
-    if (!breeze?.available || !message) return;
+    if (!breeze?.available || !message) return 0;
 
     const direction = getDirection(message);
     const units = buildUnits(message.mes);
 
+    let made = 0;
     for (let i = 0; i < units.length; i++) {
         for (const clip of clipsFor(message, direction?.lines?.[i] ?? units[i], index, i)) {
-            if (clip.voice) await breeze.prefetch(clip.text, clip.voice, clip.hint);
+            if (!clip.voice) continue;
+            if (await breeze.prefetch(clip.text, clip.voice, clip.hint)) made++;
         }
     }
+    return made;
+}
+
+/**
+ * Everything a message needs to play later, generated now and left in the cache.
+ *
+ * Direction comes first even when only audio was asked for: a clip is cached
+ * against the instruction it was generated under, so audio made before the
+ * direction exists is audio that has to be thrown away and made again.
+ */
+async function pregenerate(index, { quiet = true } = {}) {
+    const message = ctx().chat?.[index];
+    if (!message) return 0;
+
+    if (settings().enabled && !hasDirection(index)) await run(index, { quiet });
+    return prefetchMessage(index);
 }
 
 /** Everything that should happen before narration starts. */
@@ -1967,10 +1988,13 @@ async function openPanel(messageId, { play = false, expandAll = false } = {}) {
     const nextButton = button('fa-forward-step', 'Next paragraph', () => player.next());
     const stopButton = button('fa-stop', 'Stop', () => player.stop());
     const regenButton = button('fa-rotate', 'Generate a new take', () => regenerate(messageId));
+    const pregenButton = button('fa-cloud-arrow-down',
+        'Generate this message\'s audio now, ready for later', () => pregenerateFrom(messageId));
     const expandButton = button('fa-chevron-down', 'Expand or collapse every paragraph', () => toggleAll(messageId));
     const eraseButton = button('fa-trash', 'Erase cached audio for this message', () => eraseClips(messageId));
 
-    bar.append(playButton, prevButton, nextButton, stopButton, regenButton, expandButton, takes, eraseButton);
+    bar.append(playButton, prevButton, nextButton, stopButton, regenButton, pregenButton,
+        expandButton, takes, eraseButton);
     root.append(bar);
 
     const status = document.createElement('small');
@@ -2162,6 +2186,25 @@ async function regenerate(messageId) {
         // Surfaced rather than swallowed: a silent no-op looks like a broken button.
         console.error('[Breeze Director] regenerate failed:', error);
         toastr.error(String(error?.message ?? error), 'Breeze Director');
+    } finally {
+        icon?.classList.remove('fa-spin');
+    }
+}
+
+/** Generate a message's audio up front, leaving it cached rather than playing it. */
+async function pregenerateFrom(messageId) {
+    const icon = panels.get(messageId)?.root.querySelector('.fa-cloud-arrow-down');
+    icon?.classList.add('fa-spin');
+    try {
+        const made = await pregenerate(messageId, { quiet: false });
+        toastr.success(
+            made ? `Generated ${made} clip${made === 1 ? '' : 's'}, ready to play.`
+                : 'Nothing new to generate — it is already cached.',
+            'Breeze',
+        );
+    } catch (error) {
+        console.error('[Breeze Director] pre-generation failed:', error);
+        toastr.error(String(error?.message ?? error), 'Breeze');
     } finally {
         icon?.classList.remove('fa-spin');
     }
@@ -2547,6 +2590,78 @@ async function openCastSheet() {
     });
 }
 
+// ---------------------------------------------------------------- STscript
+// Everything the wand menu and the message panel can do, minus the playing.
+
+/**
+ * Which message a command means. No argument is the last message; a negative
+ * one counts back from the end, as SillyTavern's own commands allow.
+ */
+function targetMessage(value) {
+    const chat = ctx().chat ?? [];
+    if (!chat.length) return -1;
+
+    // Test for emptiness before converting: Number('') is 0, which would make a
+    // command with no argument silently target the very first message.
+    const raw = String(value ?? '').trim();
+    if (!raw) return chat.length - 1;
+
+    const asked = Number(raw);
+    if (!Number.isInteger(asked)) return chat.length - 1;
+
+    const index = asked < 0 ? chat.length + asked : asked;
+    return (index >= 0 && index < chat.length) ? index : -1;
+}
+
+function registerSlashCommands() {
+    const context = ctx();
+    const { SlashCommandParser, SlashCommand, SlashCommandArgument, ARGUMENT_TYPE } = context;
+    if (!SlashCommandParser?.addCommandObject || !SlashCommand?.fromProps) {
+        console.warn('[Breeze Director] this SillyTavern has no slash command API; skipping.');
+        return;
+    }
+
+    const add = (name, aliases, returns, help, act) => {
+        SlashCommandParser.addCommandObject(SlashCommand.fromProps({
+            name,
+            aliases,
+            returns,
+            unnamedArgumentList: [new SlashCommandArgument(
+                'message id; negative counts back from the end, default the last message',
+                [ARGUMENT_TYPE.NUMBER], false,
+            )],
+            helpString: help,
+            callback: async (_args, value) => {
+                const index = targetMessage(value);
+                if (index < 0) {
+                    toastr.warning('No such message.', 'Breeze Director');
+                    return '';
+                }
+                return String(await act(index) ?? '');
+            },
+        }));
+    };
+
+    add('breeze-direct', ['breezedirect'], 'number of paragraphs directed', `
+        <div>Write delivery direction for a message, as the director does automatically.</div>
+        <div>Replaces any existing take, keeping the old one in the message's history.</div>
+        <div><strong>Example:</strong> <code>/breeze-direct</code> or <code>/breeze-direct -2</code></div>`,
+    async (index) => (await run(index, { quiet: false }))?.lines?.length ?? 0);
+
+    add('breeze-cast', ['breezecast'], 'names of the speakers cast', `
+        <div>Work out who speaks each quoted line, and cast a voice for anyone new.</div>
+        <div>Leaves the message's direction alone.</div>
+        <div><strong>Example:</strong> <code>/breeze-cast</code></div>`,
+    async (index) => (await castMessage(index)).join(', '));
+
+    add('breeze-audio', ['breezeaudio', 'breezepregen'], 'number of clips generated', `
+        <div>Generate a message's audio now and leave it cached, without playing it.</div>
+        <div>Directs the message first if it has no direction, since a clip is cached
+        against the instruction it was made under.</div>
+        <div><strong>Example:</strong> <code>/breeze-audio</code></div>`,
+    (index) => pregenerate(index, { quiet: false }));
+}
+
 const SETTINGS_HTML = `
 <div class="breeze-director-settings">
   <div class="inline-drawer">
@@ -2790,6 +2905,13 @@ jQuery(async () => {
             <span>Voice cast</span>
         </div>`);
     $('#breezeVoiceCast').on('click', openCastSheet);
+
+    // Registering twice throws, which would abort the rest of this handler.
+    try {
+        registerSlashCommands();
+    } catch (error) {
+        console.error('[Breeze Director] could not register slash commands:', error);
+    }
 
     $('#tts_wand_container').append(`
         <div id="breezePlayerResume" class="list-group-item flex-container flexGap5" title="Resume Breeze narration">

@@ -106,6 +106,22 @@ const context = {
     ConnectionManagerRequestService: {
         handleDropdown() {}, sendRequest: async () => ({ content: '' }),
     },
+
+    // Slash command API, recording what the extension registers.
+    commands: new Map(),
+    SlashCommandParser: {
+        addCommandObject(command) {
+            if (context.commands.has(command.name)) {
+                throw new Error(`Duplicate command ${command.name}`);
+            }
+            context.commands.set(command.name, command);
+        },
+    },
+    SlashCommand: { fromProps: (props) => props },
+    SlashCommandArgument: function (description, typeList, isRequired) {
+        return { description, typeList, isRequired };
+    },
+    ARGUMENT_TYPE: { STRING: 'string', NUMBER: 'number' },
 };
 
 globalThis.$ = jq;
@@ -291,6 +307,16 @@ function stripLiterals(src) {
 Promise.all(readyFns.map(fn => fn())).then(
     () => {
         print('ready handler OK\n');
+        print('slash commands');
+        eq('registers the three commands', [...context.commands.keys()].sort(),
+           ['breeze-audio', 'breeze-cast', 'breeze-direct']);
+        for (const [name, command] of context.commands) {
+            eq(`${name} takes an optional message id`,
+               command.unnamedArgumentList?.[0]?.isRequired, false);
+            eq(`${name} documents itself`, (command.helpString ?? '').length > 40, true);
+        }
+        print('');
+
         print('provider selection');
         eq('dropdown put back on Breeze', fieldValues.get('#tts_provider'), 'Breeze');
         const onReady = context.listeners.get('app_ready') ?? [];
@@ -319,14 +345,30 @@ function runAssertions() {
 const api = new Function(source + `;return {
     splitSegments, collectQuotes, isForeignSpeaker, parseDirection,
     normalize, pickLine, castEntry, hash, syncPrompts,
-    voiceInstruction, cleanProfile, PROFILE_FIELDS, splitLines, buildUnits,
+    voiceInstruction, cleanProfile, PROFILE_FIELDS, splitLines, buildUnits, targetMessage,
     extractJson, normalizeQuoteId,
     DEFAULT_PROMPT, DEFAULT_VOICE_CAST_PROMPT };`)();
 const { splitSegments, collectQuotes, isForeignSpeaker, parseDirection,
         normalize, pickLine, castEntry, hash, syncPrompts,
-        voiceInstruction, cleanProfile, splitLines, buildUnits,
+        voiceInstruction, cleanProfile, splitLines, buildUnits, targetMessage,
         extractJson, normalizeQuoteId } = api;
 
+
+print('targetMessage');
+const savedChat = context.chat;
+context.chat = [{ mes: 'a' }, { mes: 'b' }, { mes: 'c' }];
+eq('no argument is the last message', targetMessage(undefined), 2);
+eq('blank argument is the last message', targetMessage('  '), 2);
+eq('an index', targetMessage('1'), 1);
+eq('first message', targetMessage('0'), 0);
+eq('negative counts back', targetMessage('-1'), 2);
+eq('negative, further back', targetMessage('-3'), 0);
+eq('past the end', targetMessage('9'), -1);
+eq('too far back', targetMessage('-9'), -1);
+eq('not a number is the last message', targetMessage('last'), 2);
+context.chat = [];
+eq('empty chat', targetMessage(undefined), -1);
+context.chat = savedChat;
 
 print('splitLines');
 eq('plain paragraphs', splitLines('one\ntwo'), ['one', 'two']);
@@ -604,6 +646,46 @@ function runCastScenarios() {
         } catch (error) {
             fails++;
             print('  FAIL castMessage threw: ' + error);
+        }
+
+        // Pre-generation must direct before it caches: a clip is keyed by the
+        // instruction it was made under, so audio made first is audio wasted.
+        print('\npre-generation');
+        try {
+            const pre = new Function(source
+                + ';return { settings, castMap, pregenerate, prefetchMessage };')();
+            globalThis.breezeTts = {
+                available: true,
+                listVoices: () => [...BASE, ...added.keys()],
+                hasVoice: (n) => BASE.includes(n) || added.has(n),
+                addVoice: async (n, preset) => { added.set(n, preset); return n; },
+                voiceForCharacter: (n) => (n === 'Alice' ? 'narrator' : null),
+                voicePreset: (n) => (BASE.includes(n) ? { cfg_scale: 4 } : null),
+                prefetch: async () => true,
+                getClip: async () => null,
+            };
+            context.chat = [{ name: 'Alice', swipe_id: 0, extra: {}, mes: MES }];
+            context.ConnectionManagerRequestService.sendRequest = async (profile, prompt) => {
+                if (prompt.includes('who speaks each line')) {
+                    return { content: JSON.stringify({ Q1: 'Alice', Q2: 'Bob' }) };
+                }
+                if (prompt.includes("Describe a character's voice")) {
+                    return { content: JSON.stringify({ base: 'villain', tone: 'Gruff.' }) };
+                }
+                return { content: JSON.stringify(['Weary.', 'Flat and final.']) };
+            };
+            const config = pre.settings();
+            config.profile = 'test';
+            config.cast = {};
+
+            eq('nothing directed yet', context.chat[0].extra.breeze_direction ?? null, null);
+            const made = await pre.pregenerate(0);
+            eq('directs before caching', !!context.chat[0].extra.breeze_direction, true);
+            eq('generates a clip per segment', made, 4);
+            eq('adds no provider voices', [...added.keys()], []);
+        } catch (error) {
+            fails++;
+            print('  FAIL pre-generation threw: ' + error);
         }
 
         // The cast sheet builds a lot of DOM and is otherwise untested; opening
