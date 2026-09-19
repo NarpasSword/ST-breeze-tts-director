@@ -427,6 +427,29 @@ proves nothing; running it is what catches a name that stopped resolving inside
 it. That pass also asserts the provider's voice list comes back untouched, so
 the no-writes invariant is checked from the UI as well as from `generate()`.
 
+### Slash commands
+
+`registerSlashCommands()` adds three, each taking an optional message id — no
+argument means the last message, a negative one counts back from the end:
+
+| Command | Does | Returns |
+|---|---|---|
+| `/breeze-direct` | writes delivery direction, keeping the old take in history | paragraphs directed |
+| `/breeze-cast` | identifies speakers and casts anyone new, leaving direction alone | names cast |
+| `/breeze-audio` | generates the audio and leaves it cached, without playing | clips generated |
+
+`/breeze-audio` and the panel's cloud button both go through `pregenerate()`,
+which **directs first when a message has no direction**. A clip is cached
+against the instruction it was generated under, so audio made before the
+direction exists is audio that has to be thrown away and made again.
+
+`targetMessage()` tests its argument for emptiness before converting it.
+`Number('')` is `0`, so a plain `/breeze-audio` would otherwise silently act on
+the very first message of the chat rather than the last.
+
+Registration is wrapped: `addCommandObject` throws on a duplicate name, and an
+uncaught throw there would abort the rest of the ready handler.
+
 ## Known issues / gotchas
 
 - **Prompts persist in settings, so editing the default in this file changes
