@@ -445,9 +445,21 @@ is cheaper than regenerating on every load.
 
 Two settings, and they address different gaps:
 
-- `switch_gap_ms` is a **deliberate** pause when the voice changes, applied by
-  `switchPause()`. Zero by default, and never applied before the first clip or
-  between two clips of the same voice.
+- `switch_gap_ms` shifts the start of a clip relative to the end of the one
+  before it, when the voice changes. `switchShift()` returns it; zero for the
+  same voice and before the first clip.
+
+  **Positive waits. Negative cuts.** A generated clip ends in dead air, and two
+  clips' worth back to back is what makes a change of speaker sound
+  disconnected — that cannot be waited away, it has to be trimmed. A negative
+  value schedules `advance()` that many milliseconds before the clip ends
+  (`scheduleEarlyAdvance()`), and replacing the audio source performs the cut.
+  The timer is re-timed on resume, cleared on pause and stop, and guarded by
+  `loadToken` like every other deferred step in the player.
+
+  `advance()` holds the logic the `ended` handler used to, so both routes into
+  the next clip behave identically. Duration is unknown until metadata lands; in
+  that case nothing is scheduled and `ended` handles it, costing only the trim.
 - `prefetch_ahead` is how many clips `player.warmAhead()` keeps generating ahead
   of the one playing. This is the one that matters for the gaps people actually
   hear. Breeze generates one clip at a time and takes seconds over it, so

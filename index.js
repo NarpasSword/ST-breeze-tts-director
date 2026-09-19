@@ -951,17 +951,19 @@ function voiceForSegment(segment, message) {
 }
 
 /**
- * How long to wait before a clip, given what spoke last.
+ * How far to shift the start of a clip relative to the end of the one before,
+ * when the voice changes. Zero when the same voice carries on, and before the
+ * first clip.
  *
- * A beat when the speaker changes; nothing when the same voice carries on, and
- * nothing before the first clip. The default is zero, because the gap people
- * actually hear is the involuntary one that warmAhead() exists to close, not a
- * missing pause.
+ * Positive waits. Negative starts early, cutting that many milliseconds off the
+ * tail of the clip still playing — which is where a generated clip keeps its
+ * dead air. Two clips' worth of silence back to back is what makes a change of
+ * speaker sound disconnected, and it cannot be waited away; it has to be cut.
  */
-function switchPause(lastVoice, nextVoice) {
-    const gap = Number(settings().switch_gap_ms) || 0;
-    if (gap <= 0 || !lastVoice || lastVoice === nextVoice) return 0;
-    return gap;
+function switchShift(lastVoice, nextVoice) {
+    const shift = Number(settings().switch_gap_ms) || 0;
+    if (!shift || !lastVoice || lastVoice === nextVoice) return 0;
+    return shift;
 }
 
 /**
@@ -1790,6 +1792,7 @@ const player = {
     index: 0,         // paragraph
     clipIndex: 0,     // segment within the paragraph
     lastVoice: null,  // what spoke last, so a change of speaker can be heard
+    advanceTimer: null, // pending hand-over, when cutting a clip short
     messageId: null,
     url: null,
     onChange: null,
@@ -1847,7 +1850,9 @@ const player = {
         }
         if (token !== this.loadToken) return;
 
-        const pause = switchPause(this.lastVoice, wanted.voice);
+        // Only a positive shift is a wait; a negative one was already spent
+        // cutting the tail off the clip that just finished.
+        const pause = Math.max(0, switchShift(this.lastVoice, wanted.voice));
         if (pause) {
             await new Promise(resolve => setTimeout(resolve, pause));
             if (token !== this.loadToken) return;
@@ -1861,7 +1866,70 @@ const player = {
         await this.audio.play().catch(() => { });
         this.notify('playing');
 
+        this.scheduleEarlyAdvance(wanted.voice, index, clipIndex);
         this.warmAhead(index, clipIndex);
+    },
+
+    /** Where the next clip lives, stepping over paragraphs that have none. */
+    nextPosition(index, clipIndex) {
+        let unit = index;
+        let clip = clipIndex + 1;
+        while (unit < this.units.length) {
+            const clips = this.units[unit].clips ?? [];
+            if (clip < clips.length) return { index: unit, clipIndex: clip };
+            unit++;
+            clip = 0;
+        }
+        return null;
+    },
+
+    /** Move to the next clip, as reaching the end of one does. */
+    advance() {
+        this.clearAdvance();
+
+        const clips = this.units[this.index]?.clips ?? [];
+        // Mid-paragraph the reading always continues; autoplay governs only
+        // whether it carries on across a paragraph break.
+        if (this.clipIndex + 1 < clips.length) {
+            return this.playAt(this.index, this.clipIndex + 1);
+        }
+        if (!playerSettings().autoplay_next) return this.notify('paused');
+        if (this.index + 1 < this.units.length) return this.playAt(this.index + 1);
+
+        clearPosition(this.messageId);
+        return this.notify('finished');
+    },
+
+    /**
+     * With a negative shift, hand over before this clip ends rather than after,
+     * so the next voice starts during the dead air at the end of this one.
+     * Replacing the source is what performs the cut.
+     */
+    scheduleEarlyAdvance(voice, index, clipIndex) {
+        this.clearAdvance();
+
+        const next = this.nextPosition(index, clipIndex);
+        if (!next) return;
+
+        const lead = -switchShift(voice, this.units[next.index].clips[next.clipIndex].voice);
+        if (lead <= 0) return;
+
+        // Duration is unknown until metadata lands; leaving it to `ended` then
+        // costs nothing but the trim.
+        const rate = this.audio.playbackRate || 1;
+        const remaining = ((this.audio.duration - this.audio.currentTime) * 1000) / rate;
+        if (!Number.isFinite(remaining)) return;
+
+        const token = this.loadToken;
+        this.advanceTimer = setTimeout(() => {
+            this.advanceTimer = null;
+            if (token === this.loadToken) this.advance();
+        }, Math.max(0, remaining - lead));
+    },
+
+    clearAdvance() {
+        if (this.advanceTimer) clearTimeout(this.advanceTimer);
+        this.advanceTimer = null;
     },
 
     /**
@@ -1904,8 +1972,12 @@ const player = {
         if (this.audio.paused) {
             if (!this.audio.src) return this.playAt(this.index, this.clipIndex);
             this.audio.play().catch(() => { });
+            // A hand-over pending from before the pause would be measured from
+            // the wrong moment, so it is re-timed against where we resume.
+            this.scheduleEarlyAdvance(this.lastVoice, this.index, this.clipIndex);
             this.notify('playing');
         } else {
+            this.clearAdvance();
             this.audio.pause();
             this.notify('paused');
         }
@@ -1913,6 +1985,7 @@ const player = {
 
     stop() {
         this.loadToken++;
+        this.clearAdvance();
         this.clipIndex = 0;
         this.lastVoice = null;
         this.audio.pause();
@@ -1932,22 +2005,7 @@ const player = {
     },
 };
 
-player.audio.addEventListener('ended', () => {
-    // Mid-paragraph the reading always continues; autoplay only governs whether
-    // playback carries on across a paragraph break.
-    const clips = player.units[player.index]?.clips ?? [];
-    if (player.clipIndex + 1 < clips.length) {
-        return player.playAt(player.index, player.clipIndex + 1);
-    }
-
-    if (!playerSettings().autoplay_next) return player.notify('paused');
-    if (player.index + 1 < player.units.length) {
-        player.playAt(player.index + 1);
-    } else {
-        clearPosition(player.messageId);
-        player.notify('finished');
-    }
-});
+player.audio.addEventListener('ended', () => player.advance());
 
 // ------------------------------------------------------------- inline panel
 // One panel per message, rendered into the message block itself rather than a
@@ -2690,8 +2748,11 @@ const SETTINGS_HTML = `
       <small>Matched against the trimmed line. The default catches horizontal rules
       like <code>---</code>, which Breeze otherwise reads as a run of dashes.</small>
 
-      <label for="bd_switch_gap">Pause when the voice changes (ms):</label>
-      <input id="bd_switch_gap" type="number" min="0" max="3000" step="50" class="text_pole">
+      <label for="bd_switch_gap">Shift at voice changes (ms):</label>
+      <input id="bd_switch_gap" type="number" min="-3000" max="3000" step="50" class="text_pole">
+      <small>Negative starts the next voice early, cutting that much off the end of the
+      clip before it — which is where a generated clip keeps its dead air. Positive
+      adds a beat instead. Try -200 if speaker changes feel disconnected.</small>
 
       <label for="bd_prefetch_ahead">Clips to keep generating ahead during playback:</label>
       <input id="bd_prefetch_ahead" type="number" min="0" max="20" step="1" class="text_pole">

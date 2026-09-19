@@ -320,13 +320,13 @@ const api = new Function(source + `;return {
     splitSegments, collectQuotes, isForeignSpeaker, parseDirection,
     normalize, pickLine, castEntry, hash, syncPrompts,
     voiceInstruction, cleanProfile, PROFILE_FIELDS, splitLines, buildUnits,
-    isExcluded, getDirection, DEFAULT_EXCLUSIONS, settings, switchPause, player,
+    isExcluded, getDirection, DEFAULT_EXCLUSIONS, settings, switchShift, player,
     extractJson, normalizeQuoteId,
     DEFAULT_PROMPT, DEFAULT_VOICE_CAST_PROMPT };`)();
 const { splitSegments, collectQuotes, isForeignSpeaker, parseDirection,
         normalize, pickLine, castEntry, hash, syncPrompts,
         voiceInstruction, cleanProfile, splitLines, buildUnits,
-        isExcluded, getDirection, switchPause,
+        isExcluded, getDirection, switchShift,
         extractJson, normalizeQuoteId } = api;
 
 
@@ -349,13 +349,15 @@ eq('custom pattern applies', isExcluded('[scene break]'), true);
 eq('an invalid pattern is skipped, not fatal', isExcluded('---'), false);
 config.exclusions = api.DEFAULT_EXCLUSIONS;
 
-print('switchPause');
+print('switchShift');
 config.switch_gap_ms = 0;
-eq('off by default', switchPause('a', 'b'), 0);
+eq('off by default', switchShift('a', 'b'), 0);
 config.switch_gap_ms = 250;
-eq('pauses when the voice changes', switchPause('a', 'b'), 250);
-eq('no pause for the same voice', switchPause('a', 'a'), 0);
-eq('no pause before the first clip', switchPause(null, 'a'), 0);
+eq('positive waits when the voice changes', switchShift('a', 'b'), 250);
+config.switch_gap_ms = -200;
+eq('negative cuts when the voice changes', switchShift('a', 'b'), -200);
+eq('nothing for the same voice', switchShift('a', 'a'), 0);
+eq('nothing before the first clip', switchShift(null, 'a'), 0);
 config.switch_gap_ms = 0;
 
 print('getDirection');
@@ -680,6 +682,50 @@ function runCastScenarios() {
             conf.prefetch_ahead = 0;
             await player.warmAhead(0, 0);
             eq('depth zero warms nothing', warmed, []);
+
+            eq('next position skips an empty paragraph',
+               player.nextPosition(0, 1), { index: 2, clipIndex: 0 });
+            eq('no next position at the end', player.nextPosition(2, 2), null);
+
+            // Cutting short is a timer set against how much clip is left.
+            const scheduled = [];
+            const realSetTimeout = globalThis.setTimeout;
+            globalThis.setTimeout = (fn, delay) => { scheduled.push(delay); return 1; };
+            globalThis.clearTimeout = () => {};
+
+            player.units = [{ clips: [{ text: 'a', voice: 'narrator' }, { text: 'b', voice: 'bob' }] }];
+            player.audio = { duration: 5, currentTime: 0, playbackRate: 1 };
+
+            conf.switch_gap_ms = 0;
+            player.scheduleEarlyAdvance('narrator', 0, 0);
+            eq('no shift schedules nothing', scheduled, []);
+
+            conf.switch_gap_ms = 300;
+            player.scheduleEarlyAdvance('narrator', 0, 0);
+            eq('a positive shift schedules nothing', scheduled, []);
+
+            conf.switch_gap_ms = -300;
+            player.scheduleEarlyAdvance('narrator', 0, 0);
+            eq('a negative shift hands over early', scheduled, [4700]);
+
+            scheduled.length = 0;
+            player.audio.playbackRate = 2;
+            player.scheduleEarlyAdvance('narrator', 0, 0);
+            eq('playback rate shortens the wait', scheduled, [2200]);
+
+            scheduled.length = 0;
+            player.audio = { duration: NaN, currentTime: 0, playbackRate: 1 };
+            player.scheduleEarlyAdvance('narrator', 0, 0);
+            eq('unknown duration leaves it to the clip ending', scheduled, []);
+
+            scheduled.length = 0;
+            player.audio = { duration: 5, currentTime: 0, playbackRate: 1 };
+            player.units = [{ clips: [{ text: 'a', voice: 'narrator' }, { text: 'b', voice: 'narrator' }] }];
+            player.scheduleEarlyAdvance('narrator', 0, 0);
+            eq('same voice is not cut short', scheduled, []);
+
+            globalThis.setTimeout = realSetTimeout;
+            conf.switch_gap_ms = 0;
         } catch (error) {
             fails++;
             print('  FAIL warm ahead threw: ' + error);
