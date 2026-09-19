@@ -55,6 +55,17 @@ happens when the old standalone `breeze-tts` extension is still installed.
 Unguarded, that aborts the whole file and the extension vanishes from the UI, so
 the call is wrapped and the toast says what to disable.
 
+`showRegisteredProvider()` puts the provider dropdown back on `Breeze` after
+registering. SillyTavern fills that dropdown and selects the saved provider in
+its own init (`tts/index.js:876`), which runs **before** any third-party
+provider registers, so `.val('Breeze')` matches no option yet and the select
+shows its first entry instead. Registration adds the option but never revisits
+the selection. It sets the value only — firing `change` would re-run ST's
+provider switch, and the provider is already loaded; only the display was
+wrong. It also re-asserts on `APP_READY`, which is in the event emitter's
+`autoFireAfterEmit` list, so a listener added after it fired still runs and
+there is no race with however far along ST's init happens to be.
+
 The only path this file depends on is the import `../../tts/index.js`, which
 resolves the same from any third-party folder, since they are all served from
 `/scripts/extensions/third-party/<folder>/`. `loading_order` must stay above

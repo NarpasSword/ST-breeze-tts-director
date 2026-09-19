@@ -38,6 +38,7 @@ function size(bytes) {
 // ===========================================================================
 
 
+const PROVIDER_NAME = 'Breeze'; // as it appears in SillyTavern's provider dropdown
 const SAMPLE_RATE = 24000; // Breeze streams mono s16le at 24 kHz
 const BYTES_PER_SAMPLE = 2;
 const DEFAULT_VOICE_MARKER = '[Default Voice]';
@@ -572,12 +573,41 @@ class BreezeTtsProvider {
     }
 }
 
+/**
+ * Put the provider dropdown back on Breeze.
+ *
+ * SillyTavern fills that dropdown and selects the saved provider during its own
+ * init (`tts/index.js:876`), which runs before any third-party provider has
+ * registered. With Breeze saved, `.val('Breeze')` matches no option yet, so the
+ * select falls back to showing its first entry — AllTalk. Registering adds the
+ * option but never revisits the selection, leaving the dropdown describing a
+ * provider that is not the one loaded.
+ */
+function showRegisteredProvider() {
+    const context = SillyTavern.getContext();
+
+    const select = () => {
+        if (context.extensionSettings?.tts?.currentProvider !== PROVIDER_NAME) return;
+        const dropdown = $('#tts_provider');
+        if (dropdown.val() === PROVIDER_NAME) return;
+        // Value only: firing change would re-run ST's provider switch, and the
+        // provider is already loaded — only the display is out of step.
+        dropdown.val(PROVIDER_NAME);
+    };
+
+    select();
+    // APP_READY auto-fires for listeners added after it, so this cannot race
+    // with however far along SillyTavern's own init happens to be.
+    context.eventSource.on(context.event_types.APP_READY, select);
+}
+
 // Registration throws if something else already claimed the name — which is
 // exactly what happens when the old standalone breeze-tts extension is still
 // installed. Unguarded, that exception aborts this whole file and the
 // extension vanishes from the UI with no visible cause.
 try {
-    registerTtsProvider('Breeze', BreezeTtsProvider);
+    registerTtsProvider(PROVIDER_NAME, BreezeTtsProvider);
+    jQuery(showRegisteredProvider);
 } catch (error) {
     console.error('[Breeze] could not register the TTS provider:', error);
     toastr.error('The Breeze TTS provider is already registered. Disable the separate '
