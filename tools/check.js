@@ -349,7 +349,7 @@ function eq(label, got, want) {
 
 async function runAssertions() {
 const api = new Function(source + `;return {
-    isExcluded, readableText, getDirection, DEFAULT_EXCLUSIONS, settings,
+    isExcluded, readableText, getDirection, DEFAULT_EXCLUSIONS, settings, hasProfile,
     splitSegments, collectQuotes, isNamedSpeaker, parseDirection,
     normalize, pickLine, castEntry, hash, syncPrompts, skipped, isSkipped, setSkipped,
     voiceInstruction, cleanProfile, PROFILE_FIELDS, splitLines, buildUnits, targetMessage,
@@ -512,6 +512,14 @@ eq('object passes through',
    castEntry({ base: 'villain', gender: 'male', tone: 'Gruff.' }),
    { base: 'villain', gender: 'male', tone: 'Gruff.' });
 eq('empty', castEntry(undefined), null);
+
+print('hasProfile');
+const { hasProfile } = api;
+eq('a tone counts', hasProfile({ base: 'x', tone: 'Gruff.' }), true);
+eq('any field counts', hasProfile({ base: 'x', accent: 'Scottish' }), true);
+eq('a base alone is not a description', hasProfile({ base: 'x' }), false);
+eq('nothing', hasProfile({}), false);
+eq('missing', hasProfile(undefined), false);
 
 print('cleanProfile');
 eq('keeps filled fields', cleanProfile({ gender: 'male', age: ' 40s ', tone: 'Gruff.', accent: '' }),
@@ -679,10 +687,19 @@ function runCastScenarios() {
             eq(label + ' — provider voices untouched', [...added.keys()], []);
             if (want.base) eq(label + ' — base chosen', cast.Bob?.base, want.base);
             // The message's own character is cast as well, taking their
-            // voice-map entry as the base rather than a model's guess.
-            if (cast.Alice) {
+            // voice-map entry as the base rather than a model's guess — and
+            // still getting a description, which a voice-map entry does not
+            // supply. Stopping at the base was why the character sat on the
+            // sheet blank while side characters were fully described.
+            if (cast.Alice && !setup.prestage?.Alice) {
                 eq(label + ' — character takes their voice-map voice',
                    [cast.Alice.base, cast.Alice.source], ['narrator', 'voicemap']);
+                // Only where the model had a description to give; the
+                // nothing-can-be-derived scenario deliberately has none.
+                if (setup.casting?.tone) {
+                    eq(label + ' — and is described like anyone else',
+                       cast.Alice.tone, setup.casting.tone);
+                }
             }
             if (want.tone) eq(label + ' — profile kept', cast.Bob?.tone, want.tone);
             // The original bug: auxiliary calls sized for the answer, not for a

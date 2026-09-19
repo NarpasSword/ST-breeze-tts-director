@@ -251,8 +251,10 @@ two are composed into an instruction at the moment a line is generated, by
 
 The composed instruction is, in order:
 
-1. the base's own instruction, **only** when `mode` is `append` — a base
-   describes a voice, and a cast member's description supersedes it;
+1. the base's own instruction, when `mode` is `append` **or when the speaker has
+   no description of their own** — a cast member's description supersedes the
+   base's, but only if there is one; dropping it otherwise would leave them
+   sounding like nobody rather than like their base;
 2. `voiceInstruction(castEntry, cloned)`, the speaker's own description, with
    identity words dropped when the base is a clone;
 3. the paragraph's delivery direction.
@@ -327,13 +329,21 @@ character is called something else is still ignored.
 1. `entry.pinned` — set by any edit in the cast sheet, and it outranks even the
    voice map, because the edit was an explicit choice.
 2. `breezeTts.voiceForCharacter(speaker)` — a hand-assigned voice-map entry
-   otherwise beats the director. The entry records it with
-   `source: 'voicemap'`, so the sheet still lists the speaker.
-3. The chat's cast cache.
+   settles the **base** and is recorded with `source: 'voicemap'`. It does not
+   end the casting: a voice-map entry says which voice someone speaks through,
+   not how they sound, so `askCasting()` still runs for the description.
+
+   Returning here was a real bug. `{{char}}` nearly always has a voice-map
+   entry, so the character sat on the sheet with a base and no description while
+   side characters — who have none — got the full treatment.
+3. The chat's cast cache, when the entry already has both a base and a
+   description (`hasProfile()`). A base alone is not a description.
 4. `askCasting()` answers with both a **base voice** and a **profile**, shown the
    speaker's card text, their own lines, the available voices and the running
    cast. This is the only call that describes a voice, and it runs once per
-   speaker.
+   speaker. When the base is already settled it is named in the prompt, so the
+   description suits the voice they will actually speak through, and the model's
+   own base choice only fills a gap.
 5. The base and profile are stored on the cast entry. Nothing is written to the
    provider. Several characters may share a base — the profile is what tells
    them apart.

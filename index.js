@@ -1401,10 +1401,11 @@ globalThis.breezeDirector = async function (text, voiceId, preset, hint) {
         }
     }
 
-    // The base's own instruction is the user's description of that voice. It is
-    // superseded by a cast member's, which describes someone specific, unless
-    // the user asked for the two to be combined.
-    const carried = (config.mode === 'append' && preset?.instruction) ? preset.instruction : '';
+    // The base's own instruction is the user's description of that voice. A cast
+    // member's description supersedes it, being about someone specific — but
+    // only if there is one. With nothing said about the speaker, dropping it
+    // would leave them sounding like nobody at all rather than like their base.
+    const carried = (config.mode === 'append' || !voiceLine) ? (preset?.instruction ?? '') : '';
     const instruction = [carried, voiceLine, line].map(part => String(part ?? '').trim())
         .filter(Boolean).join(' ');
     if (!instruction) return null;
@@ -1582,6 +1583,11 @@ function voiceInstruction(entry, cloned) {
     return sentence ? `${sentence}.` : '';
 }
 
+/** Has anything been said about how this speaker sounds? */
+function hasProfile(entry) {
+    return PROFILE_FIELDS.some(field => entry?.[field]);
+}
+
 /** What Breeze will be told for this cast member, for the sheet to show. */
 function castInstruction(entry) {
     const inherited = basePreset(entry.base);
@@ -1603,7 +1609,7 @@ function rememberSpeaker(speaker) {
 }
 
 /** Ask the director for this speaker's voice: a base to build on, and a description. */
-async function askCasting(speaker, quotes) {
+async function askCasting(speaker, quotes, base = null) {
     const config = settings();
     const breeze = globalThis.breezeTts;
     const available = breeze?.listVoices() ?? [];
@@ -1630,8 +1636,15 @@ async function askCasting(speaker, quotes) {
     const description = [card?.description, card?.personality]
         .map(v => String(v ?? '').trim()).filter(Boolean).join('\n\n');
 
+    const known = [];
+    if (description) known.push(`What is known of them:\n${description}`);
+    // When the base is already settled, say so: the description should fit the
+    // voice they will actually speak through.
+    if (base) known.push(`They already speak through the voice "${base}". Reply with that `
+        + 'same base, and describe them in a way that suits it.');
+
     let prompt = put(config.voice_cast_prompt, /{{speaker}}/g, speaker);
-    prompt = put(prompt, /{{context}}/g, description ? `\nWhat is known of them:\n${description}\n` : '');
+    prompt = put(prompt, /{{context}}/g, known.length ? `\n${known.join('\n\n')}\n` : '');
     prompt = put(prompt, /{{lines}}/g, spoken || '(none recorded)');
     prompt = put(prompt, /{{voices}}/g, available.map(name => `- ${name}`).join('\n'));
     prompt = put(prompt, /{{cast}}/g, roster ? put(CAST_BLOCK, /{{list}}/g, roster) : '');
@@ -1641,11 +1654,11 @@ async function askCasting(speaker, quotes) {
 
     // The model may quote the name or wrap it in a sentence; match generously.
     const wanted = String(parsed.base ?? '').trim().toLowerCase();
-    const base = available.find(name => name.toLowerCase() === wanted)
+    const chosen = available.find(name => name.toLowerCase() === wanted)
         ?? available.find(name => wanted.includes(name.toLowerCase()))
         ?? null;
 
-    return { base, profile: cleanProfile(parsed) };
+    return { base: chosen, profile: cleanProfile(parsed) };
 }
 
 /**
@@ -1666,28 +1679,39 @@ async function castVoice(speaker, quotes = []) {
         return base;
     };
 
-    // An edit in the cast sheet pins the entry, and pinning outranks everything.
-    if (entry.pinned && entry.base) return settle(entry.base);
+    // An edit in the cast sheet pins the entry. A bare pre-stage — a name with
+    // nothing on it yet — is the one thing still worth filling in.
+    if (entry.pinned && (entry.base || hasProfile(entry))) return settle(entry.base);
 
-    // Otherwise a hand-assigned voice-map entry beats anything decided here.
+    // A hand-assigned voice-map entry settles which voice they speak through.
+    // It says nothing about how they sound, though, so it fills the base and
+    // casting still runs for the description. Returning here was why the
+    // character — who nearly always has a voice-map entry — ended up on the
+    // sheet with a base and no description, while side characters got both.
     const mapped = breeze.voiceForCharacter(speaker);
-    if (mapped) {
+    if (mapped && !entry.base) {
         entry.base = mapped;
         entry.source = 'voicemap';
-        return settle(mapped);
     }
 
-    if (entry.base && breeze.hasVoice(entry.base)) return settle(entry.base);
+    // Already described: nothing left to decide.
+    if (entry.base && breeze.hasVoice(entry.base) && hasProfile(entry)) {
+        return settle(entry.base);
+    }
 
     if (castJobs.has(speaker)) return castJobs.get(speaker);
 
     const pending = (async () => {
-        const casting = await askCasting(speaker, quotes);
-        if (casting?.base) entry.base = casting.base;
+        const casting = await askCasting(speaker, quotes, entry.base);
+        // A base already chosen — by the voice map or by hand — outranks the
+        // model's; it only fills a gap.
+        if (casting?.base && !entry.base) {
+            entry.base = casting.base;
+            delete entry.source;
+        }
         for (const field of PROFILE_FIELDS) {
             if (!entry[field] && casting?.profile?.[field]) entry[field] = casting.profile[field];
         }
-        delete entry.source;
         return entry.base;
     })()
         .then(base => {
@@ -2697,7 +2721,9 @@ async function openCastSheet() {
             const instruction = castInstruction(entry);
             built.textContent = instruction
                 ? `Breeze hears: ${instruction}`
-                : 'Nothing to send yet — pick a base voice or describe their tone.';
+                : entry.base
+                    ? `Reads as "${entry.base}" is written. Describe them to set them apart.`
+                    : 'Nothing to send yet — pick a base voice or describe their tone.';
             row.append(built);
 
             list.append(row);
