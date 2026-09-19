@@ -51,8 +51,11 @@ gjs tools/check.js index.js
 ```
 
 It loads `index.js` under stubs for the browser and SillyTavern globals, runs
-the jQuery ready handler, then asserts the pure logic against the file as
-loaded. **Run it after every edit.** Anything that throws at module eval or
+the jQuery ready handler, asserts the pure logic against the file as loaded,
+then drives `generate()` end to end against a stubbed model and provider. Those
+last scenarios exist because the cast sheet can sit empty while attribution
+works perfectly — a failure no unit test sees. They share global stubs, so they
+run strictly in sequence. **Run it after every edit.** Anything that throws at module eval or
 inside `bind()` aborts the rest of the file, so the extension disappears from
 the UI entirely — no panel, no buttons, no listeners — with the only clue in the
 browser console. A syntax check alone will not catch it: a missing top-level
@@ -206,16 +209,26 @@ two different voices.
 `castVoice()` is only ever called for a speaker `isForeignSpeaker()` accepts.
 Resolution order, each step falling through on failure:
 
-1. `breezeTts.voiceForCharacter(speaker)` — a hand-assigned voice-map entry
-   always beats the director.
-2. The chat's cast cache.
-3. `askCasting()` picks a **base voice**, shown the speaker's profile, their own
+0. `rememberSpeaker()` — **before anything else**, the speaker is written onto
+   the cast sheet with whatever profile identification gave. Everything below
+   can fail; the entry stays, unvoiced, for the user to fill in. Skipping this
+   is what once made the sheet look empty while attribution worked fine.
+1. `entry.pinned` — set by any edit in the cast sheet, and it outranks even the
+   voice map, because the edit was an explicit choice.
+2. `breezeTts.voiceForCharacter(speaker)` — a hand-assigned voice-map entry
+   otherwise beats the director. The entry records it with
+   `source: 'voicemap'`, so the sheet still lists the speaker.
+3. The chat's cast cache.
+4. `askCasting()` picks a **base voice**, shown the speaker's profile, their own
    lines, the available voices and the running cast.
-4. `applyCast()` writes a provider voice named after the speaker, via
+5. `applyCast()` writes a provider voice named after the speaker, via
    `castPreset()`: the base's `cfg_scale`, its `ref_audio_url`/`ref_text` when it
-   has **both**, and `voiceInstruction()` as the instruction. Several characters
-   may share a base — the profile is what tells them apart.
-5. Null → the caller falls back to `voiceForSegment()`'s live resolution.
+   has **both**, and `voiceInstruction()` as the instruction — falling back to
+   the base's own instruction when the profile is empty, so a speaker with a
+   base always sounds like something. Several characters may share a base — the
+   profile is what tells them apart.
+6. No base and nothing said about them → the entry stays on the sheet with no
+   voice, and playback falls back to `voiceForSegment()`'s live resolution.
 
 Non-quote text uses `defaultVoice()`: the configured `narrator_voice` if it
 still exists in the provider's JSON, else the character's own voice. Leaving the
@@ -241,7 +254,9 @@ cast), and where in the message it sits.
 
 It returns `{ speakers, profiles }`: `Q1 → name` for every quote, and for each
 new speaker a `{ gender, age, tone, accent }` sketch, `cleanProfile()`-filtered
-so blanks and `"unknown"` never reach the cast.
+so blanks and `"unknown"` never reach the cast. Look profiles up with
+`profileFor()`, never by direct index — the model files them under whatever
+casing it likes, and a missed lookup silently loses the whole description.
 
 This used to ride along on the director prompt. It was two jobs in one call with
 too little context for either; the director prompt now only directs, and its

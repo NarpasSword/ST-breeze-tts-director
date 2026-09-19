@@ -465,7 +465,7 @@ async function generate(index, { quiet = true } = {}) {
                     // Only a foreign speaker gets a voice pinned; the character's
                     // own lines resolve live so voice-map edits keep working.
                     if (isForeignSpeaker(speaker, message)) {
-                        entry.voice = await castVoice(speaker, quotes, cast.profiles[speaker]);
+                        entry.voice = await castVoice(speaker, quotes, profileFor(cast.profiles, speaker));
                     }
                 }
                 line.segments.push(entry);
@@ -670,6 +670,14 @@ function pruneCast() {
 
 const PROFILE_FIELDS = ['gender', 'age', 'tone', 'accent'];
 
+/** Find a profile however the model cased the name it filed it under. */
+function profileFor(profiles, speaker) {
+    if (profiles?.[speaker]) return profiles[speaker];
+    const needle = String(speaker ?? '').trim().toLowerCase();
+    const hit = Object.keys(profiles ?? {}).find(name => name.trim().toLowerCase() === needle);
+    return hit ? profiles[hit] : null;
+}
+
 function cleanProfile(raw) {
     const profile = {};
     for (const field of PROFILE_FIELDS) {
@@ -815,8 +823,10 @@ function castPreset(entry) {
     // Clone mode needs both halves, so carry them together or not at all.
     const cloned = !!(inherited?.ref_audio_url && inherited?.ref_text);
 
+    // With nothing said about them, fall back to the base's own instruction so
+    // they at least sound like it, rather than like nothing at all.
     const preset = {
-        instruction: voiceInstruction(entry, cloned),
+        instruction: voiceInstruction(entry, cloned) || String(inherited?.instruction ?? ''),
         cfg_scale: Number(inherited?.cfg_scale ?? settings().cfg_scale),
     };
     if (cloned) {
@@ -834,6 +844,22 @@ function freeVoiceName(speaker) {
     let suffix = 2;
     while (breeze.hasVoice(name)) name = `${base}-${suffix++}`;
     return name;
+}
+
+/**
+ * Put a named speaker on the cast sheet, voiced or not. An entry with no voice
+ * is the sheet's invitation to fill one in by hand, which is better than the
+ * speaker vanishing because nothing could be derived for them automatically.
+ */
+function rememberSpeaker(speaker, profile) {
+    const cast = castMap();
+    const entry = castEntry(cast[speaker]) ?? { voice: null, base: null };
+    for (const field of PROFILE_FIELDS) {
+        if (!entry[field] && profile?.[field]) entry[field] = profile[field];
+    }
+    cast[speaker] = entry;
+    pruneCast();
+    return entry;
 }
 
 /** Write (or rewrite) the provider voice for a cast entry. */
@@ -902,40 +928,55 @@ async function castVoice(speaker, quotes = [], profile = null) {
     const breeze = globalThis.breezeTts;
     if (!breeze?.available) return null;
 
-    // A hand-assigned voice always beats anything the director decides.
-    const mapped = breeze.voiceForCharacter(speaker);
-    if (mapped) return mapped;
+    // Record them first: whatever happens next, they belong on the sheet.
+    const entry = rememberSpeaker(speaker, profile);
+    const settle = (voice) => {
+        ctx().saveSettingsDebounced();
+        onCastChanged?.();
+        return voice;
+    };
 
-    const cast = castMap();
-    const known = castEntry(cast[speaker]);
-    if (known && breeze.hasVoice(known.voice)) return known.voice;
+    // An edit in the cast sheet pins the entry, and pinning outranks everything.
+    if (entry.pinned && breeze.hasVoice(entry.voice)) return settle(entry.voice);
+
+    // Otherwise a hand-assigned voice-map entry beats anything decided here —
+    // but the speaker is still listed, with where the voice came from.
+    const mapped = breeze.voiceForCharacter(speaker);
+    if (mapped) {
+        entry.voice = mapped;
+        entry.source = 'voicemap';
+        return settle(mapped);
+    }
+
+    if (entry.voice && breeze.hasVoice(entry.voice)) return settle(entry.voice);
 
     if (castJobs.has(speaker)) return castJobs.get(speaker);
 
     const pending = (async () => {
-        const base = await askCasting(speaker, quotes, profile);
-        const entry = { voice: null, base, ...(profile ?? {}) };
+        const base = await askCasting(speaker, quotes, entry);
+        if (base) entry.base = base;
 
-        // Nothing to say about them and no base to borrow: not worth a voice.
-        if (!base && !voiceInstruction(entry, false)) return null;
+        // Nothing to build on: leave them unvoiced rather than dropping them.
+        if (!entry.base && !voiceInstruction(entry, false)) return null;
 
+        delete entry.source;
         await applyCast(speaker, entry);
-        return entry;
+        return entry.voice;
     })()
-        .then(entry => {
-            if (!entry?.voice) return null;
-            cast[speaker] = entry;
-            pruneCast();
-            ctx().saveSettingsDebounced();
-            console.info(`[Breeze Director] cast ${speaker} as "${entry.voice}"`
-                + (entry.base ? ` from base "${entry.base}"` : '') + '.');
-            toastr.info(`Cast ${speaker} as "${entry.voice}".`, 'Breeze Director');
-            onCastChanged?.();
-            return entry.voice;
+        .then(voice => {
+            if (voice) {
+                console.info(`[Breeze Director] cast ${speaker} as "${voice}"`
+                    + (entry.base ? ` from base "${entry.base}"` : '') + '.');
+                toastr.info(`Cast ${speaker} as "${voice}".`, 'Breeze Director');
+            } else {
+                console.info(`[Breeze Director] ${speaker} is on the cast sheet `
+                    + 'with no voice yet — give them one there.');
+            }
+            return settle(voice);
         })
         .catch(error => {
             console.warn('[Breeze Director] casting failed for', speaker, error);
-            return null;
+            return settle(null);
         })
         .finally(() => castJobs.delete(speaker));
 
@@ -1656,9 +1697,12 @@ async function openCastSheet() {
             who.style.cssText = 'flex:1 1 8em;min-width:0;';
             who.textContent = speaker;
 
+            const voiced = !!entry.voice && breeze.hasVoice(entry.voice);
             const voice = document.createElement('small');
             voice.style.cssText = 'opacity:0.6;flex:0 0 auto;';
-            voice.textContent = breeze.hasVoice(entry.voice) ? entry.voice : `${entry.voice} (missing)`;
+            voice.textContent = voiced
+                ? (entry.source === 'voicemap' ? `${entry.voice} (from voice map)` : entry.voice)
+                : (entry.voice ? `${entry.voice} (missing)` : 'no voice yet');
 
             head.append(who, voice);
 
@@ -1686,12 +1730,16 @@ async function openCastSheet() {
             });
 
             const preview = button('fa-play', `Hear ${speaker}`, async () => {
+                if (!voiced) {
+                    return toastr.info('Give them a base voice or a tone first.', 'Breeze Director');
+                }
                 try {
                     await breeze.preview(entry.voice);
                 } catch (error) {
                     toastr.error(String(error?.message ?? error), 'Breeze');
                 }
             });
+            if (!voiced) preview.style.opacity = '0.4';
 
             const recast = button('fa-rotate', 'Choose a base voice again', async () => {
                 const base = await askCasting(speaker, [], entry);
@@ -1756,21 +1804,27 @@ async function openCastSheet() {
             // What Breeze is actually told, so an edit's effect is visible.
             const built = document.createElement('small');
             built.style.cssText = 'display:block;opacity:0.6;margin-top:0.25em;';
-            const preset = breeze.hasVoice(entry.base ?? '') || !entry.base
-                ? castPreset(entry)
-                : { instruction: voiceInstruction(entry, false) };
-            built.textContent = preset.instruction
-                ? `Breeze hears: ${preset.instruction}`
-                : 'Nothing to send yet — fill in a tone.';
+            const instruction = (!entry.base || breeze.hasVoice(entry.base))
+                ? castPreset(entry).instruction
+                : voiceInstruction(entry, false);
+            built.textContent = instruction
+                ? `Breeze hears: ${instruction}`
+                : 'Nothing to send yet — pick a base voice or describe their tone.';
             row.append(built);
 
             list.append(row);
         }
     }
 
-    /** Rewrite the speaker's provider voice after any edit. */
+    /**
+     * Rewrite the speaker's provider voice after any edit. Editing here pins the
+     * entry, so a hand-assigned voice-map entry no longer overrides it — the
+     * edit was an explicit choice and should stick.
+     */
     async function rederive(speaker, entry) {
-        if (!voiceInstruction(entry, false)) return;
+        if (!entry.base && !voiceInstruction(entry, false)) return;
+        entry.pinned = true;
+        delete entry.source;
         await applyCast(speaker, entry);
         onCastChanged?.();
     }

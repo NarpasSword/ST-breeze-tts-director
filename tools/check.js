@@ -108,22 +108,23 @@ readyFn().then(
     },
 );
 
-function runAssertions() {
-const api = new Function(source + `;return {
-    splitSegments, collectQuotes, isForeignSpeaker, parseDirection,
-    normalize, pickLine, castEntry, hash, syncPrompts,
-    voiceInstruction, cleanProfile, PROFILE_FIELDS,
-    DEFAULT_PROMPT, DEFAULT_VOICE_CAST_PROMPT };`)();
-const { splitSegments, collectQuotes, isForeignSpeaker, parseDirection,
-        normalize, pickLine, castEntry, hash, syncPrompts,
-        voiceInstruction, cleanProfile } = api;
-
 let fails = 0;
 function eq(label, got, want) {
     const g = JSON.stringify(got), w = JSON.stringify(want);
     if (g === w) { print('  ok   ' + label); return; }
     fails++; print('  FAIL ' + label + '\n       got  ' + g + '\n       want ' + w);
 }
+
+function runAssertions() {
+const api = new Function(source + `;return {
+    splitSegments, collectQuotes, isForeignSpeaker, parseDirection,
+    normalize, pickLine, castEntry, hash, syncPrompts,
+    voiceInstruction, cleanProfile, profileFor, PROFILE_FIELDS,
+    DEFAULT_PROMPT, DEFAULT_VOICE_CAST_PROMPT };`)();
+const { splitSegments, collectQuotes, isForeignSpeaker, parseDirection,
+        normalize, pickLine, castEntry, hash, syncPrompts,
+        voiceInstruction, cleanProfile, profileFor } = api;
+
 
 print('splitSegments');
 eq('plain prose', splitSegments('He turned away.'), [{ text: 'He turned away.', kind: 'narration' }]);
@@ -180,6 +181,12 @@ eq('drops unlisted keys', cleanProfile({ tone: 'Soft.', mood: 'angry' }), { tone
 eq('all empty is null', cleanProfile({ gender: '', age: '  ' }), null);
 eq('missing is null', cleanProfile(undefined), null);
 
+print('profileFor');
+eq('exact key', profileFor({ Bob: { tone: 'a' } }, 'Bob'), { tone: 'a' });
+eq('different casing', profileFor({ bob: { tone: 'a' } }, 'Bob'), { tone: 'a' });
+eq('surrounding space', profileFor({ ' Bob ': { tone: 'a' } }, 'Bob'), { tone: 'a' });
+eq('absent', profileFor({ Carol: { tone: 'a' } }, 'Bob'), null);
+
 print('voiceInstruction');
 const bob = { gender: 'male', age: 'late forties', accent: 'Scottish', tone: 'Gruff and clipped.' };
 eq('design mode composes everything', voiceInstruction(bob, false),
@@ -210,6 +217,95 @@ cfg = { prompt: shipped, prompt_stamps: {} };
 syncPrompts(cfg);
 eq('current prompt gets stamped', cfg.prompt_stamps.prompt, hash(shipped));
 
-print(fails ? '\n' + fails + ' FAILED' : '\nall passed');
-if (fails) imports.system.exit(1);
+runCastScenarios();
+}
+
+// Drives generate() end to end against a stubbed model and provider. Every one
+// of these once left the cast sheet empty while the director named the speaker
+// perfectly well — invisible to any unit test.
+function runCastScenarios() {
+    const BASE = ['narrator', 'villain'];
+    const MES = 'She turned away. "I told you already."\n"Then leave," Bob said from the door.';
+
+    const scenarios = [
+        ['new speaker is cast',
+         { map: { Alice: 'narrator' }, casting: 'villain',
+           identify: { speakers: { Q1: 'Alice', Q2: 'Bob' },
+                       profiles: { Bob: { gender: 'male', tone: 'Gruff.' } } } },
+         { cast: ['Bob'], added: ['bob'] }],
+
+        ['speaker with a voice-map entry is still listed',
+         { map: { Alice: 'narrator', Bob: 'villain' }, casting: 'villain',
+           identify: { speakers: { Q1: 'Alice', Q2: 'Bob' },
+                       profiles: { Bob: { gender: 'male', tone: 'Gruff.' } } } },
+         { cast: ['Bob'], added: [] }],
+
+        ['profile filed under different casing is kept',
+         { map: { Alice: 'narrator' }, casting: 'villain',
+           identify: { speakers: { Q1: 'Alice', Q2: 'Bob' },
+                       profiles: { bob: { gender: 'male', tone: 'Gruff.' } } } },
+         { cast: ['Bob'], added: ['bob'], tone: 'Gruff.' }],
+
+        ['speaker is listed even when nothing can be derived',
+         { map: { Alice: 'narrator' }, casting: 'no such voice',
+           identify: { speakers: { Q1: 'Alice', Q2: 'Bob' }, profiles: {} } },
+         { cast: ['Bob'], added: [] }],
+
+        ['unattributed quotes are ignored',
+         { map: { Alice: 'narrator' }, casting: 'villain',
+           identify: { speakers: { Q1: 'Alice', Q2: 'unknown' }, profiles: {} } },
+         { cast: [], added: [] }],
+    ];
+
+    print('\ncast scenarios');
+
+    // Strictly sequential: every scenario rewrites the same global stubs, so
+    // running them concurrently has each one generating against another's model.
+    return scenarios.reduce((chain, [label, setup, want]) => chain.then(async () => {
+        const added = new Map();
+        context.chat = [{ name: 'Alice', swipe_id: 0, extra: {}, mes: MES }];
+        context.ConnectionManagerRequestService.sendRequest = async (profile, prompt) => {
+            if (prompt.includes('who speaks each line')) {
+                return { content: JSON.stringify(setup.identify) };
+            }
+            if (prompt.includes('Choose which existing voice')) return { content: setup.casting };
+            return { content: JSON.stringify(['Weary.', 'Flat and final.']) };
+        };
+        globalThis.breezeTts = {
+            available: true,
+            listVoices: () => [...BASE, ...added.keys()],
+            hasVoice: (n) => BASE.includes(n) || added.has(n),
+            addVoice: async (n, preset) => { added.set(n, preset); return n; },
+            assignVoice: async () => {},
+            voiceForCharacter: (n) => setup.map[n] ?? null,
+            voicePreset: (n) => (BASE.includes(n) ? { cfg_scale: 4 } : added.get(n) ?? null),
+            prefetch: async () => true,
+            getClip: async () => null,
+        };
+
+        const api = new Function(source + ';return { generate, settings, castMap };')();
+        const config = api.settings();
+        config.profile = 'test';
+        config.cast = {};
+
+        try {
+            await api.generate(0, { quiet: true });
+            const cast = api.castMap();
+            eq(label + ' — cast', Object.keys(cast), want.cast);
+            eq(label + ' — voices added', [...added.keys()], want.added);
+            if (want.tone) eq(label + ' — profile kept', cast.Bob?.tone, want.tone);
+        } catch (error) {
+            fails++;
+            print('  FAIL ' + label + ' threw: ' + error);
+        }
+    }), Promise.resolve()).then(finish, (error) => {
+        fails++;
+        print('  FAIL scenario chain threw: ' + error);
+        finish();
+    });
+}
+
+function finish() {
+    print(fails ? '\n' + fails + ' FAILED' : '\nall passed');
+    if (fails) imports.system.exit(1);
 }
