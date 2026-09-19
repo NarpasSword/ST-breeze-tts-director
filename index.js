@@ -257,6 +257,30 @@ function isForeignSpeaker(speaker, message) {
     return name !== String(message?.name ?? '').trim().toLowerCase();
 }
 
+// The provider is a separate extension, deployed separately, so it can be older
+// than this one. These are the methods added after the first release: without
+// them the feature they serve degrades, but nothing may throw — an exception
+// here lands in castVoice's catch and looks exactly like "the model said no".
+const PROVIDER_FEATURES = ['voicePreset', 'preview', 'dropClips'];
+
+function missingProviderFeatures() {
+    const breeze = globalThis.breezeTts;
+    if (!breeze?.available) return [];
+    return PROVIDER_FEATURES.filter(name => typeof breeze[name] !== 'function');
+}
+
+/** A base voice's preset, or null if this provider is too old to offer them. */
+function basePreset(name) {
+    const breeze = globalThis.breezeTts;
+    if (!name || typeof breeze?.voicePreset !== 'function') return null;
+    try {
+        return breeze.voicePreset(name);
+    } catch (error) {
+        console.warn('[Breeze Director] could not read base voice', name, error);
+        return null;
+    }
+}
+
 /** The voice the character themselves narrates with, per the TTS voice map. */
 function charVoice(message) {
     return globalThis.breezeTts?.voiceForCharacter(message?.name) ?? null;
@@ -863,8 +887,7 @@ function voiceInstruction(entry, cloned) {
 
 /** Build the provider preset for a cast entry: base timbre, composed instruction. */
 function castPreset(entry) {
-    const breeze = globalThis.breezeTts;
-    const inherited = entry.base ? breeze.voicePreset(entry.base) : null;
+    const inherited = basePreset(entry.base);
     // Clone mode needs both halves, so carry them together or not at all.
     const cloned = !!(inherited?.ref_audio_url && inherited?.ref_text);
 
@@ -1019,7 +1042,8 @@ async function castVoice(speaker, quotes = []) {
             return settle(voice);
         })
         .catch(error => {
-            console.warn('[Breeze Director] casting failed for', speaker, error);
+            console.error('[Breeze Director] casting failed for', speaker, error);
+            toastr.error(`Could not cast ${speaker}: ${error?.message ?? error}`, 'Breeze Director');
             return settle(null);
         })
         .finally(() => castJobs.delete(speaker));
@@ -1882,6 +1906,10 @@ async function openCastSheet() {
                 if (!voiced) {
                     return toastr.info('Give them a base voice or a tone first.', 'Breeze Director');
                 }
+                if (typeof breeze.preview !== 'function') {
+                    return toastr.warning('This build of the Breeze provider cannot preview. '
+                        + 'Redeploy breeze-tts.', 'Breeze Director');
+                }
                 try {
                     await breeze.preview(entry.voice);
                 } catch (error) {
@@ -1998,6 +2026,7 @@ const SETTINGS_HTML = `
       <label class="checkbox_label"><input id="bd_cast" type="checkbox"> Give quoted speech its own voice per speaker</label>
       <small>Click the masks icon on any message to view, generate, or edit its direction.</small>
       <small id="bd_paragraph_warn" style="color:var(--golden);display:block;"></small>
+      <small id="bd_provider_warn" style="color:var(--golden);display:block;"></small>
 
       <label for="bd_narrator">Narrator voice (everything outside quotes):</label>
       <select id="bd_narrator" class="text_pole"></select>
@@ -2108,6 +2137,12 @@ function bind() {
     // never returns speakers, and with ST's own paragraph narration off it hands
     // the provider the whole message as one job.
     const warn = () => {
+        // The two extensions deploy separately, so they can drift apart.
+        const missing = missingProviderFeatures();
+        $('#bd_provider_warn').text(missing.length
+            ? `The Breeze provider is missing ${missing.join(', ')} — redeploy breeze-tts `
+                + 'alongside this extension, or casting and previews will not work.'
+            : '');
         $('#bd_cast_prompt_warn').text(config.voice_cast_prompt.includes('{{cast}}')
             ? ''
             : 'This saved casting prompt cannot see the existing cast — click '
@@ -2210,6 +2245,15 @@ jQuery(async () => {
     $('#extensions_settings2').append(SETTINGS_HTML);
     bind();
     addButtons();
+
+    // Deployed separately, so check rather than assume they match.
+    const missing = missingProviderFeatures();
+    if (missing.length) {
+        console.warn(`[Breeze Director] the Breeze provider is missing ${missing.join(', ')}. `
+            + 'Redeploy breeze-tts from the same checkout as this extension.');
+        toastr.warning(`Breeze provider is out of date (missing ${missing.join(', ')}).`,
+            'Breeze Director');
+    }
 
     $(document).on('click', '.mes_breeze_direct', function () {
         const index = Number($(this).closest('.mes').attr('mesid'));

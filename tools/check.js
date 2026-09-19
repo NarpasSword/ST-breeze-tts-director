@@ -272,6 +272,11 @@ function runCastScenarios() {
            raw: 'Hmm {let me see}. Here:\n{"1":"Alice","q2":"Bob"}' },
          { cast: ['Bob'], added: ['bob'] }],
 
+        ['casts against a provider too old to expose voicePreset',
+         { map: { Alice: 'narrator' }, noVoicePreset: true,
+           identify: { Q1: 'Alice', Q2: 'Bob' } },
+         { cast: ['Bob'], added: ['bob'], tone: 'Gruff.' }],
+
         ['unattributed quotes are ignored',
          { map: { Alice: 'narrator' }, identify: { Q1: 'Alice', Q2: 'unknown' } },
          { cast: [], added: [] }],
@@ -309,6 +314,8 @@ function runCastScenarios() {
             prefetch: async () => true,
             getClip: async () => null,
         };
+        // An older provider simply does not have the newer methods.
+        if (setup.noVoicePreset) delete globalThis.breezeTts.voicePreset;
 
         const api = new Function(source
             + ';return { generate, settings, castMap, castMessage };')();

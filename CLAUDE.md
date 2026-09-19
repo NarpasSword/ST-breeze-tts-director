@@ -42,6 +42,19 @@ The coupling is entirely through two globals, never imports:
 Consequence: `manifest.json` `loading_order` must stay **above** the provider's
 (11 → this is 12). Every call into `breezeTts` must tolerate it being absent.
 
+**The two deploy separately, so they drift.** `breeze-tts` is not in this repo
+and is copied into SillyTavern by hand, so a freshly deployed director can be
+talking to a months-old provider. Methods added after the provider's first
+release — `voicePreset`, `preview`, `dropClips` — are listed in
+`PROVIDER_FEATURES`, checked at load, and warned about in the console, a toast
+and the settings panel.
+
+Never call one of them bare. An exception inside `castVoice()` lands in its
+`catch` and is indistinguishable from the model declining, so a stale provider
+presents as "casting silently does nothing" — which is exactly how it presented.
+`basePreset()` is the pattern: feature-test, try/catch, return null, carry on
+without the enrichment. Adding a provider method means adding it to that list.
+
 ## Install / iterate
 
 Before deploying, check the file:
