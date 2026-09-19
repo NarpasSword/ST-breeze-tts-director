@@ -427,6 +427,38 @@ proves nothing; running it is what catches a name that stopped resolving inside
 it. That pass also asserts the provider's voice list comes back untouched, so
 the no-writes invariant is checked from the UI as well as from `generate()`.
 
+### Exclusions
+
+`exclusions` is a newline-separated list of regexes; `splitLines()` drops any
+line matching one, so it never becomes a paragraph, a panel row, direction, or a
+clip. The default is `^[-*_=~]{3,}$` — horizontal rules, which Breeze otherwise
+reads aloud as a run of dashes. Patterns are matched against the **trimmed**
+line, compiled once and cached until the setting text changes, and a pattern
+that fails to compile is logged and skipped rather than silencing the message.
+
+Because paragraphs are addressed by index, changing exclusions changes what
+index three means. `getDirection()` therefore drops a stored take whose line
+count no longer matches the message — which also covers an edited message, and
+is cheaper than regenerating on every load.
+
+### Pacing
+
+Two settings, and they address different gaps:
+
+- `switch_gap_ms` is a **deliberate** pause when the voice changes, applied by
+  `switchPause()`. Zero by default, and never applied before the first clip or
+  between two clips of the same voice.
+- `prefetch_ahead` is how many clips `player.warmAhead()` keeps generating ahead
+  of the one playing. This is the one that matters for the gaps people actually
+  hear. Breeze generates one clip at a time and takes seconds over it, so
+  warming only the next clip leaves a short line's successor unfinished and
+  playback stalls waiting for it. Warming runs **sequentially** on purpose: the
+  server answers 409 to concurrent requests, so firing them together only burns
+  retries.
+
+Neither helps if the audio was never generated — `/breeze-audio` and the panel's
+pre-generate button exist for that.
+
 ## Known issues / gotchas
 
 - **Prompts persist in settings, so editing the default in this file changes

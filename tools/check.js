@@ -320,13 +320,56 @@ const api = new Function(source + `;return {
     splitSegments, collectQuotes, isForeignSpeaker, parseDirection,
     normalize, pickLine, castEntry, hash, syncPrompts,
     voiceInstruction, cleanProfile, PROFILE_FIELDS, splitLines, buildUnits,
+    isExcluded, getDirection, DEFAULT_EXCLUSIONS, settings, switchPause, player,
     extractJson, normalizeQuoteId,
     DEFAULT_PROMPT, DEFAULT_VOICE_CAST_PROMPT };`)();
 const { splitSegments, collectQuotes, isForeignSpeaker, parseDirection,
         normalize, pickLine, castEntry, hash, syncPrompts,
         voiceInstruction, cleanProfile, splitLines, buildUnits,
+        isExcluded, getDirection, switchPause,
         extractJson, normalizeQuoteId } = api;
 
+
+print('exclusions');
+const config = api.settings();
+config.exclusions = api.DEFAULT_EXCLUSIONS;
+eq('three dashes', isExcluded('---'), true);
+eq('a long rule', isExcluded('--------'), true);
+eq('asterisk rule', isExcluded('***'), true);
+eq('underscore rule', isExcluded('___'), true);
+eq('equals rule', isExcluded('==='), true);
+eq('two dashes are not a rule', isExcluded('--'), false);
+eq('an em dash in prose', isExcluded('He turned\u2014and left.'), false);
+eq('a rule with words is read', isExcluded('--- Chapter 2 ---'), false);
+eq('ordinary prose', isExcluded('The first thing visible is smoke.'), false);
+eq('rules drop out of the units', splitLines('one\n---\ntwo'), ['one', 'two']);
+
+config.exclusions = '^\\[.*\\]$\n(((';
+eq('custom pattern applies', isExcluded('[scene break]'), true);
+eq('an invalid pattern is skipped, not fatal', isExcluded('---'), false);
+config.exclusions = api.DEFAULT_EXCLUSIONS;
+
+print('switchPause');
+config.switch_gap_ms = 0;
+eq('off by default', switchPause('a', 'b'), 0);
+config.switch_gap_ms = 250;
+eq('pauses when the voice changes', switchPause('a', 'b'), 250);
+eq('no pause for the same voice', switchPause('a', 'a'), 0);
+eq('no pause before the first clip', switchPause(null, 'a'), 0);
+config.switch_gap_ms = 0;
+
+print('getDirection');
+const withLines = (mes, lines, swipe = 0) => ({
+    mes, swipe_id: swipe,
+    extra: { breeze_direction: { swipe_id: 0, lines: lines.map(t => ({ text: t, instruction: 'x' })) } },
+});
+eq('matching take is kept', !!getDirection(withLines('one\ntwo', ['one', 'two'])), true);
+eq('take from a different swipe is dropped',
+   getDirection(withLines('one\ntwo', ['one', 'two'], 1)), null);
+eq('take with the wrong paragraph count is dropped',
+   getDirection(withLines('one\ntwo', ['one', 'two', 'three'])), null);
+eq('a take written before an exclusion existed is dropped',
+   getDirection(withLines('one\n---\ntwo', ['one', '---', 'two'])), null);
 
 print('splitLines');
 eq('plain paragraphs', splitLines('one\ntwo'), ['one', 'two']);
@@ -604,6 +647,42 @@ function runCastScenarios() {
         } catch (error) {
             fails++;
             print('  FAIL castMessage threw: ' + error);
+        }
+
+        // Warming ahead is what closes the gap people hear: Breeze makes one clip
+        // at a time, so a shallow queue cannot keep up with short lines.
+        print('\nwarm ahead');
+        try {
+            const warmed = [];
+            const { player, settings: readSettings } = new Function(source
+                + ';return { player, settings };')();
+            // After the load: the module publishes its own globalThis.breezeTts.
+            globalThis.breezeTts = { prefetch: async (text) => { warmed.push(text); return true; } };
+            const conf = readSettings();
+
+            player.units = [
+                { clips: [{ text: 'a1' }, { text: 'a2' }] },
+                { clips: [] },
+                { clips: [{ text: 'c1' }, { text: 'c2' }, { text: 'c3' }] },
+            ];
+            player.loadToken = 0;
+
+            conf.prefetch_ahead = 3;
+            await player.warmAhead(0, 0);
+            eq('warms across empty paragraphs', warmed, ['a2', 'c1', 'c2']);
+
+            warmed.length = 0;
+            conf.prefetch_ahead = 10;
+            await player.warmAhead(2, 0);
+            eq('stops at the end of the message', warmed, ['c2', 'c3']);
+
+            warmed.length = 0;
+            conf.prefetch_ahead = 0;
+            await player.warmAhead(0, 0);
+            eq('depth zero warms nothing', warmed, []);
+        } catch (error) {
+            fails++;
+            print('  FAIL warm ahead threw: ' + error);
         }
 
         // The cast sheet builds a lot of DOM and is otherwise untested; opening

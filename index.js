@@ -678,6 +678,10 @@ Already cast in this scene:
 {{list}}
 `;
 
+// Horizontal rules: --- *** ___ ===, and the same in a row of tildes. These are
+// page furniture, not speech, and Breeze reads them as a stream of dashes.
+const DEFAULT_EXCLUSIONS = '^[-*_=~]{3,}$';
+
 const DEFAULTS = {
     enabled: true,
     auto: true,
@@ -694,6 +698,9 @@ const DEFAULTS = {
     voice_cast_prompt: DEFAULT_VOICE_CAST_PROMPT,
     identify_prompt: DEFAULT_IDENTIFY_PROMPT,
     identify_chunk: -1,   // paragraphs per identification call; -1 = whole message
+    exclusions: DEFAULT_EXCLUSIONS,  // one regex per line; matching lines are not spoken
+    switch_gap_ms: 0,     // deliberate pause when the voice changes
+    prefetch_ahead: 3,    // clips to keep warm ahead of the one playing
     cast: {},             // chatId -> { speaker: { voice, base, tone } }
     prompt_stamps: {},    // key -> hash of the default it was written from
 };
@@ -800,7 +807,36 @@ function splitLines(mes) {
     return String(mes ?? '')
         .split('\n')
         .map(line => line.replace(BLANK_EDGES, ''))
-        .filter(Boolean);
+        .filter(line => line && !isExcluded(line));
+}
+
+// Compiling on every line would be wasteful, and splitLines runs on every
+// repaint, so the compiled set is kept until the setting text itself changes.
+let compiledExclusions = { source: null, patterns: [] };
+
+function exclusionPatterns() {
+    const source = String(settings().exclusions ?? '');
+    if (compiledExclusions.source === source) return compiledExclusions.patterns;
+
+    const patterns = [];
+    for (const line of source.split('\n')) {
+        const pattern = line.trim();
+        if (!pattern) continue;
+        try {
+            patterns.push(new RegExp(pattern));
+        } catch (error) {
+            // One bad pattern must not silence the rest, or the whole message.
+            console.warn(`[Breeze Director] ignoring invalid exclusion /${pattern}/:`, error.message);
+        }
+    }
+
+    compiledExclusions = { source, patterns };
+    return patterns;
+}
+
+/** Is this line page furniture rather than something to read aloud? */
+function isExcluded(line) {
+    return exclusionPatterns().some(pattern => pattern.test(line));
 }
 
 /** A narration unit is one paragraph: exactly how TTS splits jobs by line. */
@@ -915,6 +951,20 @@ function voiceForSegment(segment, message) {
 }
 
 /**
+ * How long to wait before a clip, given what spoke last.
+ *
+ * A beat when the speaker changes; nothing when the same voice carries on, and
+ * nothing before the first clip. The default is zero, because the gap people
+ * actually hear is the involuntary one that warmAhead() exists to close, not a
+ * missing pause.
+ */
+function switchPause(lastVoice, nextVoice) {
+    const gap = Number(settings().switch_gap_ms) || 0;
+    if (gap <= 0 || !lastVoice || lastVoice === nextVoice) return 0;
+    return gap;
+}
+
+/**
  * The clips one paragraph plays, in order. Each carries a hint naming the
  * message and paragraph it came from, so the director returns that paragraph's
  * instruction outright instead of matching a fragment back to it.
@@ -951,6 +1001,13 @@ function getDirection(message) {
     const stored = message?.extra?.breeze_direction;
     if (!stored) return null;
     if ((stored.swipe_id ?? 0) !== (message.swipe_id ?? 0)) return null;
+
+    // Paragraphs are addressed by index, so a take with a different number of
+    // them belongs to different text — an edited message, or an exclusion added
+    // since. Regenerating beats reading paragraph four's direction over
+    // paragraph three.
+    if ((stored.lines?.length ?? 0) !== splitLines(message.mes).length) return null;
+
     return stored;
 }
 
@@ -1732,6 +1789,7 @@ const player = {
     units: [],        // paragraphs; each holds the clips it plays in order
     index: 0,         // paragraph
     clipIndex: 0,     // segment within the paragraph
+    lastVoice: null,  // what spoke last, so a change of speaker can be heard
     messageId: null,
     url: null,
     onChange: null,
@@ -1761,6 +1819,7 @@ const player = {
 
         this.index = Math.min(loadPosition(messageId), Math.max(this.units.length - 1, 0));
         this.clipIndex = 0;
+        this.lastVoice = null;
         return this.units;
     },
 
@@ -1788,6 +1847,13 @@ const player = {
         }
         if (token !== this.loadToken) return;
 
+        const pause = switchPause(this.lastVoice, wanted.voice);
+        if (pause) {
+            await new Promise(resolve => setTimeout(resolve, pause));
+            if (token !== this.loadToken) return;
+        }
+        this.lastVoice = wanted.voice;
+
         this.revoke();
         this.url = URL.createObjectURL(clip);
         this.audio.src = this.url;
@@ -1795,9 +1861,40 @@ const player = {
         await this.audio.play().catch(() => { });
         this.notify('playing');
 
-        // Warm whatever comes next: the rest of this paragraph, then the next.
-        const next = clips[clipIndex + 1] ?? this.units[index + 1]?.clips?.[0];
-        if (next) globalThis.breezeTts.prefetch(next.text, next.voice, next.hint);
+        this.warmAhead(index, clipIndex);
+    },
+
+    /**
+     * Keep the next few clips generating while this one plays.
+     *
+     * Warming only the next one is not enough: Breeze makes a clip at a time and
+     * takes seconds over it, so a short line leaves its successor unfinished and
+     * playback stalls waiting. Depth is what turns that stall into a queue that
+     * stays ahead of the reading.
+     *
+     * Sequential on purpose — the server handles one request at a time and
+     * answers 409 to the rest, so firing them together just burns retries.
+     */
+    warmAhead(index, clipIndex) {
+        const depth = Number(settings().prefetch_ahead) || 0;
+        if (depth < 1) return;
+
+        const upcoming = [];
+        let unit = index;
+        let clip = clipIndex + 1;
+        while (upcoming.length < depth && unit < this.units.length) {
+            const clips = this.units[unit].clips ?? [];
+            if (clip < clips.length) upcoming.push(clips[clip++]);
+            else { unit++; clip = 0; }
+        }
+
+        const token = this.loadToken;
+        return (async () => {
+            for (const next of upcoming) {
+                if (token !== this.loadToken) return;
+                await globalThis.breezeTts.prefetch(next.text, next.voice, next.hint);
+            }
+        })().catch(error => console.warn('[Breeze Director] warming ahead failed:', error));
     },
 
     next() { return this.playAt(this.index + 1); },
@@ -1817,6 +1914,7 @@ const player = {
     stop() {
         this.loadToken++;
         this.clipIndex = 0;
+        this.lastVoice = null;
         this.audio.pause();
         this.audio.removeAttribute('src');
         this.revoke();
@@ -2586,6 +2684,20 @@ const SETTINGS_HTML = `
       <small>-1 sends the whole message in one call, which gives the most context.
       Lower it only if long messages lose track of who is who.</small>
 
+      <label for="bd_exclusions">Never read lines matching (one regex per line):</label>
+      <textarea id="bd_exclusions" class="text_pole textarea_compact" rows="3"></textarea>
+      <input id="bd_exclusions_reset" class="menu_button" type="button" value="Reset exclusions">
+      <small>Matched against the trimmed line. The default catches horizontal rules
+      like <code>---</code>, which Breeze otherwise reads as a run of dashes.</small>
+
+      <label for="bd_switch_gap">Pause when the voice changes (ms):</label>
+      <input id="bd_switch_gap" type="number" min="0" max="3000" step="50" class="text_pole">
+
+      <label for="bd_prefetch_ahead">Clips to keep generating ahead during playback:</label>
+      <input id="bd_prefetch_ahead" type="number" min="0" max="20" step="1" class="text_pole">
+      <small>Breeze makes one clip at a time and takes seconds over it, so short lines
+      outrun a shallow queue and playback stalls. Raise this if you hear gaps.</small>
+
       <label for="bd_cfg">CFG scale:</label>
       <input id="bd_cfg" type="number" min="1" max="10" step="1" class="text_pole">
 
@@ -2658,6 +2770,9 @@ function bind() {
     field('#bd_cfg', 'cfg_scale', Number);
     field('#bd_tokens', 'max_tokens', Number);
     field('#bd_identify_chunk', 'identify_chunk', Number);
+    field('#bd_exclusions', 'exclusions');
+    field('#bd_switch_gap', 'switch_gap_ms', Number);
+    field('#bd_prefetch_ahead', 'prefetch_ahead', Number);
     field('#bd_identify_prompt', 'identify_prompt');
     field('#bd_prompt', 'prompt');
     field('#bd_voice_cast_prompt', 'voice_cast_prompt');
@@ -2716,6 +2831,12 @@ function bind() {
         $('#bd_prompt').val(DEFAULT_PROMPT);
         save();
         warn();
+    });
+
+    $('#bd_exclusions_reset').on('click', () => {
+        config.exclusions = DEFAULT_EXCLUSIONS;
+        $('#bd_exclusions').val(DEFAULT_EXCLUSIONS);
+        save();
     });
 
     $('#bd_identify_reset').on('click', () => {
