@@ -678,6 +678,10 @@ Already cast in this scene:
 {{list}}
 `;
 
+// Horizontal rules: --- *** ___ ===, and rows of tildes. Page furniture, not
+// speech, and Breeze reads them aloud as a run of dashes.
+const DEFAULT_EXCLUSIONS = '^[-*_=~]{3,}$';
+
 const DEFAULTS = {
     enabled: true,
     auto: true,
@@ -694,6 +698,8 @@ const DEFAULTS = {
     voice_cast_prompt: DEFAULT_VOICE_CAST_PROMPT,
     identify_prompt: DEFAULT_IDENTIFY_PROMPT,
     identify_chunk: -1,   // paragraphs per identification call; -1 = whole message
+    exclusions: DEFAULT_EXCLUSIONS,  // one regex per line; matching lines go unread
+    skip_tags: true,      // drop <tag>…</tag> blocks, as SillyTavern's own TTS does
     cast: {},             // chatId -> { speaker: { voice, base, tone } }
     prompt_stamps: {},    // key -> hash of the default it was written from
 };
@@ -797,10 +803,50 @@ const BLANK_EDGES = new RegExp(`^${BLANK.source}+|${BLANK.source}+$`, 'g');
  * and ST's own path finds them by matching text.
  */
 function splitLines(mes) {
-    return String(mes ?? '')
+    return readableText(mes)
         .split('\n')
         .map(line => line.replace(BLANK_EDGES, ''))
-        .filter(Boolean);
+        .filter(line => line && !isExcluded(line));
+}
+
+// Tag blocks can span lines, so they have to go before the text is split. The
+// pattern is SillyTavern's own (tts/index.js:682), so that checking this box
+// removes exactly what checking theirs would.
+const TAG_BLOCK = /<.*?>[\s\S]*?<\/.*?>/g;
+
+/** The message as it should be read aloud, with anything unspoken removed. */
+function readableText(mes) {
+    const text = String(mes ?? '');
+    return settings().skip_tags ? text.replace(TAG_BLOCK, '') : text;
+}
+
+// Compiling per line would be wasteful — splitLines runs on every repaint — so
+// the compiled set is kept until the setting text itself changes.
+let compiledExclusions = { source: null, patterns: [] };
+
+function exclusionPatterns() {
+    const source = String(settings().exclusions ?? '');
+    if (compiledExclusions.source === source) return compiledExclusions.patterns;
+
+    const patterns = [];
+    for (const line of source.split('\n')) {
+        const pattern = line.trim();
+        if (!pattern) continue;
+        try {
+            patterns.push(new RegExp(pattern));
+        } catch (error) {
+            // One bad pattern must not silence the rest, or the whole message.
+            console.warn(`[Breeze Director] ignoring invalid exclusion /${pattern}/:`, error.message);
+        }
+    }
+
+    compiledExclusions = { source, patterns };
+    return patterns;
+}
+
+/** Is this line page furniture rather than something to read aloud? */
+function isExcluded(line) {
+    return exclusionPatterns().some(pattern => pattern.test(line));
 }
 
 /** A narration unit is one paragraph: exactly how TTS splits jobs by line. */
@@ -862,11 +908,28 @@ function collectQuotes(layout) {
 
 const GENERIC_SPEAKERS = new Set(['', 'unknown', 'unclear', 'narrator', 'none', 'null', 'n/a']);
 
-/** Is this quote spoken by someone other than the message's own character? */
-function isForeignSpeaker(speaker, message) {
+/**
+ * Is this quote attributed to an actual someone?
+ *
+ * The message's own character and the user count: they speak as much as anyone
+ * else, and casting them means their dialogue gets a voice of its own rather
+ * than falling back to whatever the voice map happens to say.
+ *
+ * They also override the placeholder list, because a character really can be
+ * called Narrator — as one of these chats has — and dropping them as a
+ * placeholder would leave the person doing most of the talking uncast.
+ */
+function isNamedSpeaker(speaker, message) {
     const name = String(speaker ?? '').trim().toLowerCase();
-    if (!name || GENERIC_SPEAKERS.has(name)) return false;
-    return name !== String(message?.name ?? '').trim().toLowerCase();
+    if (!name) return false;
+
+    const context = ctx();
+    const known = [message?.name, context.name1, context.name2]
+        .map(value => String(value ?? '').trim().toLowerCase())
+        .filter(Boolean);
+    if (known.includes(name)) return true;
+
+    return !GENERIC_SPEAKERS.has(name);
 }
 
 /** A base voice's preset. Null rather than throwing: the voices JSON is hand-edited. */
@@ -946,11 +1009,45 @@ function clipsFor(message, line, messageId, paragraph) {
 // stay: in plaintext they are content, not markup.
 const normalize = s => String(s ?? '').replace(/["'`\u201C\u201D\u00AB\u00BB]/g, '').replace(/\s+/g, ' ').trim().toLowerCase();
 
+// ------------------------------------------------------------------- skipping
+// Paragraphs the reader has unchecked. Kept on the message rather than on a
+// take, so regenerating direction or restoring an earlier take leaves the
+// choice alone — it is about the text, not about how the text is read.
+
+/** Paragraph indices excluded from playback. */
+function skipped(message) {
+    return new Set(message?.extra?.breeze_skip ?? []);
+}
+
+function isSkipped(message, paragraph) {
+    return skipped(message).has(paragraph);
+}
+
+/** Include or exclude a paragraph, and persist it with the chat. */
+async function setSkipped(message, paragraph, skip) {
+    const set = skipped(message);
+    if (skip) set.add(paragraph);
+    else set.delete(paragraph);
+
+    message.extra = message.extra ?? {};
+    if (set.size) message.extra.breeze_skip = [...set].sort((a, b) => a - b);
+    else delete message.extra.breeze_skip;
+
+    await ctx().saveChat();
+}
+
 /** Stored direction, but only if it still belongs to the current swipe. */
 function getDirection(message) {
     const stored = message?.extra?.breeze_direction;
     if (!stored) return null;
     if ((stored.swipe_id ?? 0) !== (message.swipe_id ?? 0)) return null;
+
+    // Paragraphs are addressed by index, so a take with a different number of
+    // them belongs to different text — an edited message, or an exclusion or tag
+    // setting changed since. Regenerating beats reading paragraph four's
+    // direction over paragraph three.
+    if ((stored.lines?.length ?? 0) !== splitLines(message.mes).length) return null;
+
     return stored;
 }
 
@@ -1187,10 +1284,11 @@ async function generate(index, { quiet = true } = {}) {
                     const quote = quotes.find(q => q.paragraph === i && q.at === at);
                     const speaker = String(speakers[quote?.id] ?? '').trim();
                     entry.speaker = speaker || null;
-                    // Casting records the speaker; which base they speak
-                    // through is resolved at play time from the cast, so
-                    // editing it reaches messages already in the chat.
-                    if (isForeignSpeaker(speaker, message)) await castVoice(speaker, quotes);
+                    // Everyone named is cast, the character and the user
+                    // included. Which base they speak through is resolved at
+                    // play time from the cast, so editing it reaches messages
+                    // already in the chat.
+                    if (isNamedSpeaker(speaker, message)) await castVoice(speaker, quotes);
                 }
                 line.segments.push(entry);
             }
@@ -1303,10 +1401,11 @@ globalThis.breezeDirector = async function (text, voiceId, preset, hint) {
         }
     }
 
-    // The base's own instruction is the user's description of that voice. It is
-    // superseded by a cast member's, which describes someone specific, unless
-    // the user asked for the two to be combined.
-    const carried = (config.mode === 'append' && preset?.instruction) ? preset.instruction : '';
+    // The base's own instruction is the user's description of that voice. A cast
+    // member's description supersedes it, being about someone specific — but
+    // only if there is one. With nothing said about the speaker, dropping it
+    // would leave them sounding like nobody at all rather than like their base.
+    const carried = (config.mode === 'append' || !voiceLine) ? (preset?.instruction ?? '') : '';
     const instruction = [carried, voiceLine, line].map(part => String(part ?? '').trim())
         .filter(Boolean).join(' ');
     if (!instruction) return null;
@@ -1484,6 +1583,11 @@ function voiceInstruction(entry, cloned) {
     return sentence ? `${sentence}.` : '';
 }
 
+/** Has anything been said about how this speaker sounds? */
+function hasProfile(entry) {
+    return PROFILE_FIELDS.some(field => entry?.[field]);
+}
+
 /** What Breeze will be told for this cast member, for the sheet to show. */
 function castInstruction(entry) {
     const inherited = basePreset(entry.base);
@@ -1505,7 +1609,7 @@ function rememberSpeaker(speaker) {
 }
 
 /** Ask the director for this speaker's voice: a base to build on, and a description. */
-async function askCasting(speaker, quotes) {
+async function askCasting(speaker, quotes, base = null) {
     const config = settings();
     const breeze = globalThis.breezeTts;
     const available = breeze?.listVoices() ?? [];
@@ -1532,8 +1636,15 @@ async function askCasting(speaker, quotes) {
     const description = [card?.description, card?.personality]
         .map(v => String(v ?? '').trim()).filter(Boolean).join('\n\n');
 
+    const known = [];
+    if (description) known.push(`What is known of them:\n${description}`);
+    // When the base is already settled, say so: the description should fit the
+    // voice they will actually speak through.
+    if (base) known.push(`They already speak through the voice "${base}". Reply with that `
+        + 'same base, and describe them in a way that suits it.');
+
     let prompt = put(config.voice_cast_prompt, /{{speaker}}/g, speaker);
-    prompt = put(prompt, /{{context}}/g, description ? `\nWhat is known of them:\n${description}\n` : '');
+    prompt = put(prompt, /{{context}}/g, known.length ? `\n${known.join('\n\n')}\n` : '');
     prompt = put(prompt, /{{lines}}/g, spoken || '(none recorded)');
     prompt = put(prompt, /{{voices}}/g, available.map(name => `- ${name}`).join('\n'));
     prompt = put(prompt, /{{cast}}/g, roster ? put(CAST_BLOCK, /{{list}}/g, roster) : '');
@@ -1543,11 +1654,11 @@ async function askCasting(speaker, quotes) {
 
     // The model may quote the name or wrap it in a sentence; match generously.
     const wanted = String(parsed.base ?? '').trim().toLowerCase();
-    const base = available.find(name => name.toLowerCase() === wanted)
+    const chosen = available.find(name => name.toLowerCase() === wanted)
         ?? available.find(name => wanted.includes(name.toLowerCase()))
         ?? null;
 
-    return { base, profile: cleanProfile(parsed) };
+    return { base: chosen, profile: cleanProfile(parsed) };
 }
 
 /**
@@ -1568,28 +1679,39 @@ async function castVoice(speaker, quotes = []) {
         return base;
     };
 
-    // An edit in the cast sheet pins the entry, and pinning outranks everything.
-    if (entry.pinned && entry.base) return settle(entry.base);
+    // An edit in the cast sheet pins the entry. A bare pre-stage — a name with
+    // nothing on it yet — is the one thing still worth filling in.
+    if (entry.pinned && (entry.base || hasProfile(entry))) return settle(entry.base);
 
-    // Otherwise a hand-assigned voice-map entry beats anything decided here.
+    // A hand-assigned voice-map entry settles which voice they speak through.
+    // It says nothing about how they sound, though, so it fills the base and
+    // casting still runs for the description. Returning here was why the
+    // character — who nearly always has a voice-map entry — ended up on the
+    // sheet with a base and no description, while side characters got both.
     const mapped = breeze.voiceForCharacter(speaker);
-    if (mapped) {
+    if (mapped && !entry.base) {
         entry.base = mapped;
         entry.source = 'voicemap';
-        return settle(mapped);
     }
 
-    if (entry.base && breeze.hasVoice(entry.base)) return settle(entry.base);
+    // Already described: nothing left to decide.
+    if (entry.base && breeze.hasVoice(entry.base) && hasProfile(entry)) {
+        return settle(entry.base);
+    }
 
     if (castJobs.has(speaker)) return castJobs.get(speaker);
 
     const pending = (async () => {
-        const casting = await askCasting(speaker, quotes);
-        if (casting?.base) entry.base = casting.base;
+        const casting = await askCasting(speaker, quotes, entry.base);
+        // A base already chosen — by the voice map or by hand — outranks the
+        // model's; it only fills a gap.
+        if (casting?.base && !entry.base) {
+            entry.base = casting.base;
+            delete entry.source;
+        }
         for (const field of PROFILE_FIELDS) {
             if (!entry[field] && casting?.profile?.[field]) entry[field] = casting.profile[field];
         }
-        delete entry.source;
         return entry.base;
     })()
         .then(base => {
@@ -1633,7 +1755,7 @@ async function castMessage(index) {
 
     const cast = [];
     for (const quote of quotes) {
-        if (!isForeignSpeaker(quote.speaker, message) || cast.includes(quote.speaker)) continue;
+        if (!isNamedSpeaker(quote.speaker, message) || cast.includes(quote.speaker)) continue;
         cast.push(quote.speaker);
         await castVoice(quote.speaker, quotes);
     }
@@ -1662,9 +1784,11 @@ async function prefetchMessage(index) {
 
     const direction = getDirection(message);
     const units = buildUnits(message.mes);
+    const excluded = skipped(message);
 
     let made = 0;
     for (let i = 0; i < units.length; i++) {
+        if (excluded.has(i)) continue;
         for (const clip of clipsFor(message, direction?.lines?.[i] ?? units[i], index, i)) {
             if (!clip.voice) continue;
             if (await breeze.prefetch(clip.text, clip.voice, clip.hint)) made++;
@@ -1775,9 +1899,14 @@ const player = {
         // Paragraph-granular units keep resume keys and panel rows unchanged;
         // the voice switching lives inside each unit's clip list.
         const direction = getDirection(message);
+        const excluded = skipped(message);
         this.units = buildUnits(message.mes).map((unit, i) => ({
             text: unit.text,
-            clips: clipsFor(message, direction?.lines?.[i] ?? unit, messageId, i).filter(c => c.voice),
+            // An unchecked paragraph has nothing to play; playAt() and
+            // nextPosition() already step over a unit with no clips.
+            clips: excluded.has(i)
+                ? []
+                : clipsFor(message, direction?.lines?.[i] ?? unit, messageId, i).filter(c => c.voice),
         }));
 
         this.index = Math.min(loadPosition(messageId), Math.max(this.units.length - 1, 0));
@@ -2039,6 +2168,7 @@ async function openPanel(messageId, { play = false, expandAll = false } = {}) {
         const units = buildUnits(message.mes);
         const lines = takeLines();
         const editable = viewing === 0;
+        const excluded = skipped(message);
 
         // The exact clip on air, so the panel can name the voice reading it.
         const active = playingIndex >= 0 && player.messageId === messageId
@@ -2054,6 +2184,24 @@ async function openPanel(messageId, { play = false, expandAll = false } = {}) {
             const headRow = document.createElement('div');
             headRow.style.cssText = 'display:flex;gap:0.4em;align-items:flex-start;cursor:pointer;';
 
+            // Checked means read aloud. Everything starts checked; unchecking
+            // is how a paragraph is left out of playback without editing it.
+            const include = document.createElement('input');
+            include.type = 'checkbox';
+            include.checked = !excluded.has(i);
+            include.title = include.checked
+                ? 'Read this paragraph aloud'
+                : 'Skipped — not read aloud';
+            include.style.cssText = 'margin:0.35em 0 0 0;flex:0 0 auto;cursor:pointer;';
+            include.addEventListener('click', event => event.stopPropagation());
+            include.addEventListener('change', async () => {
+                await setSkipped(message, i, !include.checked);
+                // Reload if this message is on air, so the change takes effect
+                // without having to stop and start again.
+                if (player.messageId === messageId) await player.load(messageId);
+                repaint(state, playingIndex);
+            });
+
             const chevron = document.createElement('div');
             chevron.className = `fa-solid ${expanded.has(i) ? 'fa-chevron-down' : 'fa-chevron-right'}`;
             chevron.style.cssText = 'opacity:0.6;padding-top:0.25em;min-width:1em;';
@@ -2064,18 +2212,28 @@ async function openPanel(messageId, { play = false, expandAll = false } = {}) {
             if (!expanded.has(i)) {
                 text.style.cssText += 'white-space:nowrap;overflow:hidden;text-overflow:ellipsis;';
             }
+            if (excluded.has(i)) {
+                text.style.opacity = '0.45';
+                text.style.textDecoration = 'line-through';
+            }
             if (i === playingIndex) text.style.fontWeight = 'bold';
 
             const playOne = document.createElement('div');
             playOne.className = 'fa-solid fa-play';
             playOne.title = 'Play from here';
             playOne.style.cssText = 'opacity:0.6;padding-top:0.25em;cursor:pointer;';
-            playOne.addEventListener('click', event => {
+            playOne.addEventListener('click', async event => {
                 event.stopPropagation();
+                // Asking for a skipped paragraph is asking to hear it, so put it
+                // back rather than starting at the next one that is included.
+                if (excluded.has(i)) {
+                    await setSkipped(message, i, false);
+                    repaint(state, playingIndex);
+                }
                 playFrom(messageId, i);
             });
 
-            headRow.append(chevron, text, playOne);
+            headRow.append(include, chevron, text, playOne);
             headRow.addEventListener('click', () => {
                 expanded.has(i) ? expanded.delete(i) : expanded.add(i);
                 repaint(state, playingIndex);
@@ -2142,6 +2300,8 @@ async function openPanel(messageId, { play = false, expandAll = false } = {}) {
                 ? `Generating audio for paragraph ${playingIndex + 1}…${who}`
                 : playingIndex >= 0
                     ? `Paragraph ${playingIndex + 1} of ${units.length} — ${state}${who}`
+                    : excluded.size
+                    ? `${units.length} paragraphs, ${excluded.size} skipped`
                     : `${units.length} paragraphs`;
     }
 
@@ -2561,7 +2721,9 @@ async function openCastSheet() {
             const instruction = castInstruction(entry);
             built.textContent = instruction
                 ? `Breeze hears: ${instruction}`
-                : 'Nothing to send yet — pick a base voice or describe their tone.';
+                : entry.base
+                    ? `Reads as "${entry.base}" is written. Describe them to set them apart.`
+                    : 'Nothing to send yet — pick a base voice or describe their tone.';
             row.append(built);
 
             list.append(row);
@@ -2701,6 +2863,15 @@ const SETTINGS_HTML = `
       <small>-1 sends the whole message in one call, which gives the most context.
       Lower it only if long messages lose track of who is who.</small>
 
+      <label class="checkbox_label"><input id="bd_skip_tags" type="checkbox"> Skip
+      <code>&lt;tag&gt;…&lt;/tag&gt;</code> blocks, as SillyTavern's own TTS does</label>
+
+      <label for="bd_exclusions">Never read lines matching (one regex per line):</label>
+      <textarea id="bd_exclusions" class="text_pole textarea_compact" rows="3"></textarea>
+      <input id="bd_exclusions_reset" class="menu_button" type="button" value="Reset exclusions">
+      <small>Matched against the trimmed line. The default catches horizontal rules
+      like <code>---</code>, which Breeze otherwise reads as a run of dashes.</small>
+
       <label for="bd_cfg">CFG scale:</label>
       <input id="bd_cfg" type="number" min="1" max="10" step="1" class="text_pole">
 
@@ -2773,6 +2944,8 @@ function bind() {
     field('#bd_cfg', 'cfg_scale', Number);
     field('#bd_tokens', 'max_tokens', Number);
     field('#bd_identify_chunk', 'identify_chunk', Number);
+    field('#bd_exclusions', 'exclusions');
+    checkbox('#bd_skip_tags', 'skip_tags');
     field('#bd_identify_prompt', 'identify_prompt');
     field('#bd_prompt', 'prompt');
     field('#bd_voice_cast_prompt', 'voice_cast_prompt');
@@ -2831,6 +3004,12 @@ function bind() {
         $('#bd_prompt').val(DEFAULT_PROMPT);
         save();
         warn();
+    });
+
+    $('#bd_exclusions_reset').on('click', () => {
+        config.exclusions = DEFAULT_EXCLUSIONS;
+        $('#bd_exclusions').val(DEFAULT_EXCLUSIONS);
+        save();
     });
 
     $('#bd_identify_reset').on('click', () => {

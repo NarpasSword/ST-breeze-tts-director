@@ -251,8 +251,10 @@ two are composed into an instruction at the moment a line is generated, by
 
 The composed instruction is, in order:
 
-1. the base's own instruction, **only** when `mode` is `append` — a base
-   describes a voice, and a cast member's description supersedes it;
+1. the base's own instruction, when `mode` is `append` **or when the speaker has
+   no description of their own** — a cast member's description supersedes the
+   base's, but only if there is one; dropping it otherwise would leave them
+   sounding like nobody rather than like their base;
 2. `voiceInstruction(castEntry, cloned)`, the speaker's own description, with
    identity words dropped when the base is a clone;
 3. the paragraph's delivery direction.
@@ -270,10 +272,55 @@ per speaker with `addVoice()`. It worked, but it meant the extension owned
 entries in a list the user curates, and the two drifted. `castEntry()` migrates
 those old entries by reading their derived `voice` as a `base`.
 
+### What never gets read
+
+Three filters, applied in order inside `splitLines()`:
+
+1. **Tag blocks.** `skip_tags` (on by default) drops `<tag>…</tag>` using
+   SillyTavern's own pattern (`tts/index.js:682`), so ticking this box removes
+   exactly what ticking theirs would. It runs on the whole message before
+   splitting, because a tag block can span lines.
+2. **Blank-looking lines**, as described above.
+3. **Exclusions.** `exclusions` is a newline-separated list of regexes; any line
+   matching one is dropped. The default is `^[-*_=~]{3,}$` — horizontal rules,
+   which Breeze otherwise reads aloud as a run of dashes. Patterns match the
+   **trimmed** line, are compiled once and cached until the setting text
+   changes, and one that fails to compile is logged and skipped rather than
+   silencing the message.
+
+All three change what paragraph three means, and paragraphs are addressed by
+index, so `getDirection()` drops a stored take whose line count no longer
+matches the message. That also covers an edited message, which would otherwise
+read one paragraph's direction over another.
+
+### Skipping paragraphs
+
+Each row in the message panel has a checkbox. Checked means read aloud, and
+everything starts checked; unchecking leaves a paragraph out of playback without
+editing the message.
+
+The indices live on `message.extra.breeze_skip`, **not** on a take. Regenerating
+direction or restoring an earlier one leaves the choice alone, because it is
+about the text rather than about how the text is read. The field is deleted when
+nothing is skipped, so a chat that never uses the feature carries nothing extra.
+
+`player.load()` gives a skipped paragraph no clips, and `playAt()` and
+`nextPosition()` already step over a unit with none, so nothing else in the
+player needed to know. `prefetchMessage()` skips them too — there is no sense
+generating audio nobody will hear. Pressing play on a skipped paragraph checks
+it again first, since asking to hear it is asking for it back.
+
 ### Casting a quoted speaker
 
 `castVoice()` is only ever called for a speaker `isForeignSpeaker()` accepts.
 Resolution order, each step falling through on failure:
+
+Everyone named is cast, **including the message's own character and the user**.
+`isNamedSpeaker()` is the gate, and it treats those two as speakers even when
+their name is one of `GENERIC_SPEAKERS`: a character really can be called
+Narrator, and dropping them as a placeholder would leave the person doing most
+of the talking uncast. A stray `"narrator"` attribution in a chat whose
+character is called something else is still ignored.
 
 0. `rememberSpeaker()` — **before anything else**, the speaker is written onto
    the cast sheet with whatever profile identification gave. Everything below
@@ -282,13 +329,21 @@ Resolution order, each step falling through on failure:
 1. `entry.pinned` — set by any edit in the cast sheet, and it outranks even the
    voice map, because the edit was an explicit choice.
 2. `breezeTts.voiceForCharacter(speaker)` — a hand-assigned voice-map entry
-   otherwise beats the director. The entry records it with
-   `source: 'voicemap'`, so the sheet still lists the speaker.
-3. The chat's cast cache.
+   settles the **base** and is recorded with `source: 'voicemap'`. It does not
+   end the casting: a voice-map entry says which voice someone speaks through,
+   not how they sound, so `askCasting()` still runs for the description.
+
+   Returning here was a real bug. `{{char}}` nearly always has a voice-map
+   entry, so the character sat on the sheet with a base and no description while
+   side characters — who have none — got the full treatment.
+3. The chat's cast cache, when the entry already has both a base and a
+   description (`hasProfile()`). A base alone is not a description.
 4. `askCasting()` answers with both a **base voice** and a **profile**, shown the
    speaker's card text, their own lines, the available voices and the running
    cast. This is the only call that describes a voice, and it runs once per
-   speaker.
+   speaker. When the base is already settled it is named in the prompt, so the
+   description suits the voice they will actually speak through, and the model's
+   own base choice only fills a gap.
 5. The base and profile are stored on the cast entry. Nothing is written to the
    provider. Several characters may share a base — the profile is what tells
    them apart.
