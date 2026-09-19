@@ -238,6 +238,7 @@ globalThis.breezeTts = {
     listVoices() { return this._provider?.listVoices() ?? []; },
     hasVoice(name) { return this._provider?.hasVoice(name) ?? false; },
     voiceForCharacter(character) { return this._provider?.voiceForCharacter(character) ?? null; },
+    assignedVoice(character) { return this._provider?.assignedVoice(character) ?? null; },
     prefetch(text, voice, hint) { return this._provider?.prefetch(text, voice, hint) ?? Promise.resolve(false); },
     getClip(text, voice, hint) { return this._provider?._clip(text, voice, hint); },
     cacheStats() { return cache.stats(); },
@@ -563,6 +564,20 @@ class BreezeTtsProvider {
         return this._presets()[name] ?? null;
     }
 
+    /**
+     * The voice a character was *explicitly* given in the voice map.
+     *
+     * Distinct from voiceForCharacter() below, which follows [Default Voice] to
+     * whatever it points at. SillyTavern gives every character that marker
+     * until someone picks otherwise (tts/index.js:1525), so following it here
+     * would read "nobody chose a voice for them" as "the user chose this one".
+     */
+    assignedVoice(character) {
+        const value = (this.settings.voiceMap ?? {})[character];
+        if (!value || value === 'disabled' || value === DEFAULT_VOICE_MARKER) return null;
+        return this.hasVoice(value) ? value : null;
+    }
+
     /** Resolve which voice a character narrates with, following the default marker. */
     voiceForCharacter(character) {
         const map = this.settings.voiceMap ?? {};
@@ -651,7 +666,7 @@ genuinely does not say.
 Reply with ONLY a JSON object mapping each label to a name, no commentary, no code fences:
 {"Q1": "name", "Q2": "name"}`;
 
-const DEFAULT_VOICE_CAST_PROMPT = `Describe a character's voice, and choose an existing voice to build it on.
+const DEFAULT_VOICE_CAST_PROMPT = `Cast a speaking voice for one character.
 
 Character: {{speaker}}
 {{context}}
@@ -661,13 +676,19 @@ Lines they speak:
 Available base voices:
 {{voices}}
 {{cast}}
-Pick the closest base from the list. Several characters may share one, since your
-description is what tells them apart. If this character is someone already cast under
-a different name, reuse their base.
+First choose a base: the voice on that list whose sound is nearest theirs. Match on
+apparent gender first, then age, then texture. Several characters may share a base —
+your description is what tells them apart — so choose on sound alone, never on who
+has been cast already or on where a voice sits in the list.
 
-Then describe their voice: apparent gender, approximate age, the tone and manner of
-their speech, and an accent only if there is a basis for one. Leave a field as ""
-when there is no basis — do not invent.
+Then describe the voice itself:
+  gender  — as the description or their lines give it
+  age     — approximate, such as "late teens" or "forties"
+  tone    — ONE sentence: pitch, texture, pace, and their habitual manner of speaking
+  accent  — only where there is a clear basis for one
+
+Leave a field as "" when nothing supports it. Do not invent. Describe how they sound,
+not how they look, what they have done, or what is happening to them.
 
 Reply with ONLY a JSON object, no commentary, no code fences:
 {"base": "<a voice name from the list>", "gender": "", "age": "", "tone": "", "accent": ""}`;
@@ -676,6 +697,8 @@ Reply with ONLY a JSON object, no commentary, no code fences:
 const CAST_BLOCK = `
 Already cast in this scene:
 {{list}}
+
+Reuse one of those bases only if this is the same person under another name.
 `;
 
 // Horizontal rules: --- *** ___ ===, and rows of tildes. Page furniture, not
@@ -1414,10 +1437,30 @@ globalThis.breezeDirector = async function (text, voiceId, preset, hint) {
     return { instruction, cfg_scale: preset?.cfg_scale ?? Number(config.cfg_scale) };
 };
 
-/** The character card for a name, when the chat has one. */
+/** The character card for a name, matched forgivingly — the model supplies it. */
 function cardFor(name) {
-    const characters = ctx().characters ?? [];
-    return characters.find(c => c.name === name) ?? null;
+    const wanted = String(name ?? '').trim().toLowerCase();
+    if (!wanted) return null;
+    return (ctx().characters ?? [])
+        .find(card => String(card?.name ?? '').trim().toLowerCase() === wanted) ?? null;
+}
+
+/**
+ * What a character card says about who someone is.
+ *
+ * Reads the v1 fields and the v2 `data` ones, as SillyTavern itself does
+ * (`slash-commands.js:5541`); a card written to the v2 spec leaves the top-level
+ * fields empty, and reading only those found nothing to describe them with.
+ */
+function cardText(name) {
+    const card = cardFor(name);
+    if (!card) return '';
+
+    const data = card.data ?? {};
+    return [
+        card.description || data.description,
+        card.personality || data.personality,
+    ].map(value => String(value ?? '').trim()).filter(Boolean).join('\n\n');
 }
 
 // -------------------------------------------------------------- cast storage
@@ -1632,12 +1675,16 @@ async function askCasting(speaker, quotes, base = null) {
         })
         .join('\n');
 
-    const card = cardFor(speaker);
-    const description = [card?.description, card?.personality]
-        .map(v => String(v ?? '').trim()).filter(Boolean).join('\n\n');
-
     const known = [];
-    if (description) known.push(`What is known of them:\n${description}`);
+
+    // The card is the best evidence there is about how someone sounds, and for
+    // the chat's own character it is usually the only evidence, since their
+    // lines are being read by the narrator rather than described.
+    const description = cardText(speaker);
+    if (description) known.push(`Their character description:\n${description}`);
+    else console.info(`[Breeze Director] no character card for "${speaker}"; `
+        + 'casting from their lines alone.');
+
     // When the base is already settled, say so: the description should fit the
     // voice they will actually speak through.
     if (base) known.push(`They already speak through the voice "${base}". Reply with that `
@@ -1683,12 +1730,13 @@ async function castVoice(speaker, quotes = []) {
     // nothing on it yet — is the one thing still worth filling in.
     if (entry.pinned && (entry.base || hasProfile(entry))) return settle(entry.base);
 
-    // A hand-assigned voice-map entry settles which voice they speak through.
-    // It says nothing about how they sound, though, so it fills the base and
-    // casting still runs for the description. Returning here was why the
-    // character — who nearly always has a voice-map entry — ended up on the
-    // sheet with a base and no description, while side characters got both.
-    const mapped = breeze.voiceForCharacter(speaker);
+    // A voice-map entry settles which voice they speak through, but says nothing
+    // about how they sound, so it fills the base and casting still runs for the
+    // description. Only an explicit assignment counts: SillyTavern marks every
+    // character [Default Voice] until someone chooses, and taking that as a
+    // choice pinned every character to whatever the default pointed at — which
+    // is what made the director look like it always picked the same base.
+    const mapped = breeze.assignedVoice(speaker);
     if (mapped && !entry.base) {
         entry.base = mapped;
         entry.source = 'voicemap';
