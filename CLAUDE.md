@@ -42,6 +42,19 @@ Consequence: `manifest.json` `loading_order` must stay **above** the provider's
 
 ## Install / iterate
 
+Before deploying, smoke-test the file:
+
+```
+gjs tools/smoke.js index.js
+```
+
+It loads `index.js` under stubs for the browser and SillyTavern globals and runs
+the jQuery ready handler. **Run it after every edit.** Anything that throws at
+module eval or inside `bind()` aborts the rest of the file, so the extension
+disappears from the UI entirely — no panel, no buttons, no listeners — with the
+only clue in the browser console. A syntax check alone will not catch it: a
+missing top-level `const` parses fine and throws at eval.
+
 No build. Deploy by putting the folder where SillyTavern serves per-user
 extensions, then hard-reload the browser:
 

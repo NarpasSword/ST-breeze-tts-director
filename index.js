@@ -61,6 +61,18 @@ Already cast in this scene:
 {{list}}
 `;
 
+const DEFAULT_VOICE_PROMPT = `Design a speaking voice for the character below.
+
+Write ONE sentence describing the voice itself: apparent age, texture, pitch, accent if the
+description implies one, and their default manner of speaking.
+Describe the voice only — no plot, no backstory, no character name.
+Output the sentence and nothing else.
+
+Name: {{char}}
+
+Description:
+{{description}}`;
+
 const DEFAULTS = {
     enabled: true,
     auto: true,
