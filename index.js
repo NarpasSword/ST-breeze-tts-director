@@ -1,16 +1,599 @@
-// SillyTavern/data/narpas/extensions/breeze-director/index.js
+// SillyTavern extension: Breeze TTS, Director & Player.
 //
-// Breeze Director & Player. Two halves of one extension:
-//   Director - LLM-written per-paragraph delivery instructions, voice design
-//              from character cards, and audio pre-generation.
-//   Player   - paragraph-by-paragraph playback with seek and resume.
-// Both share the narration-unit splitting below, which mirrors the TTS
-// extension's own, so one unit here is exactly one generated clip.
+// One extension, three halves that were once three folders:
 //
-// Settings live under two keys, breeze_director and breeze_player, so configs
-// saved when these were separate extensions carry over unchanged.
+//   Provider — registers "Breeze" in the TTS provider dropdown, wraps its raw
+//              PCM in WAV, caches clips in IndexedDB, and publishes
+//              globalThis.breezeTts.
+//   Director — an LLM call per message writes per-paragraph delivery direction,
+//              another works out who speaks each quote, and each speaker is
+//              cast a voice of their own.
+//   Player   — an inline panel per message: paragraph seek, resume, take
+//              history, per-segment voice overrides.
 //
-// Requires: ../breeze-tts/index.js  (the provider, registers globalThis.breezeTts)
+// The two halves still talk through globalThis.breezeTts and
+// globalThis.breezeDirector rather than calling each other directly. That
+// boundary is worth keeping: the provider must work with no director present,
+// and the director must tolerate a provider that is absent or older.
+//
+// They were separate extensions until they drifted apart once too often — a
+// director deployed against a months-old provider fails silently, because an
+// exception inside casting is indistinguishable from the model declining.
+// Shipping them together removes that failure mode entirely.
+import { registerTtsProvider, getPreviewString, saveTtsProviderSettings, initVoiceMap } from '../../tts/index.js';
+
+// ===========================================================================
+// PROVIDER
+// ===========================================================================
+
+
+const SAMPLE_RATE = 24000; // Breeze streams mono s16le at 24 kHz
+const BYTES_PER_SAMPLE = 2;
+const DEFAULT_VOICE_MARKER = '[Default Voice]';
+
+const DEFAULT_VOICES = {
+    'narrator': {
+        instruction: 'A calm, warm narrator with clear diction and unhurried pacing.',
+        cfg_scale: 4,
+    },
+    'villain': {
+        instruction: 'A gravelly older man, menacing and slow, with a hint of amusement.',
+        cfg_scale: 4,
+    },
+};
+
+/** Wrap raw PCM bytes in a 44-byte WAV header so the browser can play them. */
+function toWav(pcm) {
+    const length = pcm.size ?? pcm.byteLength;
+    const header = new ArrayBuffer(44);
+    const view = new DataView(header);
+    const str = (offset, text) => {
+        for (let i = 0; i < text.length; i++) view.setUint8(offset + i, text.charCodeAt(i));
+    };
+    const byteRate = SAMPLE_RATE * BYTES_PER_SAMPLE;
+
+    str(0, 'RIFF');
+    view.setUint32(4, 36 + length, true);
+    str(8, 'WAVE');
+    str(12, 'fmt ');
+    view.setUint32(16, 16, true);
+    view.setUint16(20, 1, true);            // PCM
+    view.setUint16(22, 1, true);            // mono
+    view.setUint32(24, SAMPLE_RATE, true);
+    view.setUint32(28, byteRate, true);
+    view.setUint16(32, BYTES_PER_SAMPLE, true);
+    view.setUint16(34, 16, true);
+    str(36, 'data');
+    view.setUint32(40, length, true);
+
+    return new Blob([header, pcm], { type: 'audio/wav' });
+}
+
+// ------------------------------------------------------------------ clip cache
+// IndexedDB rather than the chat file: audio is far too big to ride along in
+// chat JSON, and this survives reloads without bloating exports.
+
+const DB_NAME = 'breeze-tts';
+const STORE = 'clips';
+const DB_VERSION = 2; // v2 adds the voiceText index
+let dbPromise = null;
+
+function db() {
+    if (!dbPromise) {
+        dbPromise = new Promise((resolve, reject) => {
+            const request = indexedDB.open(DB_NAME, DB_VERSION);
+            request.onupgradeneeded = () => {
+                const database = request.result;
+                const store = database.objectStoreNames.contains(STORE)
+                    ? request.transaction.objectStore(STORE)
+                    : database.createObjectStore(STORE, { keyPath: 'key' });
+                if (!store.indexNames.contains('ts')) store.createIndex('ts', 'ts');
+                // The primary key folds in the instruction, so erasing the audio
+                // for one message needs a second way in. Rows written before v2
+                // carry no voice/text, stay out of this index, and age out via LRU.
+                if (!store.indexNames.contains('voiceText')) {
+                    store.createIndex('voiceText', ['voice', 'text']);
+                }
+            };
+            request.onsuccess = () => resolve(request.result);
+            request.onerror = () => reject(request.error);
+        });
+    }
+    return dbPromise;
+}
+
+function tx(mode, run) {
+    return db().then(database => new Promise((resolve, reject) => {
+        const transaction = database.transaction(STORE, mode);
+        const request = run(transaction.objectStore(STORE));
+        transaction.onerror = () => reject(transaction.error);
+        if (request) {
+            request.onsuccess = () => resolve(request.result);
+            request.onerror = () => reject(request.error);
+        } else {
+            transaction.oncomplete = () => resolve();
+        }
+    }));
+}
+
+const cache = {
+    async get(key) {
+        try {
+            const row = await tx('readonly', store => store.get(key));
+            if (!row) return null;
+            // Refresh recency without blocking the caller.
+            tx('readwrite', store => store.put({ ...row, ts: Date.now() })).catch(() => { });
+            return row.blob;
+        } catch (error) {
+            console.warn('[Breeze] cache read failed:', error);
+            return null;
+        }
+    },
+    async put(key, blob, limit, meta = {}) {
+        try {
+            await tx('readwrite', store => store.put({
+                key, blob, ts: Date.now(), voice: meta.voice ?? '', text: meta.text ?? '',
+            }));
+            await cache.evict(limit);
+        } catch (error) {
+            console.warn('[Breeze] cache write failed:', error);
+        }
+    },
+    async evict(limit) {
+        const total = await cache.count();
+        if (total <= limit) return;
+        const excess = total - limit;
+        await tx('readwrite', store => {
+            let removed = 0;
+            const cursorRequest = store.index('ts').openCursor();
+            cursorRequest.onsuccess = () => {
+                const cursor = cursorRequest.result;
+                if (!cursor || removed >= excess) return;
+                cursor.delete();
+                removed++;
+                cursor.continue();
+            };
+            return null;
+        });
+    },
+    count() {
+        return tx('readonly', store => store.count()).catch(() => 0);
+    },
+    /** Clip count and total bytes on disk. */
+    async stats() {
+        try {
+            const database = await db();
+            return await new Promise((resolve, reject) => {
+                const transaction = database.transaction(STORE, 'readonly');
+                const request = transaction.objectStore(STORE).openCursor();
+                let count = 0;
+                let bytes = 0;
+                request.onsuccess = () => {
+                    const cursor = request.result;
+                    if (!cursor) return resolve({ count, bytes });
+                    count++;
+                    bytes += cursor.value?.blob?.size ?? 0;
+                    cursor.continue();
+                };
+                request.onerror = () => reject(request.error);
+            });
+        } catch {
+            return { count: 0, bytes: 0 };
+        }
+    },
+    /** Delete every cached clip for these lines in this voice, whatever the instruction. */
+    async dropMany(voice, texts) {
+        let count = 0;
+        let bytes = 0;
+        try {
+            const database = await db();
+            await new Promise((resolve, reject) => {
+                const transaction = database.transaction(STORE, 'readwrite');
+                const index = transaction.objectStore(STORE).index('voiceText');
+                transaction.oncomplete = () => resolve();
+                transaction.onerror = () => reject(transaction.error);
+
+                for (const text of new Set(texts)) {
+                    const cursorRequest = index.openCursor(IDBKeyRange.only([voice, text]));
+                    cursorRequest.onsuccess = () => {
+                        const cursor = cursorRequest.result;
+                        if (!cursor) return;
+                        count++;
+                        bytes += cursor.value?.blob?.size ?? 0;
+                        cursor.delete();
+                        cursor.continue();
+                    };
+                }
+            });
+        } catch (error) {
+            console.warn('[Breeze] cache drop failed:', error);
+        }
+        return { count, bytes };
+    },
+    clear() {
+        return tx('readwrite', store => store.clear());
+    },
+};
+
+// ------------------------------------------------------------------ public API
+// Declared before the provider class: registerTtsProvider() constructs and loads
+// the provider during the register call, so anything bound afterwards is too late.
+
+globalThis.breezeTts = {
+    _provider: null,
+    _bind(provider) { this._provider = provider; },
+    get available() { return !!this._provider; },
+    listVoices() { return this._provider?.listVoices() ?? []; },
+    hasVoice(name) { return this._provider?.hasVoice(name) ?? false; },
+    addVoice(name, preset) { return this._provider?.addVoice(name, preset); },
+    assignVoice(character, voice) { return this._provider?.assignVoice(character, voice); },
+    voiceForCharacter(character) { return this._provider?.voiceForCharacter(character) ?? null; },
+    prefetch(text, voice, hint) { return this._provider?.prefetch(text, voice, hint) ?? Promise.resolve(false); },
+    getClip(text, voice, hint) { return this._provider?._clip(text, voice, hint); },
+    cacheCount() { return cache.count(); },
+    cacheStats() { return cache.stats(); },
+    preview(voice) { return this._provider?.previewTtsVoice(voice); },
+    /** A copy of a voice's raw preset, for deriving another voice from it. */
+    voicePreset(name) {
+        const preset = this._provider?.voicePreset(name);
+        return preset ? { ...preset } : null;
+    },
+    dropClips(texts, voice) { return cache.dropMany(voice, texts); },
+    clearCache() { return cache.clear(); },
+};
+
+// ------------------------------------------------------------------- provider
+
+class BreezeTtsProvider {
+    constructor() {
+        globalThis.breezeTts._bind(this);
+    }
+
+    settings;
+    voices = [];
+    ready = false;
+    separator = ' . ';
+    audioElement = document.createElement('audio');
+    _pending = new Map();
+
+    defaultSettings = {
+        voiceMap: {},
+        provider_endpoint: 'http://127.0.0.1:7860',
+        voices_json: JSON.stringify(DEFAULT_VOICES, null, 2),
+        chunk_ms: 0,
+        seed: 42,
+        cache_enabled: true,
+        cache_max: 500,
+    };
+
+    get settingsHtml() {
+        return `
+        <label for="breeze_endpoint">Breeze API Endpoint:</label>
+        <input id="breeze_endpoint" type="text" class="text_pole"/>
+
+        <label for="breeze_seed">Seed:</label>
+        <input id="breeze_seed" type="number" class="text_pole"/>
+
+        <label for="breeze_chunk">Stream chunk size (ms, 0 = wait for full clip):</label>
+        <input id="breeze_chunk" type="number" min="0" step="100" class="text_pole"/>
+        <small>Streaming disables the clip cache and can sound seamed. 0 is recommended.</small>
+
+        <label class="checkbox_label">
+            <input id="breeze_cache" type="checkbox"> Cache generated clips
+        </label>
+        <label for="breeze_cache_max">Max cached clips:</label>
+        <input id="breeze_cache_max" type="number" min="0" step="50" class="text_pole"/>
+        <div class="flex-container">
+            <input id="breeze_cache_clear" class="menu_button" type="button" value="Clear cache"/>
+            <span id="breeze_cache_count" class="flex1"></span>
+        </div>
+
+        <label for="breeze_voices">Voices (JSON):</label>
+        <small>Each key is a voice name. Fields: <code>instruction</code>, <code>cfg_scale</code>,
+        <code>ref_audio_url</code>, <code>ref_text</code>, <code>dynamic</code>.</small>
+        <textarea id="breeze_voices" class="text_pole textarea_compact" rows="14"></textarea>
+        <div id="breeze_status"></div>`;
+    }
+
+    async loadSettings(settings) {
+        this.settings = Object.assign({}, this.defaultSettings);
+        for (const key in settings) {
+            if (key in this.settings) this.settings[key] = settings[key];
+        }
+
+        $('#breeze_endpoint').val(this.settings.provider_endpoint).on('input', () => this.onSettingsChange());
+        $('#breeze_seed').val(this.settings.seed).on('input', () => this.onSettingsChange());
+        $('#breeze_chunk').val(this.settings.chunk_ms).on('input', () => this.onSettingsChange());
+        $('#breeze_cache').prop('checked', this.settings.cache_enabled).on('change', () => this.onSettingsChange());
+        $('#breeze_cache_max').val(this.settings.cache_max).on('input', () => this.onSettingsChange());
+        $('#breeze_voices').val(this.settings.voices_json).on('input', () => this.onSettingsChange());
+        $('#breeze_cache_clear').on('click', async () => {
+            await cache.clear();
+            this.refreshCacheCount();
+            toastr.success('Clip cache cleared.', 'Breeze');
+        });
+
+        this.refreshCacheCount();
+        await this.checkReady();
+    }
+
+    onSettingsChange() {
+        this.settings.provider_endpoint = String($('#breeze_endpoint').val()).replace(/\/+$/, '');
+        this.settings.seed = Number($('#breeze_seed').val());
+        this.settings.chunk_ms = Number($('#breeze_chunk').val());
+        this.settings.cache_enabled = !!$('#breeze_cache').prop('checked');
+        this.settings.cache_max = Number($('#breeze_cache_max').val());
+        this.settings.voices_json = String($('#breeze_voices').val());
+        this.voices = [];
+        saveTtsProviderSettings();
+    }
+
+    async refreshCacheCount() {
+        const { count, bytes } = await cache.stats();
+        const size = bytes > 1048576
+            ? `${(bytes / 1048576).toFixed(1)} MB`
+            : `${Math.round(bytes / 1024)} KB`;
+        $('#breeze_cache_count').text(count ? `${count} clips — ${size}` : 'cache empty');
+    }
+
+    dispose() { }
+
+    _presets() {
+        try {
+            return JSON.parse(this.settings.voices_json);
+        } catch (error) {
+            toastr.error('Voices JSON is not valid.', 'Breeze TTS');
+            throw error;
+        }
+    }
+
+    async checkReady() {
+        try {
+            const response = await fetch(`${this.settings.provider_endpoint}/health`);
+            const data = await response.json();
+            this.ready = data.status === 'ok';
+            $('#breeze_status').text(this.ready ? 'Ready' : `Status: ${data.status}`);
+        } catch {
+            this.ready = false;
+            $('#breeze_status').text('Offline — is the Breeze API running, and is CORS enabled?');
+        }
+        this.voices = await this.fetchTtsVoiceObjects();
+    }
+
+    async onRefreshClick() {
+        await this.checkReady();
+        await this.refreshCacheCount();
+    }
+
+    async fetchTtsVoiceObjects() {
+        return Object.keys(this._presets()).map(name => ({ name, voice_id: name, lang: 'en-US' }));
+    }
+
+    async getVoice(voiceName) {
+        if (!this.voices.length) this.voices = await this.fetchTtsVoiceObjects();
+        const match = this.voices.find(v => v.name === voiceName);
+        if (!match) throw `TTS Voice name ${voiceName} not found`;
+        return match;
+    }
+
+    /**
+     * Settle the instruction for this line, consulting the director if present.
+     * `hint` names the message and paragraph the text came from. Callers that
+     * know it should pass it: without one the director has to find the line by
+     * matching text, which a short quoted fragment can defeat.
+     */
+    async _plan(text, voiceId, hint) {
+        const preset = this._presets()[voiceId];
+        if (!preset) throw `Unknown Breeze voice: ${voiceId}`;
+
+        let instruction = preset.instruction ?? '';
+        let cfgScale = preset.cfg_scale ?? 1;
+
+        // `bypass` is for previews: play the voice as written, undirected.
+        if (!hint?.bypass && preset.dynamic !== false && typeof globalThis.breezeDirector === 'function') {
+            try {
+                const directed = await globalThis.breezeDirector(text, voiceId, preset, hint);
+                if (directed?.instruction) {
+                    instruction = directed.instruction;
+                    cfgScale = directed.cfg_scale ?? cfgScale;
+                }
+            } catch (error) {
+                console.error('[Breeze] director hook failed, using static preset:', error);
+            }
+        }
+
+        const key = JSON.stringify([
+            this.settings.provider_endpoint, voiceId, instruction, cfgScale,
+            this.settings.seed, preset.ref_audio_url ?? '', text,
+        ]);
+
+        return { preset, instruction, cfgScale, key };
+    }
+
+    /** POST to Breeze. Retries while the server is busy generating something else. */
+    async _fetch(text, plan) {
+        const form = new FormData();
+        form.append('text', text);
+        form.append('seed', String(this.settings.seed));
+        form.append('cfg_scale', String(plan.cfgScale));
+        if (plan.instruction) form.append('instruction', plan.instruction);
+
+        if (plan.preset.ref_audio_url) {
+            const audio = await fetch(plan.preset.ref_audio_url).then(r => r.blob());
+            form.append('ref_audio', audio, 'reference.wav');
+            form.append('ref_text', plan.preset.ref_text ?? '');
+        }
+
+        for (let attempt = 0; attempt < 40; attempt++) {
+            const response = await fetch(`${this.settings.provider_endpoint}/v1/audio/speech`, {
+                method: 'POST',
+                body: form,
+            });
+            if (response.status === 409) {
+                await new Promise(resolve => setTimeout(resolve, 500));
+                continue;
+            }
+            if (!response.ok) throw new Error(`Breeze HTTP ${response.status}: ${await response.text()}`);
+            return response;
+        }
+        throw new Error('Breeze stayed busy for too long.');
+    }
+
+    /** A complete WAV clip, from cache when possible. */
+    async _clip(text, voiceId, hint) {
+        const plan = await this._plan(text, voiceId, hint);
+
+        if (this.settings.cache_enabled) {
+            const hit = await cache.get(plan.key);
+            if (hit) {
+                console.debug('[Breeze] cache hit');
+                return hit;
+            }
+        }
+
+        // Prefetch and playback can ask for the same clip at once; generate once.
+        if (this._pending.has(plan.key)) return this._pending.get(plan.key);
+
+        const work = (async () => {
+            const response = await this._fetch(text, plan);
+            const clip = toWav(await response.blob());
+            if (this.settings.cache_enabled) {
+                await cache.put(plan.key, clip, Number(this.settings.cache_max), { voice: voiceId, text });
+                this.refreshCacheCount();
+            }
+            return clip;
+        })();
+
+        this._pending.set(plan.key, work);
+        try {
+            return await work;
+        } finally {
+            this._pending.delete(plan.key);
+        }
+    }
+
+    /** Generate and cache ahead of playback. Errors are swallowed by design. */
+    async prefetch(text, voiceId, hint) {
+        if (!this.settings.cache_enabled) return false;
+        try {
+            await this._clip(text, voiceId, hint);
+            return true;
+        } catch (error) {
+            console.warn('[Breeze] prefetch failed:', error);
+            return false;
+        }
+    }
+
+    async *generateTts(text, voiceId) {
+        // Streaming path: playable chunks as PCM arrives, no caching.
+        if (Number(this.settings.chunk_ms) > 0) {
+            const plan = await this._plan(text, voiceId);
+            const response = await this._fetch(text, plan);
+            const minBytes = Math.floor(SAMPLE_RATE * BYTES_PER_SAMPLE * this.settings.chunk_ms / 1000);
+            const reader = response.body.getReader();
+            let buffer = [];
+            let size = 0;
+
+            const flush = () => {
+                // Never split a 16-bit sample across chunks.
+                let pending = new Blob(buffer);
+                let carry = null;
+                if (pending.size % BYTES_PER_SAMPLE !== 0) {
+                    carry = pending.slice(pending.size - 1);
+                    pending = pending.slice(0, pending.size - 1);
+                }
+                buffer = carry ? [carry] : [];
+                size = carry ? carry.size : 0;
+                return new Response(toWav(pending), { headers: { 'Content-Type': 'audio/wav' } });
+            };
+
+            while (true) {
+                const { done, value } = await reader.read();
+                if (done) break;
+                buffer.push(value);
+                size += value.length;
+                if (size >= minBytes) yield flush();
+            }
+            if (size > 0) yield flush();
+            return;
+        }
+
+        yield new Response(await this._clip(text, voiceId), {
+            headers: { 'Content-Type': 'audio/wav' },
+        });
+    }
+
+    async previewTtsVoice(voiceId) {
+        this.audioElement.pause();
+        this.audioElement.currentTime = 0;
+
+        const clip = await this._clip(getPreviewString('en-US'), voiceId, { bypass: true });
+        const url = URL.createObjectURL(clip);
+        this.audioElement.src = url;
+        this.audioElement.onended = () => URL.revokeObjectURL(url);
+        await this.audioElement.play();
+    }
+
+    // ----------------------------------------------------- methods the API uses
+
+    listVoices() {
+        return Object.keys(this._presets());
+    }
+
+    hasVoice(name) {
+        return Object.prototype.hasOwnProperty.call(this._presets(), name);
+    }
+
+    voicePreset(name) {
+        return this._presets()[name] ?? null;
+    }
+
+    /** Add or replace a voice preset and persist it. */
+    async addVoice(name, preset) {
+        const presets = this._presets();
+        presets[name] = preset;
+        this.settings.voices_json = JSON.stringify(presets, null, 2);
+        $('#breeze_voices').val(this.settings.voices_json);
+        this.voices = [];
+        saveTtsProviderSettings();
+        await initVoiceMap();
+        return name;
+    }
+
+    /** Point a character at a voice in the TTS voice map. */
+    async assignVoice(character, voiceName) {
+        this.settings.voiceMap = this.settings.voiceMap ?? {};
+        this.settings.voiceMap[character] = voiceName;
+        saveTtsProviderSettings();
+        await initVoiceMap();
+        return voiceName;
+    }
+
+    /** Resolve which voice a character narrates with, following the default marker. */
+    voiceForCharacter(character) {
+        const map = this.settings.voiceMap ?? {};
+        let value = map[character];
+        if (value === DEFAULT_VOICE_MARKER) value = map[DEFAULT_VOICE_MARKER];
+        if (!value || value === 'disabled' || value === DEFAULT_VOICE_MARKER) return null;
+        return this.hasVoice(value) ? value : null;
+    }
+}
+
+// Registration throws if something else already claimed the name — which is
+// exactly what happens when the old standalone breeze-tts extension is still
+// installed. Unguarded, that exception aborts this whole file and the
+// extension vanishes from the UI with no visible cause.
+try {
+    registerTtsProvider('Breeze', BreezeTtsProvider);
+} catch (error) {
+    console.error('[Breeze] could not register the TTS provider:', error);
+    toastr.error('The Breeze TTS provider is already registered. Disable the separate '
+        + '"Breeze TTS Provider" extension — this one now includes it.', 'Breeze');
+}
+
+// ===========================================================================
+// DIRECTOR AND PLAYER
+// ===========================================================================
 
 const MODULE = 'breeze_director';
 const PLAYER_MODULE = 'breeze_player';

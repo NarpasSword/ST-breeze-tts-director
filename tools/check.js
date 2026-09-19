@@ -75,16 +75,34 @@ globalThis.Audio = function () {
     };
 };
 globalThis.URL = { createObjectURL: () => 'blob:x', revokeObjectURL() {} };
+globalThis.indexedDB = { open: () => ({}) };
+globalThis.FormData = function () { return { append() {} }; };
+globalThis.fetch = async () => ({ ok: true, status: 200, json: async () => ({}), blob: async () => ({}) });
+
+// Bindings the extension imports from SillyTavern's own tts extension. The
+// import statement is stripped below, so these stand in as free variables.
+let registeredProvider = null;
+globalThis.registerTtsProvider = (name, cls) => { registeredProvider = { name, cls }; };
+globalThis.getPreviewString = () => 'preview';
+globalThis.saveTtsProviderSettings = () => {};
+globalThis.initVoiceMap = async () => {};
 
 
 const [, bytes] = GLib.file_get_contents(ARGV[0] || 'index.js');
-const source = new TextDecoder().decode(bytes);
+// new Function() compiles a classic script body, which cannot hold imports.
+// Stripping them leaves the imported names as free variables, stubbed above.
+const source = new TextDecoder().decode(bytes)
+    .replace(/^\s*import\s[^;]*;/gm, '');
 
 try {
     // new Function() compiles a classic script body: syntax errors and
     // top-level ReferenceErrors both surface here.
     new Function(source)();
     print('eval          OK');
+    print('provider      ' + (registeredProvider
+        ? `registered as "${registeredProvider.name}"`
+        : 'NOT REGISTERED'));
+    if (!registeredProvider) throw new Error('provider never registered');
 } catch (error) {
     print('eval          THREW: ' + error);
     print(String(error.stack || ''));
@@ -303,6 +321,11 @@ function runCastScenarios() {
             }
             return { content: JSON.stringify(['Weary.', 'Flat and final.']) };
         };
+        const api = new Function(source
+            + ';return { generate, settings, castMap, castMessage };')();
+
+        // After loading: the module publishes its own globalThis.breezeTts, so
+        // a stub installed earlier would be overwritten by the real one.
         globalThis.breezeTts = {
             available: true,
             listVoices: () => [...BASE, ...added.keys()],
@@ -316,9 +339,6 @@ function runCastScenarios() {
         };
         // An older provider simply does not have the newer methods.
         if (setup.noVoicePreset) delete globalThis.breezeTts.voicePreset;
-
-        const api = new Function(source
-            + ';return { generate, settings, castMap, castMessage };')();
         const config = api.settings();
         config.profile = 'test';
         config.cast = {};
@@ -352,6 +372,9 @@ function runCastScenarios() {
             }
             throw new Error('castMessage should not ask for direction');
         };
+        const api = new Function(source
+            + ';return { settings, castMap, castMessage };')();
+
         globalThis.breezeTts = {
             available: true,
             listVoices: () => [...BASE, ...added.keys()],
@@ -362,9 +385,6 @@ function runCastScenarios() {
             voicePreset: (n) => (BASE.includes(n) ? { cfg_scale: 4 } : added.get(n) ?? null),
             prefetch: async () => true, getClip: async () => null,
         };
-
-        const api = new Function(source
-            + ';return { settings, castMap, castMessage };')();
         const config = api.settings();
         config.profile = 'test';
         config.cast = {};

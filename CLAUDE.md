@@ -4,56 +4,52 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-A SillyTavern third-party extension: **Breeze Director & Player**. One `index.js`
-(~1300 lines, no build step, no dependencies) that does three things over a
-shared splitting rule:
+A SillyTavern third-party extension: **Breeze TTS, Director & Player**. One
+`index.js` (~2900 lines, no build step, no dependencies beyond SillyTavern's own
+`tts` extension) doing four things:
 
-- **Director** — one LLM call per chat message writes a delivery instruction for
-  every paragraph, stored in the chat file. The TTS provider picks those up while
-  narrating.
-- **Identification** — its own call, or several, works out who speaks each
-  quoted span and sketches a voice profile for anyone new.
-- **Casting** — each identified speaker gets their own Breeze voice, built from
-  a base voice plus their profile. Non-quote text reads in a configurable
-  narrator voice.
-- **Player** — an inline panel per message with paragraph-level seek, per-message
-  resume, per-segment voice overrides, and take history.
+- **Provider** — registers `Breeze` in the TTS provider dropdown, wraps its raw
+  24 kHz PCM in a WAV header, caches clips in IndexedDB keyed by content, and
+  publishes `globalThis.breezeTts`.
+- **Director** — one LLM call per message writes a delivery instruction for
+  every paragraph, stored in the chat file.
+- **Identification and casting** — a second call works out who speaks each
+  quoted span; a third, per new speaker, gives them a base voice and a profile.
+  Non-quote text reads in a configurable narrator voice.
+- **Player** — an inline panel per message with paragraph-level seek,
+  per-message resume, per-segment voice overrides, and take history.
 
-There is no build, lint, or test tooling. The file is plain ES module JS loaded
-directly by the browser.
+There is no build or lint tooling beyond `tools/check.js`. The file is a plain
+ES module loaded directly by the browser.
 
-## Hard dependency: the Breeze TTS provider
+## One extension, two halves
 
-This extension does nothing on its own. It requires a **separate** extension,
-`breeze-tts`, which registers the `Breeze` TTS provider and publishes
-`globalThis.breezeTts`. That provider lives outside this repo (see
-`../breeze-tts/` in the working tree, and the parent `CLAUDE.md` for its notes).
+The provider and the director speak only through two globals —
+`globalThis.breezeTts` and `globalThis.breezeDirector` — even though they now
+live in the same file. Keep that boundary:
 
-The coupling is entirely through two globals, never imports:
+- the provider must work with no director present, falling back to each voice's
+  own static instruction whenever `breezeDirector` returns `null` or throws;
+- the director must tolerate a provider that is absent or older, which is what
+  `PROVIDER_FEATURES` and `basePreset()` guard.
 
-- This extension **reads** `globalThis.breezeTts` — `available`, `listVoices`,
-  `hasVoice`, `addVoice`, `assignVoice`, `voiceForCharacter`,
-  `prefetch(text, voice, hint)`, `getClip(text, voice, hint)`, `dropClips`,
-  `cacheStats`, `clearCache`.
-- This extension **publishes** `globalThis.breezeDirector(text, voiceId, preset, hint)`.
-  The provider calls it for every narration line and falls back to the voice's
-  static instruction whenever it returns `null` or throws.
+**They used to be two extensions and drifted apart once too often.** The
+provider lived outside version control and was copied into SillyTavern by hand,
+so a freshly deployed director could be talking to a months-old provider. That
+fails *silently*: an exception inside `castVoice()` lands in its `catch` and is
+indistinguishable from the model declining, so casting quietly does nothing.
+Shipping them together removes the failure mode; the globals keep the seam
+legible.
 
-Consequence: `manifest.json` `loading_order` must stay **above** the provider's
-(11 → this is 12). Every call into `breezeTts` must tolerate it being absent.
+`registerTtsProvider` throws if the name is already taken, which is exactly what
+happens when the old standalone `breeze-tts` extension is still installed.
+Unguarded, that aborts the whole file and the extension vanishes from the UI, so
+the call is wrapped and the toast says what to disable.
 
-**The two deploy separately, so they drift.** `breeze-tts` is not in this repo
-and is copied into SillyTavern by hand, so a freshly deployed director can be
-talking to a months-old provider. Methods added after the provider's first
-release — `voicePreset`, `preview`, `dropClips` — are listed in
-`PROVIDER_FEATURES`, checked at load, and warned about in the console, a toast
-and the settings panel.
-
-Never call one of them bare. An exception inside `castVoice()` lands in its
-`catch` and is indistinguishable from the model declining, so a stale provider
-presents as "casting silently does nothing" — which is exactly how it presented.
-`basePreset()` is the pattern: feature-test, try/catch, return null, carry on
-without the enrichment. Adding a provider method means adding it to that list.
+The only path this file depends on is the import `../../tts/index.js`, which
+resolves the same from any third-party folder, since they are all served from
+`/scripts/extensions/third-party/<folder>/`. `loading_order` must stay above
+SillyTavern's own `tts` extension.
 
 ## Install / iterate
 
@@ -63,8 +59,10 @@ Before deploying, check the file:
 gjs tools/check.js index.js
 ```
 
-It loads `index.js` under stubs for the browser and SillyTavern globals, runs
-the jQuery ready handler, asserts the pure logic against the file as loaded,
+It strips the `import` line (a `new Function()` body cannot hold one, so the
+imported names are stubbed as globals), loads `index.js` under stubs for the
+browser and SillyTavern globals, checks the provider registered, runs the
+jQuery ready handler, asserts the pure logic against the file as loaded,
 then drives `generate()` end to end against a stubbed model and provider. Those
 last scenarios exist because the cast sheet can sit empty while attribution
 works perfectly — a failure no unit test sees. They share global stubs, so they
@@ -81,14 +79,10 @@ extensions, then hard-reload the browser:
 SillyTavern/data/<handle>/extensions/<folder>/     # e.g. data/narpas/extensions/breeze-director/
 ```
 
-Served to the page as `/scripts/extensions/third-party/<folder>/index.js`. The
-folder name is free (nothing imports this by path), unlike `breeze-tts`, which
-imports `../../tts/index.js` and therefore must sit beside SillyTavern's own
-`tts` extension.
+Served to the page as `/scripts/extensions/third-party/<folder>/index.js`.
 
-Note the repo is `ST-breeze-tts-director` while the deployed folder and the
-parent notes call it `breeze-director`; keep that in mind when following paths
-in comments.
+**Disable the old standalone `breeze-tts` extension** if it is still installed.
+Both register the name `Breeze`; the one that loses says so in a toast.
 
 Console checks while iterating:
 

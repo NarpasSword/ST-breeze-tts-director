@@ -1,11 +1,11 @@
 {
-    "display_name": "Breeze Director & Player",
+    "display_name": "Breeze TTS, Director & Player",
     "loading_order": 12,
     "requires": [],
     "optional": [],
     "js": "index.js",
     "css": "",
-    "author": "you",
-    "version": "1.0.0",
-    "homePage": "None"
+    "author": "narpas",
+    "version": "2.0.0",
+    "homePage": "https://github.com/NarpasSword/ST-breeze-tts-director"
 }
