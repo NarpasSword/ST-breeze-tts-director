@@ -270,10 +270,34 @@ per speaker with `addVoice()`. It worked, but it meant the extension owned
 entries in a list the user curates, and the two drifted. `castEntry()` migrates
 those old entries by reading their derived `voice` as a `base`.
 
+### Skipping paragraphs
+
+Each row in the message panel has a checkbox. Checked means read aloud, and
+everything starts checked; unchecking leaves a paragraph out of playback without
+editing the message.
+
+The indices live on `message.extra.breeze_skip`, **not** on a take. Regenerating
+direction or restoring an earlier one leaves the choice alone, because it is
+about the text rather than about how the text is read. The field is deleted when
+nothing is skipped, so a chat that never uses the feature carries nothing extra.
+
+`player.load()` gives a skipped paragraph no clips, and `playAt()` and
+`nextPosition()` already step over a unit with none, so nothing else in the
+player needed to know. `prefetchMessage()` skips them too — there is no sense
+generating audio nobody will hear. Pressing play on a skipped paragraph checks
+it again first, since asking to hear it is asking for it back.
+
 ### Casting a quoted speaker
 
 `castVoice()` is only ever called for a speaker `isForeignSpeaker()` accepts.
 Resolution order, each step falling through on failure:
+
+Everyone named is cast, **including the message's own character and the user**.
+`isNamedSpeaker()` is the gate, and it treats those two as speakers even when
+their name is one of `GENERIC_SPEAKERS`: a character really can be called
+Narrator, and dropping them as a placeholder would leave the person doing most
+of the talking uncast. A stray `"narrator"` attribution in a chat whose
+character is called something else is still ignored.
 
 0. `rememberSpeaker()` — **before anything else**, the speaker is written onto
    the cast sheet with whatever profile identification gave. Everything below

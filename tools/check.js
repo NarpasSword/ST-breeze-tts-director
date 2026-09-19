@@ -325,14 +325,20 @@ Promise.all(readyFns.map(fn => fn())).then(
         for (const fn of onReady) fn();
         eq('APP_READY listener corrects it again', fieldValues.get('#tts_provider'), 'Breeze');
         print('');
-        runAssertions();
+        return runAssertions();
     },
     (error) => {
         print('ready handler THREW: ' + error);
         print(String(error.stack || '').split('\n').slice(0, 8).join('\n'));
         imports.system.exit(1);
     },
-);
+).catch((error) => {
+    // Without this a throw inside the success handler above becomes an
+    // unhandled rejection with no message, which hides real failures.
+    print('checks THREW: ' + error);
+    print(String(error.stack || '').split('\n').slice(0, 8).join('\n'));
+    imports.system.exit(1);
+});
 
 let fails = 0;
 function eq(label, got, want) {
@@ -341,15 +347,15 @@ function eq(label, got, want) {
     fails++; print('  FAIL ' + label + '\n       got  ' + g + '\n       want ' + w);
 }
 
-function runAssertions() {
+async function runAssertions() {
 const api = new Function(source + `;return {
-    splitSegments, collectQuotes, isForeignSpeaker, parseDirection,
-    normalize, pickLine, castEntry, hash, syncPrompts,
+    splitSegments, collectQuotes, isNamedSpeaker, parseDirection,
+    normalize, pickLine, castEntry, hash, syncPrompts, skipped, isSkipped, setSkipped,
     voiceInstruction, cleanProfile, PROFILE_FIELDS, splitLines, buildUnits, targetMessage,
     extractJson, normalizeQuoteId,
     DEFAULT_PROMPT, DEFAULT_VOICE_CAST_PROMPT };`)();
-const { splitSegments, collectQuotes, isForeignSpeaker, parseDirection,
-        normalize, pickLine, castEntry, hash, syncPrompts,
+const { splitSegments, collectQuotes, isNamedSpeaker, parseDirection,
+        normalize, pickLine, castEntry, hash, syncPrompts, skipped, isSkipped, setSkipped,
         voiceInstruction, cleanProfile, splitLines, buildUnits, targetMessage,
         extractJson, normalizeQuoteId } = api;
 
@@ -403,11 +409,38 @@ eq('numbering', collectQuotes([splitSegments('A "one" B'), splitSegments('"two" 
    [{ id: 'Q1', paragraph: 0, at: 1, text: 'one' }, { id: 'Q2', paragraph: 1, at: 0, text: 'two' },
     { id: 'Q3', paragraph: 1, at: 2, text: 'three' }]);
 
-print('isForeignSpeaker');
+print('skipping paragraphs');
+const skipMsg = { mes: 'one\ntwo\nthree', extra: {} };
+eq('nothing skipped by default', [...skipped(skipMsg)], []);
+eq('everything plays by default', isSkipped(skipMsg, 1), false);
+await setSkipped(skipMsg, 1, true);
+eq('unchecking records it', skipMsg.extra.breeze_skip, [1]);
+eq('and reads back', isSkipped(skipMsg, 1), true);
+eq('its neighbours are unaffected', isSkipped(skipMsg, 0), false);
+await setSkipped(skipMsg, 0, true);
+eq('kept in order', skipMsg.extra.breeze_skip, [0, 1]);
+await setSkipped(skipMsg, 1, true);
+eq('skipping twice is not two entries', skipMsg.extra.breeze_skip, [0, 1]);
+await setSkipped(skipMsg, 0, false);
+eq('rechecking removes it', skipMsg.extra.breeze_skip, [1]);
+await setSkipped(skipMsg, 1, false);
+eq('the field goes away when nothing is skipped',
+   'breeze_skip' in skipMsg.extra, false);
+
+print('isNamedSpeaker');
 const msg = { name: 'Alice' };
-eq('same char', isForeignSpeaker('alice', msg), false);
-eq('unknown', isForeignSpeaker('unknown', msg), false);
-eq('foreign', isForeignSpeaker('Bob', msg), true);
+eq('another character', isNamedSpeaker('Bob', msg), true);
+eq('the message character is cast too', isNamedSpeaker('alice', msg), true);
+eq('the user is cast too', isNamedSpeaker(context.name1, msg), true);
+eq('unknown is not a speaker', isNamedSpeaker('unknown', msg), false);
+eq('narrator is not a speaker', isNamedSpeaker('narrator', msg), false);
+eq('nothing is not a speaker', isNamedSpeaker('', msg), false);
+// A character really can be called Narrator; the placeholder list must not
+// swallow the person doing most of the talking.
+eq('a character named Narrator is a speaker',
+   isNamedSpeaker('Narrator', { name: 'Narrator' }), true);
+eq('but a stray "narrator" attribution still is not',
+   isNamedSpeaker('Narrator', { name: 'Alice' }), false);
 
 print('parseDirection');
 eq('object form', parseDirection('{"directions":["a","b"],"speakers":{"Q1":"Bob"}}', 2),
@@ -502,43 +535,43 @@ function runCastScenarios() {
         ['new speaker is cast',
          { map: { Alice: 'narrator' }, casting: { base: 'villain', gender: 'male', tone: 'Gruff.' },
            identify: { Q1: 'Alice', Q2: 'Bob' } },
-         { cast: ['Bob'], base: 'villain', tone: 'Gruff.' }],
+         { cast: ['Alice', 'Bob'], base: 'villain', tone: 'Gruff.' }],
 
         ['speaker with a voice-map entry is still listed',
          { map: { Alice: 'narrator', Bob: 'villain' },
            identify: { Q1: 'Alice', Q2: 'Bob' } },
-         { cast: ['Bob'] }],
+         { cast: ['Alice', 'Bob'] }],
 
         ['answer recovered from the reasoning channel',
          { map: { Alice: 'narrator' },
            raw: '',
            reasoning: 'Working through it... {"Q1":"Alice","Q2":"Bob"}' },
-         { cast: ['Bob'], base: 'villain', tone: 'Gruff.' }],
+         { cast: ['Alice', 'Bob'], base: 'villain', tone: 'Gruff.' }],
 
         ['speaker is listed even when nothing can be derived',
          { map: { Alice: 'narrator' }, casting: { base: 'no such voice' },
            identify: { Q1: 'Alice', Q2: 'Bob' } },
-         { cast: ['Bob'] }],
+         { cast: ['Alice', 'Bob'] }],
 
         ['a pre-staged speaker is reused, not re-cast',
          { map: { Alice: 'narrator' }, casting: { base: 'villain', gender: 'male', tone: 'Gruff.' },
            prestage: { Bob: { voice: 'villain', base: 'villain', pinned: true, tone: 'Mine.' } },
            identify: { Q1: 'Alice', Q2: 'Bob' } },
-         { cast: ['Bob'], base: 'villain', tone: 'Mine.' }],
+         { cast: ['Alice', 'Bob'], base: 'villain', tone: 'Mine.' }],
 
         ['survives a reasoning preamble and odd quote ids',
          { map: { Alice: 'narrator' }, casting: { base: 'villain', gender: 'male', tone: 'Gruff.' },
            raw: 'Hmm {let me see}. Here:\n{"1":"Alice","q2":"Bob"}' },
-         { cast: ['Bob'], base: 'villain' }],
+         { cast: ['Alice', 'Bob'], base: 'villain' }],
 
         ['casts when a base voice cannot be read',
          { map: { Alice: 'narrator' }, unreadableBase: true,
            identify: { Q1: 'Alice', Q2: 'Bob' } },
-         { cast: ['Bob'], base: 'villain', tone: 'Gruff.' }],
+         { cast: ['Alice', 'Bob'], base: 'villain', tone: 'Gruff.' }],
 
         ['unattributed quotes are ignored',
          { map: { Alice: 'narrator' }, identify: { Q1: 'Alice', Q2: 'unknown' } },
-         { cast: [] }],
+         { cast: ['Alice'] }],
     ];
 
     print('\ncast scenarios');
@@ -592,11 +625,19 @@ function runCastScenarios() {
         try {
             await api.generate(0, { quiet: true });
             const cast = api.castMap();
-            eq(label + ' — cast', Object.keys(cast), want.cast);
+            // Sorted: insertion order depends on who was pre-staged, which is
+            // not what any of these scenarios is about.
+            eq(label + ' — cast', Object.keys(cast).sort(), [...want.cast].sort());
             // The provider's voices are the user's to manage: this extension
             // composes on top of them and must never write one.
             eq(label + ' — provider voices untouched', [...added.keys()], []);
             if (want.base) eq(label + ' — base chosen', cast.Bob?.base, want.base);
+            // The message's own character is cast as well, taking their
+            // voice-map entry as the base rather than a model's guess.
+            if (cast.Alice) {
+                eq(label + ' — character takes their voice-map voice',
+                   [cast.Alice.base, cast.Alice.source], ['narrator', 'voicemap']);
+            }
             if (want.tone) eq(label + ' — profile kept', cast.Bob?.tone, want.tone);
             // The original bug: auxiliary calls sized for the answer, not for a
             // reasoning model's thinking, came back empty and failed silently.
@@ -638,8 +679,8 @@ function runCastScenarios() {
 
         try {
             const named = await api.castMessage(0);
-            eq('castMessage — names the speaker', named, ['Bob']);
-            eq('castMessage — casts them', Object.keys(api.castMap()), ['Bob']);
+            eq('castMessage — names the speakers', named, ['Alice', 'Bob']);
+            eq('castMessage — casts them', Object.keys(api.castMap()).sort(), ['Alice', 'Bob']);
             eq('castMessage — adds no provider voices', [...added.keys()], []);
             eq('castMessage — leaves direction alone',
                context.chat[0].extra.breeze_direction ?? null, null);
@@ -653,7 +694,7 @@ function runCastScenarios() {
         print('\npre-generation');
         try {
             const pre = new Function(source
-                + ';return { settings, castMap, pregenerate, prefetchMessage };')();
+                + ';return { settings, castMap, pregenerate, prefetchMessage, player };')();
             globalThis.breezeTts = {
                 available: true,
                 listVoices: () => [...BASE, ...added.keys()],
@@ -683,6 +724,27 @@ function runCastScenarios() {
             eq('directs before caching', !!context.chat[0].extra.breeze_direction, true);
             eq('generates a clip per segment', made, 4);
             eq('adds no provider voices', [...added.keys()], []);
+
+            // An unchecked paragraph is not generated and not played.
+            context.chat[0].extra.breeze_skip = [0];
+            eq('skipped paragraphs are not generated', await pre.prefetchMessage(0), 2);
+
+            const { player: skipPlayer } = new Function(source + ';return { player };')();
+            globalThis.breezeTts = {
+                available: true,
+                hasVoice: () => true,
+                voiceForCharacter: () => 'narrator',
+                voicePreset: () => ({ cfg_scale: 4 }),
+                prefetch: async () => true,
+                getClip: async () => null,
+            };
+            await skipPlayer.load(0);
+            eq('a skipped paragraph has no clips', skipPlayer.units[0].clips.length, 0);
+            eq('the rest still do', skipPlayer.units[1].clips.length > 0, true);
+            // Asking to play the skipped paragraph must land on the next one.
+            await skipPlayer.playAt(0, 0);
+            eq('playing a skipped paragraph moves past it', skipPlayer.index, 1);
+            delete context.chat[0].extra.breeze_skip;
         } catch (error) {
             fails++;
             print('  FAIL pre-generation threw: ' + error);

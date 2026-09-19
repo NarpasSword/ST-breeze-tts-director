@@ -862,11 +862,28 @@ function collectQuotes(layout) {
 
 const GENERIC_SPEAKERS = new Set(['', 'unknown', 'unclear', 'narrator', 'none', 'null', 'n/a']);
 
-/** Is this quote spoken by someone other than the message's own character? */
-function isForeignSpeaker(speaker, message) {
+/**
+ * Is this quote attributed to an actual someone?
+ *
+ * The message's own character and the user count: they speak as much as anyone
+ * else, and casting them means their dialogue gets a voice of its own rather
+ * than falling back to whatever the voice map happens to say.
+ *
+ * They also override the placeholder list, because a character really can be
+ * called Narrator — as one of these chats has — and dropping them as a
+ * placeholder would leave the person doing most of the talking uncast.
+ */
+function isNamedSpeaker(speaker, message) {
     const name = String(speaker ?? '').trim().toLowerCase();
-    if (!name || GENERIC_SPEAKERS.has(name)) return false;
-    return name !== String(message?.name ?? '').trim().toLowerCase();
+    if (!name) return false;
+
+    const context = ctx();
+    const known = [message?.name, context.name1, context.name2]
+        .map(value => String(value ?? '').trim().toLowerCase())
+        .filter(Boolean);
+    if (known.includes(name)) return true;
+
+    return !GENERIC_SPEAKERS.has(name);
 }
 
 /** A base voice's preset. Null rather than throwing: the voices JSON is hand-edited. */
@@ -945,6 +962,33 @@ function clipsFor(message, line, messageId, paragraph) {
 // Strips quote marks so a segment matches the paragraph it came from. Asterisks
 // stay: in plaintext they are content, not markup.
 const normalize = s => String(s ?? '').replace(/["'`\u201C\u201D\u00AB\u00BB]/g, '').replace(/\s+/g, ' ').trim().toLowerCase();
+
+// ------------------------------------------------------------------- skipping
+// Paragraphs the reader has unchecked. Kept on the message rather than on a
+// take, so regenerating direction or restoring an earlier take leaves the
+// choice alone — it is about the text, not about how the text is read.
+
+/** Paragraph indices excluded from playback. */
+function skipped(message) {
+    return new Set(message?.extra?.breeze_skip ?? []);
+}
+
+function isSkipped(message, paragraph) {
+    return skipped(message).has(paragraph);
+}
+
+/** Include or exclude a paragraph, and persist it with the chat. */
+async function setSkipped(message, paragraph, skip) {
+    const set = skipped(message);
+    if (skip) set.add(paragraph);
+    else set.delete(paragraph);
+
+    message.extra = message.extra ?? {};
+    if (set.size) message.extra.breeze_skip = [...set].sort((a, b) => a - b);
+    else delete message.extra.breeze_skip;
+
+    await ctx().saveChat();
+}
 
 /** Stored direction, but only if it still belongs to the current swipe. */
 function getDirection(message) {
@@ -1187,10 +1231,11 @@ async function generate(index, { quiet = true } = {}) {
                     const quote = quotes.find(q => q.paragraph === i && q.at === at);
                     const speaker = String(speakers[quote?.id] ?? '').trim();
                     entry.speaker = speaker || null;
-                    // Casting records the speaker; which base they speak
-                    // through is resolved at play time from the cast, so
-                    // editing it reaches messages already in the chat.
-                    if (isForeignSpeaker(speaker, message)) await castVoice(speaker, quotes);
+                    // Everyone named is cast, the character and the user
+                    // included. Which base they speak through is resolved at
+                    // play time from the cast, so editing it reaches messages
+                    // already in the chat.
+                    if (isNamedSpeaker(speaker, message)) await castVoice(speaker, quotes);
                 }
                 line.segments.push(entry);
             }
@@ -1633,7 +1678,7 @@ async function castMessage(index) {
 
     const cast = [];
     for (const quote of quotes) {
-        if (!isForeignSpeaker(quote.speaker, message) || cast.includes(quote.speaker)) continue;
+        if (!isNamedSpeaker(quote.speaker, message) || cast.includes(quote.speaker)) continue;
         cast.push(quote.speaker);
         await castVoice(quote.speaker, quotes);
     }
@@ -1662,9 +1707,11 @@ async function prefetchMessage(index) {
 
     const direction = getDirection(message);
     const units = buildUnits(message.mes);
+    const excluded = skipped(message);
 
     let made = 0;
     for (let i = 0; i < units.length; i++) {
+        if (excluded.has(i)) continue;
         for (const clip of clipsFor(message, direction?.lines?.[i] ?? units[i], index, i)) {
             if (!clip.voice) continue;
             if (await breeze.prefetch(clip.text, clip.voice, clip.hint)) made++;
@@ -1775,9 +1822,14 @@ const player = {
         // Paragraph-granular units keep resume keys and panel rows unchanged;
         // the voice switching lives inside each unit's clip list.
         const direction = getDirection(message);
+        const excluded = skipped(message);
         this.units = buildUnits(message.mes).map((unit, i) => ({
             text: unit.text,
-            clips: clipsFor(message, direction?.lines?.[i] ?? unit, messageId, i).filter(c => c.voice),
+            // An unchecked paragraph has nothing to play; playAt() and
+            // nextPosition() already step over a unit with no clips.
+            clips: excluded.has(i)
+                ? []
+                : clipsFor(message, direction?.lines?.[i] ?? unit, messageId, i).filter(c => c.voice),
         }));
 
         this.index = Math.min(loadPosition(messageId), Math.max(this.units.length - 1, 0));
@@ -2039,6 +2091,7 @@ async function openPanel(messageId, { play = false, expandAll = false } = {}) {
         const units = buildUnits(message.mes);
         const lines = takeLines();
         const editable = viewing === 0;
+        const excluded = skipped(message);
 
         // The exact clip on air, so the panel can name the voice reading it.
         const active = playingIndex >= 0 && player.messageId === messageId
@@ -2054,6 +2107,24 @@ async function openPanel(messageId, { play = false, expandAll = false } = {}) {
             const headRow = document.createElement('div');
             headRow.style.cssText = 'display:flex;gap:0.4em;align-items:flex-start;cursor:pointer;';
 
+            // Checked means read aloud. Everything starts checked; unchecking
+            // is how a paragraph is left out of playback without editing it.
+            const include = document.createElement('input');
+            include.type = 'checkbox';
+            include.checked = !excluded.has(i);
+            include.title = include.checked
+                ? 'Read this paragraph aloud'
+                : 'Skipped — not read aloud';
+            include.style.cssText = 'margin:0.35em 0 0 0;flex:0 0 auto;cursor:pointer;';
+            include.addEventListener('click', event => event.stopPropagation());
+            include.addEventListener('change', async () => {
+                await setSkipped(message, i, !include.checked);
+                // Reload if this message is on air, so the change takes effect
+                // without having to stop and start again.
+                if (player.messageId === messageId) await player.load(messageId);
+                repaint(state, playingIndex);
+            });
+
             const chevron = document.createElement('div');
             chevron.className = `fa-solid ${expanded.has(i) ? 'fa-chevron-down' : 'fa-chevron-right'}`;
             chevron.style.cssText = 'opacity:0.6;padding-top:0.25em;min-width:1em;';
@@ -2064,18 +2135,28 @@ async function openPanel(messageId, { play = false, expandAll = false } = {}) {
             if (!expanded.has(i)) {
                 text.style.cssText += 'white-space:nowrap;overflow:hidden;text-overflow:ellipsis;';
             }
+            if (excluded.has(i)) {
+                text.style.opacity = '0.45';
+                text.style.textDecoration = 'line-through';
+            }
             if (i === playingIndex) text.style.fontWeight = 'bold';
 
             const playOne = document.createElement('div');
             playOne.className = 'fa-solid fa-play';
             playOne.title = 'Play from here';
             playOne.style.cssText = 'opacity:0.6;padding-top:0.25em;cursor:pointer;';
-            playOne.addEventListener('click', event => {
+            playOne.addEventListener('click', async event => {
                 event.stopPropagation();
+                // Asking for a skipped paragraph is asking to hear it, so put it
+                // back rather than starting at the next one that is included.
+                if (excluded.has(i)) {
+                    await setSkipped(message, i, false);
+                    repaint(state, playingIndex);
+                }
                 playFrom(messageId, i);
             });
 
-            headRow.append(chevron, text, playOne);
+            headRow.append(include, chevron, text, playOne);
             headRow.addEventListener('click', () => {
                 expanded.has(i) ? expanded.delete(i) : expanded.add(i);
                 repaint(state, playingIndex);
@@ -2142,6 +2223,8 @@ async function openPanel(messageId, { play = false, expandAll = false } = {}) {
                 ? `Generating audio for paragraph ${playingIndex + 1}…${who}`
                 : playingIndex >= 0
                     ? `Paragraph ${playingIndex + 1} of ${units.length} — ${state}${who}`
+                    : excluded.size
+                    ? `${units.length} paragraphs, ${excluded.size} skipped`
                     : `${units.length} paragraphs`;
     }
 
