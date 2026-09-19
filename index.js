@@ -49,20 +49,17 @@ Lines they speak:
 
 Available voices:
 {{voices}}
+{{cast}}
+If this character is someone already cast under a different name, reply with that
+same voice. Otherwise prefer a voice nobody has yet, so each character stays distinct.
 
 Reply with ONLY the voice name, copied exactly from the list. Nothing else.`;
 
-const DEFAULT_VOICE_PROMPT = `Design a speaking voice for the character below.
-
-Write ONE sentence describing the voice itself: apparent age, texture, pitch, accent if the
-description implies one, and their default manner of speaking.
-Describe the voice only — no plot, no backstory, no character name.
-Output the sentence and nothing else.
-
-Name: {{char}}
-
-Description:
-{{description}}`;
+/** Spliced into the casting prompt at {{cast}} once anyone has been cast. */
+const CAST_BLOCK = `
+Already cast in this scene:
+{{list}}
+`;
 
 const DEFAULTS = {
     enabled: true,
@@ -215,11 +212,23 @@ function voiceForSegment(segment, message) {
     return charVoice(message) ?? defaultVoice(message);
 }
 
-/** The clips one paragraph plays, in order. */
-function clipsFor(message, line) {
+/**
+ * The clips one paragraph plays, in order. Each carries a hint naming the
+ * message and paragraph it came from, so the director returns that paragraph's
+ * instruction outright instead of matching a fragment back to it.
+ */
+function clipsFor(message, line, messageId, paragraph) {
+    const hint = { messageId, paragraph };
     const segments = line?.segments;
-    if (!segments?.length) return [{ text: line?.text ?? '', voice: defaultVoice(message) }];
-    return segments.map(segment => ({ text: segment.text, voice: voiceForSegment(segment, message) }));
+    if (!segments?.length) {
+        return [{ text: line?.text ?? '', voice: defaultVoice(message), speaker: null, hint }];
+    }
+    return segments.map(segment => ({
+        text: segment.text,
+        voice: voiceForSegment(segment, message),
+        speaker: segment.kind === 'dialogue' ? (segment.speaker || null) : null,
+        hint,
+    }));
 }
 
 // Strips quote marks so a segment matches the paragraph it came from. Asterisks
@@ -452,6 +461,11 @@ function locate(text) {
     return chat.length - 1;
 }
 
+/**
+ * Which paragraph's instruction applies to this text. Only used when no hint
+ * was passed — SillyTavern's own narration path, where the text is a whole
+ * paragraph and matching is dependable.
+ */
 function pickLine(direction, text) {
     const needle = normalize(text);
     if (!needle) return direction.lines[0]?.instruction;
@@ -459,19 +473,27 @@ function pickLine(direction, text) {
     const exact = direction.lines.find(l => normalize(l.text) === needle);
     if (exact) return exact.instruction;
 
-    // Quote-only narration hands us a fragment of the line.
-    const partial = direction.lines.find(l => {
-        const body = normalize(l.text);
-        return body.includes(needle) || needle.includes(body);
-    });
-    return (partial ?? direction.lines[0])?.instruction;
+    // A fragment can sit inside more than one paragraph; the longest container
+    // is the least bad guess. Pass a hint and this never runs.
+    let best = null;
+    let bestLength = -1;
+    for (const line of direction.lines) {
+        const body = normalize(line.text);
+        if (!body.includes(needle) && !needle.includes(body)) continue;
+        if (body.length > bestLength) {
+            best = line;
+            bestLength = body.length;
+        }
+    }
+    return (best ?? direction.lines[0])?.instruction;
 }
 
-globalThis.breezeDirector = async function (text, voiceId, preset) {
+globalThis.breezeDirector = async function (text, voiceId, preset, hint) {
     const config = settings();
     if (!config.enabled) return null;
 
-    const index = locate(text);
+    // A hint names the paragraph outright; locate() only guesses from the text.
+    const index = Number.isInteger(hint?.messageId) ? hint.messageId : locate(text);
     const message = ctx().chat?.[index];
     if (!message) return null;
 
@@ -487,7 +509,9 @@ globalThis.breezeDirector = async function (text, voiceId, preset) {
     }
     if (!direction) return null;
 
-    const line = pickLine(direction, text);
+    const line = Number.isInteger(hint?.paragraph)
+        ? direction.lines[hint.paragraph]?.instruction
+        : pickLine(direction, text);
     if (!line) return null;
 
     const base = preset?.instruction;
@@ -556,6 +580,9 @@ async function designVoice(name) {
 
 const castJobs = new Map();
 
+// Set by bind(), so the settings roster repaints as speakers are cast.
+let onCastChanged = null;
+
 function currentChatId() {
     return ctx().getCurrentChatId?.() ?? 'chat';
 }
@@ -590,13 +617,16 @@ async function pickVoice(speaker, quotes) {
         .map(q => `- ${q.text}`)
         .join('\n');
 
-    const prompt = put(
-        put(
-            put(config.voice_pick_prompt, /{{speaker}}/g, speaker),
-            /{{lines}}/g, spoken || '(none recorded)',
-        ),
-        /{{voices}}/g, available.map(name => `- ${name}`).join('\n'),
-    );
+    // Showing the running cast is what keeps a scene consistent: the model can
+    // reuse a voice for the same person under another name, and avoid handing
+    // one voice to two characters.
+    const cast = castMap();
+    const roster = Object.entries(cast).map(([who, voice]) => `- ${who} → ${voice}`).join('\n');
+
+    let prompt = put(config.voice_pick_prompt, /{{speaker}}/g, speaker);
+    prompt = put(prompt, /{{lines}}/g, spoken || '(none recorded)');
+    prompt = put(prompt, /{{voices}}/g, available.map(name => `- ${name}`).join('\n'));
+    prompt = put(prompt, /{{cast}}/g, roster ? put(CAST_BLOCK, /{{list}}/g, roster) : '');
 
     const result = await ctx().ConnectionManagerRequestService.sendRequest(config.profile, prompt, 60);
     const answer = String(result?.content ?? '')
@@ -639,7 +669,9 @@ async function castVoice(speaker, quotes = []) {
             const designed = await designVoice(speaker);
             if (designed) return designed;
         }
-        return pickVoice(speaker, quotes);
+        const picked = await pickVoice(speaker, quotes);
+        if (picked) toastr.info(`Cast ${speaker} as "${picked}".`, 'Breeze Director');
+        return picked;
     })()
         .then(voice => {
             if (!voice) return null;
@@ -647,6 +679,7 @@ async function castVoice(speaker, quotes = []) {
             pruneCast();
             ctx().saveSettingsDebounced();
             console.info(`[Breeze Director] cast ${speaker} as "${voice}".`);
+            onCastChanged?.();
             return voice;
         })
         .catch(error => {
@@ -692,8 +725,8 @@ async function prefetchMessage(index) {
     const units = buildUnits(message.mes);
 
     for (let i = 0; i < units.length; i++) {
-        for (const clip of clipsFor(message, direction?.lines?.[i] ?? units[i])) {
-            if (clip.voice) await breeze.prefetch(clip.text, clip.voice);
+        for (const clip of clipsFor(message, direction?.lines?.[i] ?? units[i], index, i)) {
+            if (clip.voice) await breeze.prefetch(clip.text, clip.voice, clip.hint);
         }
     }
 }
@@ -789,7 +822,7 @@ const player = {
         const direction = getDirection(message);
         this.units = buildUnits(message.mes).map((unit, i) => ({
             text: unit.text,
-            clips: clipsFor(message, direction?.lines?.[i] ?? unit).filter(clip => clip.voice),
+            clips: clipsFor(message, direction?.lines?.[i] ?? unit, messageId, i).filter(c => c.voice),
         }));
 
         this.index = Math.min(loadPosition(messageId), Math.max(this.units.length - 1, 0));
@@ -813,7 +846,8 @@ const player = {
         const token = ++this.loadToken;
         let clip;
         try {
-            clip = await globalThis.breezeTts.getClip(clips[clipIndex].text, clips[clipIndex].voice);
+            const wanted = clips[clipIndex];
+            clip = await globalThis.breezeTts.getClip(wanted.text, wanted.voice, wanted.hint);
         } catch (error) {
             toastr.error(String(error?.message ?? error), 'Breeze Player');
             return this.notify('error');
@@ -829,7 +863,7 @@ const player = {
 
         // Warm whatever comes next: the rest of this paragraph, then the next.
         const next = clips[clipIndex + 1] ?? this.units[index + 1]?.clips?.[0];
-        if (next) globalThis.breezeTts.prefetch(next.text, next.voice);
+        if (next) globalThis.breezeTts.prefetch(next.text, next.voice, next.hint);
     },
 
     next() { return this.playAt(this.index + 1); },
@@ -861,6 +895,7 @@ const player = {
     },
 
     notify(state) {
+        // index only: the panel reads clipIndex off the player for the rest.
         if (typeof this.onChange === 'function') this.onChange(state, this.index);
     },
 };
@@ -1053,6 +1088,12 @@ async function openPanel(messageId, { play = false, expandAll = false } = {}) {
         const lines = takeLines();
         const editable = viewing === 0;
 
+        // The exact clip on air, so the panel can name the voice reading it.
+        const active = playingIndex >= 0 && player.messageId === messageId
+            ? player.units[playingIndex]?.clips?.[player.clipIndex] ?? null
+            : null;
+        const who = active?.voice ? ` — ${active.speaker ?? 'narration'} in "${active.voice}"` : '';
+
         list.innerHTML = '';
         rows = units.map((unit, i) => {
             const row = document.createElement('div');
@@ -1088,6 +1129,26 @@ async function openPanel(messageId, { play = false, expandAll = false } = {}) {
                 repaint(state, playingIndex);
             });
             row.append(headRow);
+
+            // Chips make a multi-voice paragraph visible without expanding it.
+            const voices = [...new Set((lines[i]?.segments ?? [])
+                .map(segment => voiceForSegment(segment, message))
+                .filter(Boolean))];
+            if (voices.length > 1) {
+                const chips = document.createElement('div');
+                chips.style.cssText = 'display:flex;gap:0.3em;flex-wrap:wrap;margin:0.2em 0 0 1.4em;'
+                    + 'font-size:calc(var(--mainFontSize) * 0.85);';
+                for (const name of voices) {
+                    const chip = document.createElement('span');
+                    const live = i === playingIndex && name === active?.voice;
+                    chip.style.cssText = 'border:1px solid var(--white20a);border-radius:4px;'
+                        + `padding:0 0.35em;opacity:${live ? '1' : '0.55'};`
+                        + (live ? 'font-weight:bold;' : '');
+                    chip.textContent = name;
+                    chips.append(chip);
+                }
+                row.append(chips);
+            }
 
             let input = null;
             if (expanded.has(i)) {
@@ -1126,9 +1187,9 @@ async function openPanel(messageId, { play = false, expandAll = false } = {}) {
         status.textContent = !direction
             ? 'No direction yet — press the rotate button to generate one.'
             : state === 'loading'
-                ? `Generating audio for paragraph ${playingIndex + 1}…`
+                ? `Generating audio for paragraph ${playingIndex + 1}…${who}`
                 : playingIndex >= 0
-                    ? `Paragraph ${playingIndex + 1} of ${units.length} — ${state}`
+                    ? `Paragraph ${playingIndex + 1} of ${units.length} — ${state}${who}`
                     : `${units.length} paragraphs`;
     }
 
@@ -1219,7 +1280,7 @@ async function eraseClips(messageId) {
     const units = buildUnits(message.mes);
     const byVoice = new Map();
     units.forEach((unit, i) => {
-        for (const clip of clipsFor(message, direction?.lines?.[i] ?? unit)) {
+        for (const clip of clipsFor(message, direction?.lines?.[i] ?? unit, messageId, i)) {
             if (!clip.voice) continue;
             if (!byVoice.has(clip.voice)) byVoice.set(clip.voice, []);
             byVoice.get(clip.voice).push(clip.text);
@@ -1347,6 +1408,13 @@ const SETTINGS_HTML = `
       <code>{{lines}}</code>, <code>{{voices}}</code>):</label>
       <textarea id="bd_voice_pick_prompt" class="text_pole textarea_compact" rows="8"></textarea>
       <input id="bd_voice_pick_reset" class="menu_button" type="button" value="Reset casting prompt">
+      <small id="bd_cast_prompt_warn" style="color:var(--golden);display:block;"></small>
+
+      <hr>
+      <b>Cast for this chat</b>
+      <small>Who the director has given a voice to. Forgetting one re-casts it next time.</small>
+      <div id="bd_cast_list" style="margin:0.4em 0;"></div>
+      <input id="bd_cast_clear" class="menu_button" type="button" value="Forget whole cast">
 
       <hr>
       <b>Player</b>
@@ -1397,6 +1465,10 @@ function bind() {
         $('#bd_prompt_warn').text(config.prompt.includes('{{quotes}}')
             ? ''
             : 'This saved prompt predates speaker casting — click "Reset prompt" to enable it.');
+        $('#bd_cast_prompt_warn').text(config.voice_pick_prompt.includes('{{cast}}')
+            ? ''
+            : 'This saved casting prompt cannot see the existing cast — click '
+                + '"Reset casting prompt" so the director keeps voices consistent.');
         $('#bd_paragraph_warn').text(ctx().extensionSettings?.tts?.narrate_by_paragraphs
             ? ''
             : 'SillyTavern\'s "Narrate by paragraphs" is off, so its own narration reads '
@@ -1419,6 +1491,56 @@ function bind() {
         save();
     });
 
+    // The roster is the point of the cast cache, so make it visible and editable.
+    const renderCast = () => {
+        const host = $('#bd_cast_list').empty();
+        // Read without creating: bind() runs before any chat is open.
+        const cast = settings().cast?.[currentChatId()] ?? {};
+        const speakers = Object.keys(cast).sort();
+        if (!speakers.length) {
+            host.append('<small style="opacity:0.6;">Nobody cast yet.</small>');
+            return;
+        }
+
+        const available = globalThis.breezeTts?.listVoices?.() ?? [];
+        for (const speaker of speakers) {
+            const row = $('<div class="flex-container" style="gap:0.4em;align-items:center;margin:0.2em 0;"></div>');
+            row.append($('<span style="flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;"></span>').text(speaker));
+
+            const select = $('<select class="text_pole" style="flex:0 0 auto;width:auto;"></select>');
+            for (const name of available) select.append($('<option/>').val(name).text(name));
+            // A voice deleted from the provider's JSON still shows, so the
+            // entry is explainable rather than silently snapping elsewhere.
+            if (!available.includes(cast[speaker])) {
+                select.append($('<option/>').val(cast[speaker]).text(`${cast[speaker]} (missing)`));
+            }
+            select.val(cast[speaker]).on('change', function () {
+                cast[speaker] = String($(this).val());
+                save();
+            });
+
+            const forget = $('<div class="menu_button fa-solid fa-xmark" title="Forget this one" style="flex:0 0 auto;"></div>');
+            forget.on('click', () => {
+                delete cast[speaker];
+                save();
+                renderCast();
+            });
+
+            row.append(select, forget);
+            host.append(row);
+        }
+    };
+    renderCast();
+    onCastChanged = renderCast;
+
+    $('#bd_cast_clear').on('click', () => {
+        const cast = settings().cast?.[currentChatId()] ?? {};
+        for (const speaker of Object.keys(cast)) delete cast[speaker];
+        save();
+        renderCast();
+        toastr.info('Cast forgotten for this chat.', 'Breeze Director');
+    });
+
     $('#bd_reset').on('click', () => {
         config.prompt = DEFAULT_PROMPT;
         $('#bd_prompt').val(DEFAULT_PROMPT);
@@ -1430,6 +1552,7 @@ function bind() {
         config.voice_pick_prompt = DEFAULT_VOICE_PICK_PROMPT;
         $('#bd_voice_pick_prompt').val(DEFAULT_VOICE_PICK_PROMPT);
         save();
+        warn();
     });
     const playerConfig = playerSettings();
     $('#bp_autoplay').prop('checked', playerConfig.autoplay_next).on('change', function () {
@@ -1520,6 +1643,7 @@ jQuery(async () => {
         inFlight.clear();
         voiceJobs.clear();
         castJobs.clear();
+        onCastChanged?.();
         player.stop();
         closeAllPanels();
         addButtons();

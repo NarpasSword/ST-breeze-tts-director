@@ -30,9 +30,10 @@ This extension does nothing on its own. It requires a **separate** extension,
 The coupling is entirely through two globals, never imports:
 
 - This extension **reads** `globalThis.breezeTts` — `available`, `listVoices`,
-  `hasVoice`, `addVoice`, `assignVoice`, `voiceForCharacter`, `prefetch`,
-  `getClip`, `cacheStats`, `clearCache`.
-- This extension **publishes** `globalThis.breezeDirector(text, voiceId, preset)`.
+  `hasVoice`, `addVoice`, `assignVoice`, `voiceForCharacter`,
+  `prefetch(text, voice, hint)`, `getClip(text, voice, hint)`, `dropClips`,
+  `cacheStats`, `clearCache`.
+- This extension **publishes** `globalThis.breezeDirector(text, voiceId, preset, hint)`.
   The provider calls it for every narration line and falls back to the voice's
   static instruction whenever it returns `null` or throws.
 
@@ -98,9 +99,26 @@ of what gets spoken.
 so a segment still matches the paragraph it came from, but leaves `*` and `_`
 alone as content. Don't reintroduce markup stripping without a reason to.
 
-This is also why `pickLine()` needs no segment awareness: its "quote-only
-narration hands us a fragment" branch already maps a span back to its parent
-paragraph's instruction.
+### How a segment finds its instruction
+
+Every segment of a paragraph is generated with that paragraph's single
+instruction, so tone context is intact no matter how many voices a paragraph
+uses. There are two ways it gets there:
+
+- **With a hint** — the player knows exactly which message and paragraph it is
+  playing, so `clipsFor()` attaches `{ messageId, paragraph }` to every clip and
+  it rides through `getClip` → `_plan` → `breezeDirector`. Exact, and the only
+  path the player uses.
+- **Without one** — SillyTavern's own narration calls the provider with nothing
+  but text, so `locate()` and `pickLine()` have to find the paragraph by
+  matching. That is dependable for a whole paragraph, which is all ST ever
+  sends.
+
+Never rely on matching for a fragment. `locate()` scans the chat newest-first
+for any message containing the text, and `pickLine()` falls back to the longest
+paragraph containing it — a short quote like `"Yes."` can match the wrong
+paragraph, or the wrong message. If a new caller generates sub-paragraph audio,
+it must pass a hint.
 
 **Caveat on the first rule.** ST only splits by line when
 `extension_settings.tts.narrate_by_paragraphs` is on (`tts/index.js:274`). With
@@ -156,7 +174,7 @@ were once separate extensions. Keep both keys — renaming drops users' configs.
    voice if the character has none, then prefetch every clip. Doing this before
    narration means **no LLM call happens during playback**.
 2. The provider calls `globalThis.breezeDirector(text, …)` per line. It locates
-   the message by fuzzy-matching normalized text (`locate`, `pickLine`), awaits
+   the message from the hint, or by matching text when there is none, awaits
    any in-flight precompute for that message rather than racing it, and returns
    `{ instruction, cfg_scale }`.
 3. `on_missing` decides the no-direction case: `static` (provider's own preset,
@@ -182,6 +200,26 @@ Resolution order, each step falling through on failure:
 Non-quote text uses `defaultVoice()`: the configured `narrator_voice` if it
 still exists in the provider's JSON, else the character's own voice. Leaving the
 setting empty reproduces pre-casting behavior exactly.
+
+`pickVoice()` shows the model the chat's running cast through `{{cast}}`, and
+asks it to reuse a voice when the speaker is someone already cast under another
+name and otherwise to prefer an uncast one. That is what keeps a long scene
+consistent, so a saved casting prompt without `{{cast}}` is a real regression —
+`bind()` warns until it is reset.
+
+### Seeing the cast
+
+Three views, because a wrong voice is otherwise invisible until you hear it:
+
+- The settings drawer lists the chat's cast, one row per speaker, with a voice
+  dropdown and a forget button. It repaints live via `onCastChanged`, which
+  `castVoice()` fires, and on `CHAT_CHANGED`. A voice since deleted from the
+  provider's JSON still shows, marked `(missing)`.
+- A paragraph using more than one voice shows chips naming them, collapsed or
+  not, with the one currently on air bolded.
+- The panel status line names the speaker and voice of the clip playing.
+
+`pickVoice()` toasts what it cast, matching `designVoice()`'s existing toast.
 
 ### Failure policy
 
