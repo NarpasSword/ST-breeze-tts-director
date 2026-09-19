@@ -347,6 +347,8 @@ function eq(label, got, want) {
     fails++; print('  FAIL ' + label + '\n       got  ' + g + '\n       want ' + w);
 }
 
+const DEFAULT_VOICE_MARKER = '[Default Voice]';
+
 async function runAssertions() {
 const api = new Function(source + `;return {
     isExcluded, readableText, getDirection, DEFAULT_EXCLUSIONS, settings, hasProfile,
@@ -527,6 +529,10 @@ eq('keeps filled fields', cleanProfile({ gender: 'male', age: ' 40s ', tone: 'Gr
 eq('drops unknown', cleanProfile({ gender: 'unknown', tone: 'Soft.' }), { tone: 'Soft.' });
 eq('drops unlisted keys', cleanProfile({ tone: 'Soft.', mood: 'angry' }), { tone: 'Soft.' });
 eq('all empty is null', cleanProfile({ gender: '', age: '  ' }), null);
+// A long tone is kept, not truncated — mangling someone's voice is worse than
+// a wordy one — but it warns, which is how it becomes visible at all.
+const wordy = Array(40).fill('word').join(' ');
+eq('an over-long tone survives', cleanProfile({ tone: wordy })?.tone, wordy);
 eq('missing is null', cleanProfile(undefined), null);
 
 print('extractJson');
@@ -623,6 +629,12 @@ function runCastScenarios() {
            identify: { Q1: 'Alice', Q2: 'Bob' } },
          { cast: ['Alice', 'Bob'], base: 'villain', tone: 'Gruff.' }],
 
+        ['a [Default Voice] entry is not a choice of base',
+         { map: { Alice: '[Default Voice]', '[Default Voice]': 'narrator' },
+           casting: { base: 'villain', gender: 'female', tone: 'Dry.' },
+           identify: { Q1: 'Alice', Q2: 'Bob' } },
+         { cast: ['Alice', 'Bob'], base: 'villain', aliceBase: 'villain' }],
+
         ['unattributed quotes are ignored',
          { map: { Alice: 'narrator' }, identify: { Q1: 'Alice', Q2: 'unknown' } },
          { cast: ['Alice'] }],
@@ -644,7 +656,7 @@ function runCastScenarios() {
                 return { content: setup.raw ?? JSON.stringify(setup.identify),
                          reasoning: setup.reasoning };
             }
-            if (prompt.includes("Describe a character's voice")) {
+            if (prompt.includes('Available base voices')) {
                 return { content: JSON.stringify(setup.casting) };
             }
             return { content: JSON.stringify(['Weary.', 'Flat and final.']) };
@@ -660,7 +672,15 @@ function runCastScenarios() {
             hasVoice: (n) => BASE.includes(n) || added.has(n),
             addVoice: async (n, preset) => { added.set(n, preset); return n; },
             assignVoice: async () => {},
-            voiceForCharacter: (n) => setup.map[n] ?? null,
+            assignedVoice: (n) => {
+                const value = setup.map[n];
+                return (!value || value === DEFAULT_VOICE_MARKER) ? null : value;
+            },
+            voiceForCharacter: (n) => {
+                const value = setup.map[n];
+                return (value === DEFAULT_VOICE_MARKER
+                    ? setup.map[DEFAULT_VOICE_MARKER] : value) ?? null;
+            },
             voicePreset: (n) => (BASE.includes(n) ? { cfg_scale: 4 } : added.get(n) ?? null),
             prefetch: async () => true,
             getClip: async () => null,
@@ -691,7 +711,12 @@ function runCastScenarios() {
             // still getting a description, which a voice-map entry does not
             // supply. Stopping at the base was why the character sat on the
             // sheet blank while side characters were fully described.
-            if (cast.Alice && !setup.prestage?.Alice) {
+            if (want.aliceBase) {
+                // Nobody chose a voice for her, so the director chose the base
+                // rather than inheriting whatever [Default Voice] points at.
+                eq(label + ' — character is cast freely',
+                   [cast.Alice?.base, cast.Alice?.source], [want.aliceBase, undefined]);
+            } else if (cast.Alice && !setup.prestage?.Alice) {
                 eq(label + ' — character takes their voice-map voice',
                    [cast.Alice.base, cast.Alice.source], ['narrator', 'voicemap']);
                 // Only where the model had a description to give; the
@@ -718,7 +743,7 @@ function runCastScenarios() {
             if (prompt.includes('who speaks each line')) {
                 return { content: JSON.stringify({ Q1: 'Alice', Q2: 'Bob' }) };
             }
-            if (prompt.includes("Describe a character's voice")) {
+            if (prompt.includes('Available base voices')) {
                 return { content: JSON.stringify({ base: 'villain', tone: 'Gruff.' }) };
             }
             throw new Error('castMessage should not ask for direction');
@@ -732,6 +757,7 @@ function runCastScenarios() {
             hasVoice: (n) => BASE.includes(n) || added.has(n),
             addVoice: async (n, preset) => { added.set(n, preset); return n; },
             assignVoice: async () => {},
+            assignedVoice: (n) => (n === 'Alice' ? 'narrator' : null),
             voiceForCharacter: (n) => (n === 'Alice' ? 'narrator' : null),
             voicePreset: (n) => (BASE.includes(n) ? { cfg_scale: 4 } : added.get(n) ?? null),
             prefetch: async () => true, getClip: async () => null,
@@ -763,6 +789,7 @@ function runCastScenarios() {
                 listVoices: () => [...BASE, ...added.keys()],
                 hasVoice: (n) => BASE.includes(n) || added.has(n),
                 addVoice: async (n, preset) => { added.set(n, preset); return n; },
+                assignedVoice: (n) => (n === 'Alice' ? 'narrator' : null),
                 voiceForCharacter: (n) => (n === 'Alice' ? 'narrator' : null),
                 voicePreset: (n) => (BASE.includes(n) ? { cfg_scale: 4 } : null),
                 prefetch: async () => true,
@@ -773,7 +800,7 @@ function runCastScenarios() {
                 if (prompt.includes('who speaks each line')) {
                     return { content: JSON.stringify({ Q1: 'Alice', Q2: 'Bob' }) };
                 }
-                if (prompt.includes("Describe a character's voice")) {
+                if (prompt.includes('Available base voices')) {
                     return { content: JSON.stringify({ base: 'villain', tone: 'Gruff.' }) };
                 }
                 return { content: JSON.stringify(['Weary.', 'Flat and final.']) };
@@ -796,6 +823,7 @@ function runCastScenarios() {
             globalThis.breezeTts = {
                 available: true,
                 hasVoice: () => true,
+                assignedVoice: () => 'narrator',
                 voiceForCharacter: () => 'narrator',
                 voicePreset: () => ({ cfg_scale: 4 }),
                 prefetch: async () => true,
@@ -826,6 +854,7 @@ function runCastScenarios() {
                 listVoices: () => [...BASE, ...added.keys()],
                 hasVoice: (n) => BASE.includes(n) || added.has(n),
                 addVoice: async (n, preset) => { added.set(n, preset); return n; },
+                assignedVoice: () => null,
                 voiceForCharacter: () => null,
                 voicePreset: (n) => (BASE.includes(n) ? { cfg_scale: 4 } : null),
                 previewWith: async () => {},

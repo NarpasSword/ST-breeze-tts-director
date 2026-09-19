@@ -328,19 +328,27 @@ character is called something else is still ignored.
    is what once made the sheet look empty while attribution worked fine.
 1. `entry.pinned` — set by any edit in the cast sheet, and it outranks even the
    voice map, because the edit was an explicit choice.
-2. `breezeTts.voiceForCharacter(speaker)` — a hand-assigned voice-map entry
-   settles the **base** and is recorded with `source: 'voicemap'`. It does not
+2. `breezeTts.assignedVoice(speaker)` — an **explicitly** assigned voice-map
+   entry settles the base and is recorded with `source: 'voicemap'`. It does not
    end the casting: a voice-map entry says which voice someone speaks through,
    not how they sound, so `askCasting()` still runs for the description.
 
-   Returning here was a real bug. `{{char}}` nearly always has a voice-map
-   entry, so the character sat on the sheet with a base and no description while
-   side characters — who have none — got the full treatment.
+   Use `assignedVoice()`, never `voiceForCharacter()`, to decide this.
+   `voiceForCharacter()` follows `[Default Voice]` to whatever it points at,
+   which is right for a narration fallback and wrong here: SillyTavern marks
+   every character with that placeholder until someone chooses otherwise
+   (`tts/index.js:1525`), so following it read "nobody picked a voice" as "the
+   user picked this one" and pinned every character to the same base. That is
+   what made the director look like it always chose the same voice.
+
+   Returning here at all was a separate bug: `{{char}}` usually has some entry,
+   so the character sat on the sheet with a base and no description while side
+   characters got the full treatment.
 3. The chat's cast cache, when the entry already has both a base and a
    description (`hasProfile()`). A base alone is not a description.
 4. `askCasting()` answers with both a **base voice** and a **profile**, shown the
-   speaker's card text, their own lines, the available voices and the running
-   cast. This is the only call that describes a voice, and it runs once per
+   speaker's **character card**, their own lines, the available voices and the
+   running cast. This is the only call that describes a voice, and it runs once per
    speaker. When the base is already settled it is named in the prompt, so the
    description suits the voice they will actually speak through, and the model's
    own base choice only fills a gap.
@@ -381,6 +389,33 @@ casing it likes, and a missed lookup silently loses the whole description.
 This used to ride along on the director prompt. It was two jobs in one call with
 too little context for either; the director prompt now only directs, and its
 `{{quotes}}` placeholder is gone.
+
+The card is the best evidence there is about how someone sounds, and for the
+chat's own character it is often the only evidence — their lines are being read,
+not described. `cardText()` reads the v1 fields **and** the v2 `data` ones, as
+SillyTavern does (`slash-commands.js:5541`), because a card written to the v2
+spec leaves the top-level fields empty; reading only those found nothing.
+`cardFor()` matches the name trimmed and case-insensitively, since the name
+comes from a model. When no card is found, that is logged rather than passed
+over in silence.
+
+### The voice is the instrument, not the performance
+
+A cast member's `tone` describes how someone **always** sounds — pitch, texture,
+pace, habitual manner. How a given line is *felt* is the per-paragraph
+director's job, and the two compose at generation time.
+
+Keeping them apart matters in the prompt, or the model writes the performance
+into the instrument: an early version returned *"teasing and quick-witted when
+confident, but prone to breathless, rambling flusters when nervous"* — a
+description of a character arc, not a voice, and at forty-odd words it also
+drowned the paragraph direction it was concatenated with. The casting prompt
+therefore caps the tone at fifteen words, bans semicolons, dashes and
+sub-clauses, and shows one worked example of the right shape.
+
+`cleanProfile()` warns past `TONE_WORD_LIMIT` but never truncates — cutting
+someone's voice off mid-phrase is worse than a wordy one, and the warning is
+what makes it visible at all.
 
 ### Composing a voice instruction
 
