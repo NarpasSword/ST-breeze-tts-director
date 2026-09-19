@@ -130,15 +130,18 @@ function buildUnits(mes) {
     return splitLines(mes).map(text => ({ text }));
 }
 
-// Verbatim from SillyTavern's parseMessageSegments (tts/index.js). A paragraph
-// stays the unit of direction; segments exist only to decide who reads what.
-const SEGMENT_PATTERN = /(\*[^*]*?\*)|(".*?")|(\u201C.*?\u201D)|(\u00AB.*?\u00BB)|(\u300C.*?\u300D)|(\u300E.*?\u300F)|(\uFF02.*?\uFF02)/gim;
+// SillyTavern's parseMessageSegments (tts/index.js) minus its \*action\*
+// alternative: this chat is plaintext, so an asterisk is an asterisk. Leaving
+// that alternative in would let a stray pair — "2 * 3 * 4", a footnote marker —
+// be read as markup and silently stripped out of what gets spoken.
+// A paragraph stays the unit of direction; segments only decide who reads what.
+const SEGMENT_PATTERN = /(".*?")|(\u201C.*?\u201D)|(\u00AB.*?\u00BB)|(\u300C.*?\u300D)|(\u300E.*?\u300F)|(\uFF02.*?\uFF02)/gim;
 
 /**
  * Split one paragraph into spans that may each take their own voice, matching
  * ST's rules: delimiters stripped, pieces trimmed, empties dropped, and the
- * whole line kept when nothing matches. Asterisk actions read as narration —
- * only quoted speech can change speaker.
+ * whole line kept when nothing matches. Only quoted speech changes speaker;
+ * everything around it is narration.
  */
 function splitSegments(line) {
     const segments = [];
@@ -151,8 +154,9 @@ function splitSegments(line) {
             const before = line.slice(lastIndex, match.index).trim();
             if (before) segments.push({ text: before, kind: 'narration' });
         }
+        // Every alternative left in the pattern is a quote form.
         const content = match[0].slice(1, -1).trim();
-        if (content) segments.push({ text: content, kind: match[1] ? 'narration' : 'dialogue' });
+        if (content) segments.push({ text: content, kind: 'dialogue' });
         lastIndex = match.index + match[0].length;
     }
 
@@ -218,7 +222,9 @@ function clipsFor(message, line) {
     return segments.map(segment => ({ text: segment.text, voice: voiceForSegment(segment, message) }));
 }
 
-const normalize = s => String(s ?? '').replace(/[*_"'`~]/g, '').replace(/\s+/g, ' ').trim().toLowerCase();
+// Strips quote marks so a segment matches the paragraph it came from. Asterisks
+// stay: in plaintext they are content, not markup.
+const normalize = s => String(s ?? '').replace(/["'`\u201C\u201D\u00AB\u00BB]/g, '').replace(/\s+/g, ' ').trim().toLowerCase();
 
 /** Stored direction, but only if it still belongs to the current swipe. */
 function getDirection(message) {

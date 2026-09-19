@@ -77,14 +77,26 @@ Two levels of splitting, and the distinction is load-bearing:
   what SillyTavern's TTS extension does when it builds narration jobs. This is
   the unit of *direction*, of panel rows, and of resume positions.
 - `splitSegments()` splits one paragraph into quoted and unquoted spans, so each
-  can take its own voice. It mirrors ST's `parseMessageSegments`
-  (`tts/index.js:537`) exactly, delimiters stripped and empties dropped, and its
-  regex is byte-identical to ST's.
+  can take its own voice. It follows ST's `parseMessageSegments`
+  (`tts/index.js:537`) — delimiters stripped, pieces trimmed, empties dropped —
+  with one deliberate difference below.
 
 An earlier design used segments for *direction* too, and was reverted because
 one-sentence fragments made for poor stage directions — that history is in
 `.bak`. Segments are back for voices only; every segment in a paragraph
 inherits that paragraph's single instruction, so the arc survives.
+
+### This chat is plaintext
+
+`SEGMENT_PATTERN` is ST's regex **minus its `\*action\*` alternative**, because
+messages here carry no asterisk markup. Only quoted speech changes speaker;
+everything else is narration. Leaving that alternative in would let a stray pair
+— `2 * 3 * 4`, a footnote marker — be read as markup and silently stripped out
+of what gets spoken.
+
+`normalize()` follows the same rule: it strips quote marks, straight and curly,
+so a segment still matches the paragraph it came from, but leaves `*` and `_`
+alone as content. Don't reintroduce markup stripping without a reason to.
 
 This is also why `pickLine()` needs no segment awareness: its "quote-only
 narration hands us a fragment" branch already maps a span back to its parent
