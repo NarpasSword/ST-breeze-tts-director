@@ -42,18 +42,19 @@ Consequence: `manifest.json` `loading_order` must stay **above** the provider's
 
 ## Install / iterate
 
-Before deploying, smoke-test the file:
+Before deploying, check the file:
 
 ```
-gjs tools/smoke.js index.js
+gjs tools/check.js index.js
 ```
 
-It loads `index.js` under stubs for the browser and SillyTavern globals and runs
-the jQuery ready handler. **Run it after every edit.** Anything that throws at
-module eval or inside `bind()` aborts the rest of the file, so the extension
-disappears from the UI entirely — no panel, no buttons, no listeners — with the
-only clue in the browser console. A syntax check alone will not catch it: a
-missing top-level `const` parses fine and throws at eval.
+It loads `index.js` under stubs for the browser and SillyTavern globals, runs
+the jQuery ready handler, then asserts the pure logic against the file as
+loaded. **Run it after every edit.** Anything that throws at module eval or
+inside `bind()` aborts the rest of the file, so the extension disappears from
+the UI entirely — no panel, no buttons, no listeners — with the only clue in the
+browser console. A syntax check alone will not catch it: a missing top-level
+`const` parses fine and throws at eval.
 
 No build. Deploy by putting the folder where SillyTavern serves per-user
 extensions, then hard-reload the browser:
@@ -206,19 +207,37 @@ Resolution order, each step falling through on failure:
 1. `breezeTts.voiceForCharacter(speaker)` — a hand-assigned voice-map entry
    always beats the director.
 2. The chat's cast cache.
-3. `cardFor(speaker)` hits → `designVoice()` writes them a real voice.
-4. Otherwise `pickVoice()` asks the model to choose from `listVoices()`.
+3. `askCasting()` asks the model for a **base voice** and a **tone
+   description**, showing it the speaker's card text, their own lines, the
+   available voices and the running cast.
+4. `deriveVoice()` writes a new provider voice named after the speaker: the
+   base's `cfg_scale`, and its `ref_audio_url`/`ref_text` when it has both, with
+   the tone as the `instruction`. Several characters may share a base — the
+   description is what tells them apart.
 5. Null → the caller falls back to `voiceForSegment()`'s live resolution.
 
 Non-quote text uses `defaultVoice()`: the configured `narrator_voice` if it
 still exists in the provider's JSON, else the character's own voice. Leaving the
 setting empty reproduces pre-casting behavior exactly.
 
-`pickVoice()` shows the model the chat's running cast through `{{cast}}`, and
-asks it to reuse a voice when the speaker is someone already cast under another
-name and otherwise to prefer an uncast one. That is what keeps a long scene
-consistent, so a saved casting prompt without `{{cast}}` is a real regression —
-`bind()` warns until it is reset.
+`askCasting()` shows the model the chat's running cast through `{{cast}}` and
+asks it to reuse a base when the speaker is someone already cast under another
+name. That is what keeps a long scene consistent, so a saved casting prompt
+without `{{cast}}` is a real regression — `bind()` warns until it is reset.
+
+A cast entry is `{ voice, base, tone }`. `castEntry()` normalises the bare
+voice-name strings written before base and tone existed, so old chats keep
+working.
+
+### Prompts upgrade themselves now
+
+`syncPrompts()` stamps each stored prompt with a hash of the default it came
+from. On load, a stored prompt still matching its stamp was never edited and is
+replaced with the current default; one that differs was customised and is left
+alone. This is the fix for the old trap where changing a default here did
+nothing for an existing install. A prompt stored *before* stamping exists has no
+stamp, so it is left alone and warned about — reset it once and it starts
+tracking.
 
 ### Seeing the cast
 
@@ -232,7 +251,14 @@ Three views, because a wrong voice is otherwise invisible until you hear it:
   not, with the one currently on air bolded.
 - The panel status line names the speaker and voice of the clip playing.
 
-`pickVoice()` toasts what it cast, matching `designVoice()`'s existing toast.
+`castVoice()` toasts what it cast, matching `designVoice()`'s existing toast.
+
+The sheet itself is `openCastSheet()`, opened from the wand menu's **Voice
+cast** entry or the settings button. One row per speaker: base voice, tone
+description, preview, re-cast, forget. Edits apply immediately and re-derive the
+speaker's provider voice **under its existing name**, so segments already stored
+in the chat keep pointing at it. The settings panel only reports the count and
+opens the sheet — one editor, not two.
 
 ### Failure policy
 
