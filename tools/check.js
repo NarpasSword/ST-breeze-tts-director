@@ -251,6 +251,13 @@ function runCastScenarios() {
            identify: { speakers: { Q1: 'Alice', Q2: 'Bob' }, profiles: {} } },
          { cast: ['Bob'], added: [] }],
 
+        ['a pre-staged speaker is reused, not re-cast',
+         { map: { Alice: 'narrator' }, casting: 'villain',
+           prestage: { Bob: { voice: 'villain', base: 'villain', pinned: true, tone: 'Mine.' } },
+           identify: { speakers: { Q1: 'Alice', Q2: 'Bob' },
+                       profiles: { Bob: { gender: 'male', tone: 'Gruff.' } } } },
+         { cast: ['Bob'], added: [], tone: 'Mine.', voice: 'villain' }],
+
         ['unattributed quotes are ignored',
          { map: { Alice: 'narrator' }, casting: 'villain',
            identify: { speakers: { Q1: 'Alice', Q2: 'unknown' }, profiles: {} } },
@@ -283,10 +290,12 @@ function runCastScenarios() {
             getClip: async () => null,
         };
 
-        const api = new Function(source + ';return { generate, settings, castMap };')();
+        const api = new Function(source
+            + ';return { generate, settings, castMap, castMessage };')();
         const config = api.settings();
         config.profile = 'test';
         config.cast = {};
+        if (setup.prestage) Object.assign(api.castMap(), setup.prestage);
 
         try {
             await api.generate(0, { quiet: true });
@@ -294,11 +303,53 @@ function runCastScenarios() {
             eq(label + ' — cast', Object.keys(cast), want.cast);
             eq(label + ' — voices added', [...added.keys()], want.added);
             if (want.tone) eq(label + ' — profile kept', cast.Bob?.tone, want.tone);
+            if (want.voice) eq(label + ' — voice kept', cast.Bob?.voice, want.voice);
         } catch (error) {
             fails++;
             print('  FAIL ' + label + ' threw: ' + error);
         }
-    }), Promise.resolve()).then(finish, (error) => {
+    }), Promise.resolve()).then(async () => {
+        // castMessage() is the casting half alone: it must leave direction be.
+        const added = new Map();
+        context.chat = [{ name: 'Alice', swipe_id: 0, extra: {}, mes: MES }];
+        context.ConnectionManagerRequestService.sendRequest = async (profile, prompt) => {
+            if (prompt.includes('who speaks each line')) {
+                return { content: JSON.stringify({
+                    speakers: { Q1: 'Alice', Q2: 'Bob' },
+                    profiles: { Bob: { gender: 'male', tone: 'Gruff.' } },
+                }) };
+            }
+            if (prompt.includes('Choose which existing voice')) return { content: 'villain' };
+            throw new Error('castMessage should not ask for direction');
+        };
+        globalThis.breezeTts = {
+            available: true,
+            listVoices: () => [...BASE, ...added.keys()],
+            hasVoice: (n) => BASE.includes(n) || added.has(n),
+            addVoice: async (n, preset) => { added.set(n, preset); return n; },
+            assignVoice: async () => {},
+            voiceForCharacter: (n) => (n === 'Alice' ? 'narrator' : null),
+            voicePreset: (n) => (BASE.includes(n) ? { cfg_scale: 4 } : added.get(n) ?? null),
+            prefetch: async () => true, getClip: async () => null,
+        };
+
+        const api = new Function(source
+            + ';return { settings, castMap, castMessage };')();
+        const config = api.settings();
+        config.profile = 'test';
+        config.cast = {};
+
+        try {
+            const named = await api.castMessage(0);
+            eq('castMessage — names the speaker', named, ['Bob']);
+            eq('castMessage — casts them', Object.keys(api.castMap()), ['Bob']);
+            eq('castMessage — leaves direction alone',
+               context.chat[0].extra.breeze_direction ?? null, null);
+        } catch (error) {
+            fails++;
+            print('  FAIL castMessage threw: ' + error);
+        }
+    }).then(finish, (error) => {
         fails++;
         print('  FAIL scenario chain threw: ' + error);
         finish();

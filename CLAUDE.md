@@ -297,7 +297,21 @@ Three views, because a wrong voice is otherwise invisible until you hear it:
 
 The sheet itself is `openCastSheet()`, opened from the wand menu's **Voice
 cast** entry or the settings button. One row per speaker: base voice, gender,
-age, accent, tone, the composed instruction, preview, re-base, forget. Edits apply immediately and re-derive the
+age, accent, tone, the composed instruction, preview, re-base, forget. Its
+toolbar has two chat-level actions:
+
+- **Add speaker** pre-stages someone who has not spoken yet. A hand-added entry
+  is `pinned`, so when the director eventually names them it reuses the entry
+  as-is — no model call, no overwriting the tone you wrote. That is the whole
+  point of pre-staging, and there is a scenario in `tools/check.js` for it.
+- **Scan chat** runs `castMessage()` over the recent messages that contain
+  quotes, newest first, bounded by `CAST_SCAN_LIMIT`. It confirms the cost
+  first, because each message is at least one model call plus one per new voice.
+
+`castMessage()` is the casting half of `generate()` on its own: identify, then
+cast every foreign speaker. It deliberately never writes
+`extra.breeze_direction` — scanning for speakers must not silently re-direct
+messages you have already tuned. Edits apply immediately and re-derive the
 speaker's provider voice **under its existing name**, so segments already stored
 in the chat keep pointing at it. The settings panel only reports the count and
 opens the sheet — one editor, not two.

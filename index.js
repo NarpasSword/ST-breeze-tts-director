@@ -110,6 +110,10 @@ const DEFAULTS = {
 
 const CAST_CHAT_LIMIT = 50;
 
+// How far back a cast scan will look. Each message with quotes in it costs at
+// least one model call, so this is a spend ceiling as much as a search depth.
+const CAST_SCAN_LIMIT = 20;
+
 // Prompts live in settings, so shipping a new default used to change nothing for
 // an existing install. Each stored prompt is stamped with a hash of the default
 // it came from: if it still matches, nobody edited it and it upgrades silently.
@@ -984,6 +988,43 @@ async function castVoice(speaker, quotes = [], profile = null) {
     return pending;
 }
 
+/**
+ * Identify and cast the speakers in one message, leaving its direction alone.
+ * This is the casting half of generate(), for when that is all you want.
+ */
+async function castMessage(index) {
+    const message = ctx().chat?.[index];
+    if (!message) return [];
+
+    const units = buildUnits(message.mes);
+    const quotes = collectQuotes(units.map(unit => splitSegments(unit.text)));
+    if (!quotes.length) return [];
+
+    const found = await identifySpeakers(message, units, quotes);
+    for (const quote of quotes) {
+        quote.speaker = String(found.speakers[quote.id] ?? '').trim();
+    }
+
+    const cast = [];
+    for (const quote of quotes) {
+        if (!isForeignSpeaker(quote.speaker, message) || cast.includes(quote.speaker)) continue;
+        cast.push(quote.speaker);
+        await castVoice(quote.speaker, quotes, profileFor(found.profiles, quote.speaker));
+    }
+    return cast;
+}
+
+/** Messages with quoted speech in them, newest first. */
+function quotedMessages(limit) {
+    const chat = ctx().chat ?? [];
+    const found = [];
+    for (let i = chat.length - 1; i >= 0 && found.length < limit; i--) {
+        const quotes = collectQuotes(buildUnits(chat[i]?.mes).map(unit => splitSegments(unit.text)));
+        if (quotes.length) found.push(i);
+    }
+    return found;
+}
+
 /** Ensure the character has a voice, designing one from their card if not. */
 async function ensureVoice(name) {
     const config = settings();
@@ -1669,8 +1710,76 @@ async function openCastSheet() {
         + 'of their own. Changes are saved as you make them.';
     wrapper.append(heading, note);
 
+    // --- toolbar --------------------------------------------------------
+    const bar = document.createElement('div');
+    bar.className = 'flex-container';
+    bar.style.cssText = 'gap:0.4em;align-items:center;flex-wrap:wrap;margin-bottom:0.6em;';
+
+    const addButton = button(null, 'Add a speaker by hand', () => addSpeaker(), 'Add speaker');
+    const scanButton = button(null, 'Find speakers in recent messages', () => scanChat(), 'Scan chat');
+    const progress = document.createElement('small');
+    progress.style.cssText = 'opacity:0.7;flex:1 1 auto;';
+
+    bar.append(addButton, scanButton, progress);
+    wrapper.append(bar);
+
     const list = document.createElement('div');
     wrapper.append(list);
+
+    /**
+     * Pre-stage someone who has not spoken yet. Added by hand means chosen
+     * deliberately, so the entry is pinned: nothing later overrides it.
+     */
+    async function addSpeaker() {
+        const name = await context.callGenericPopup(
+            'Name of the speaker to add:', context.POPUP_TYPE.INPUT, '',
+        );
+        const speaker = String(name ?? '').trim();
+        if (!speaker) return;
+        if (cast[speaker]) return toastr.info(`${speaker} is already cast.`, 'Breeze Director');
+
+        cast[speaker] = { voice: null, base: null, pinned: true };
+        context.saveSettingsDebounced();
+        onCastChanged?.();
+        paint();
+    }
+
+    /** Run the casting half of the director over recent messages. */
+    async function scanChat() {
+        if (!settings().profile) {
+            return toastr.warning('Pick a connection profile first.', 'Breeze Director');
+        }
+
+        const targets = quotedMessages(CAST_SCAN_LIMIT);
+        if (!targets.length) {
+            return toastr.info('No quoted speech in this chat yet.', 'Breeze Director');
+        }
+
+        const confirmed = await context.callGenericPopup(
+            `Scan ${targets.length} message${targets.length === 1 ? '' : 's'} for speakers? `
+            + `That is at least ${targets.length} model calls, plus one for each new voice.`,
+            context.POPUP_TYPE.CONFIRM,
+        );
+        if (!confirmed) return;
+
+        scanButton.classList.add('disabled');
+        const named = new Set();
+        try {
+            for (let i = 0; i < targets.length; i++) {
+                progress.textContent = `Scanning message ${i + 1} of ${targets.length}…`;
+                for (const speaker of await castMessage(targets[i])) named.add(speaker);
+                paint();
+            }
+            progress.textContent = named.size
+                ? `Found ${[...named].join(', ')}.`
+                : 'No new speakers found.';
+        } catch (error) {
+            console.error('[Breeze Director] cast scan failed:', error);
+            progress.textContent = 'Scan failed — see the console.';
+        } finally {
+            scanButton.classList.remove('disabled');
+        }
+    }
 
     function paint() {
         const available = breeze.listVoices();
