@@ -56,14 +56,24 @@ async function fireAll(from, label) {
     return fired;
 }
 
-let readyFn = null;
+// The extension registers more than one jQuery-ready callback; keep them all.
+const readyFns = [];
+
+// Selector -> value, so a test can see what the extension wrote where.
+const fieldValues = new Map();
+
 function jq(arg) {
-    if (typeof arg === 'function') { readyFn = arg; return undefined; }
+    if (typeof arg === 'function') { readyFns.push(arg); return undefined; }
+    const key = String(arg);
     const o = {
         length: 1,
         append: () => o, prepend: () => o, on: () => o, off: () => o,
         prop: (k, v) => (v === undefined ? false : o),
-        val: (v) => (v === undefined ? '' : o),
+        val: (v) => {
+            if (v === undefined) return fieldValues.get(key) ?? '';
+            fieldValues.set(key, v);
+            return o;
+        },
         text: (v) => (v === undefined ? '' : o),
         html: (v) => (v === undefined ? '' : o),
         css: () => o, attr: () => undefined, empty: () => o, remove: () => o,
@@ -85,10 +95,13 @@ const context = {
         return true;
     },
     POPUP_TYPE: { CONFIRM: 1 },
-    eventSource: { on() {} },
+    listeners: new Map(),
+    eventSource: {
+        on(event, fn) { (context.listeners.get(event) ?? context.listeners.set(event, []).get(event)).push(fn); },
+    },
     event_types: {
         CHARACTER_MESSAGE_RENDERED: 'a', USER_MESSAGE_RENDERED: 'b',
-        MESSAGE_SWIPED: 'c', CHAT_CHANGED: 'd',
+        MESSAGE_SWIPED: 'c', CHAT_CHANGED: 'd', APP_READY: 'app_ready',
     },
     ConnectionManagerRequestService: {
         handleDropdown() {}, sendRequest: async () => ({ content: '' }),
@@ -140,10 +153,15 @@ try {
     imports.system.exit(1);
 }
 
-if (!readyFn) {
+if (!readyFns.length) {
     print('ready handler NOT REGISTERED');
     imports.system.exit(1);
 }
+
+// Pretend SillyTavern already saved Breeze as the chosen provider, and that its
+// own init selected the dropdown before our option existed.
+context.extensionSettings.tts = { currentProvider: 'Breeze', narrate_by_paragraphs: true };
+fieldValues.set('#tts_provider', 'AllTalk');
 
 checkForOrphanedCalls(source);
 
@@ -270,9 +288,17 @@ function stripLiterals(src) {
     return out;
 }
 
-readyFn().then(
+Promise.all(readyFns.map(fn => fn())).then(
     () => {
         print('ready handler OK\n');
+        print('provider selection');
+        eq('dropdown put back on Breeze', fieldValues.get('#tts_provider'), 'Breeze');
+        const onReady = context.listeners.get('app_ready') ?? [];
+        eq('re-asserted on APP_READY', onReady.length > 0, true);
+        fieldValues.set('#tts_provider', 'AllTalk');
+        for (const fn of onReady) fn();
+        eq('APP_READY listener corrects it again', fieldValues.get('#tts_provider'), 'Breeze');
+        print('');
         runAssertions();
     },
     (error) => {
@@ -293,14 +319,28 @@ function runAssertions() {
 const api = new Function(source + `;return {
     splitSegments, collectQuotes, isForeignSpeaker, parseDirection,
     normalize, pickLine, castEntry, hash, syncPrompts,
-    voiceInstruction, cleanProfile, PROFILE_FIELDS,
+    voiceInstruction, cleanProfile, PROFILE_FIELDS, splitLines, buildUnits,
     extractJson, normalizeQuoteId,
     DEFAULT_PROMPT, DEFAULT_VOICE_CAST_PROMPT };`)();
 const { splitSegments, collectQuotes, isForeignSpeaker, parseDirection,
         normalize, pickLine, castEntry, hash, syncPrompts,
-        voiceInstruction, cleanProfile,
+        voiceInstruction, cleanProfile, splitLines, buildUnits,
         extractJson, normalizeQuoteId } = api;
 
+
+print('splitLines');
+eq('plain paragraphs', splitLines('one\ntwo'), ['one', 'two']);
+eq('blank line between paragraphs', splitLines('one\n\ntwo'), ['one', 'two']);
+eq('CRLF paragraph break', splitLines('one\r\n\r\ntwo'), ['one', 'two']);
+eq('trailing CR is trimmed off', splitLines('one\r\ntwo'), ['one', 'two']);
+eq('whitespace-only line', splitLines('one\n   \ntwo'), ['one', 'two']);
+eq('tab-only line', splitLines('one\n\t\ntwo'), ['one', 'two']);
+eq('zero-width-only line', splitLines('one\n\u200B\ntwo'), ['one', 'two']);
+eq('byte-order mark line', splitLines('one\n\uFEFF\ntwo'), ['one', 'two']);
+eq('inner spacing survives', splitLines('a  b'), ['a  b']);
+eq('nothing at all', splitLines(''), []);
+eq('only blanks', splitLines('\r\n \n\t'), []);
+eq('units skip the blanks', buildUnits('one\r\n\r\ntwo').length, 2);
 
 print('splitSegments');
 eq('plain prose', splitSegments('He turned away.'), [{ text: 'He turned away.', kind: 'narration' }]);

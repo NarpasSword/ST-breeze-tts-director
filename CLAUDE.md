@@ -55,6 +55,17 @@ happens when the old standalone `breeze-tts` extension is still installed.
 Unguarded, that aborts the whole file and the extension vanishes from the UI, so
 the call is wrapped and the toast says what to disable.
 
+`showRegisteredProvider()` puts the provider dropdown back on `Breeze` after
+registering. SillyTavern fills that dropdown and selects the saved provider in
+its own init (`tts/index.js:876`), which runs **before** any third-party
+provider registers, so `.val('Breeze')` matches no option yet and the select
+shows its first entry instead. Registration adds the option but never revisits
+the selection. It sets the value only — firing `change` would re-run ST's
+provider switch, and the provider is already loaded; only the display was
+wrong. It also re-asserts on `APP_READY`, which is in the event emitter's
+`autoFireAfterEmit` list, so a listener added after it fired still runs and
+there is no race with however far along ST's init happens to be.
+
 The only path this file depends on is the import `../../tts/index.js`, which
 resolves the same from any third-party folder, since they are all served from
 `/scripts/extensions/third-party/<folder>/`. `loading_order` must stay above
@@ -110,9 +121,19 @@ await globalThis.breezeTts.cacheStats()
 
 Two levels of splitting, and the distinction is load-bearing:
 
-- `buildUnits()` splits a message by `\n`, dropping empty lines — **exactly**
-  what SillyTavern's TTS extension does when it builds narration jobs. This is
-  the unit of *direction*, of panel rows, and of resume positions.
+- `buildUnits()` splits a message by `\n`, dropping lines that **look** empty.
+  This is the unit of *direction*, of panel rows, and of resume positions.
+
+  ST itself drops only lines of length zero. That is not enough: a message with
+  CRLF endings splits into lines still carrying their `\r`, so every paragraph
+  break becomes a one-character line that survives the test and shows up as a
+  blank paragraph — a panel row, a unit to direct, a clip of nothing to
+  generate. Lines of spaces or of zero-width characters do the same, so
+  `splitLines()` trims both before deciding.
+
+  This makes our paragraph numbering diverge from ST's line numbering, which
+  costs nothing: the player addresses paragraphs through an explicit hint, and
+  ST's own path finds them by matching text.
 - `splitSegments()` splits one paragraph into quoted and unquoted spans, so each
   can take its own voice. It follows ST's `parseMessageSegments`
   (`tts/index.js:537`) — delimiters stripped, pieces trimmed, empties dropped —
