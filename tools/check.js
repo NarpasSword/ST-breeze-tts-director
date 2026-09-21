@@ -1092,6 +1092,82 @@ function runCastScenarios() {
             print('  FAIL model deadline threw: ' + error);
         }
 
+        // The dots down the left of the panel: red for a paragraph with no audio,
+        // blue while it is being generated, green once it is cached.
+        print('\nclip status in the panel');
+        try {
+            const view = new Function(source + ';return { settings, buildUnits, blankTake,'
+                + ' openPanel, panels, player, rollUp, CLIP_STATUS };')();
+            const units = view.buildUnits(MES);
+            context.chat = [{ name: 'Alice', swipe_id: 0, extra: {}, mes: MES }];
+            const config = view.settings();
+            config.profile = 'test';
+            config.cast = {};
+
+            eq('pending beats everything — something is happening',
+               view.rollUp(['cached', 'pending', 'missing']), 'pending');
+            eq('ready only when every clip in the paragraph is',
+               view.rollUp(['cached', 'missing']), 'missing');
+            eq('a whole paragraph cached is ready', view.rollUp(['cached', 'cached']), 'cached');
+            eq('a line with no voice is neither', view.rollUp(['unknown']), 'unknown');
+            eq('red and green are not the same colour to a screen either',
+               view.CLIP_STATUS.cached.colour !== view.CLIP_STATUS.missing.colour, true);
+
+            // One status per paragraph, in order, so a scenario can say what the
+            // cache holds without holding a cache.
+            let answers = [];
+            globalThis.breezeTts = {
+                available: true,
+                listVoices: () => [...BASE],
+                hasVoice: (n) => BASE.includes(n),
+                assignedVoice: () => 'narrator',
+                voiceForCharacter: () => 'narrator',
+                voicePreset: () => ({ cfg_scale: 4 }),
+                prefetch: async () => 'generated',
+                getClip: async () => null,
+                clipStatuses: async (clips) => clips.map(() => answers.shift() ?? 'missing'),
+            };
+
+            await view.blankTake(0);          // one clip per paragraph, no casting
+            await view.openPanel(0);
+            const panel = view.panels.get(0);
+
+            answers = units.map(() => 'cached');
+            await panel.refreshStatus();
+            const painted = () => panel.rows.map(r => r.dot.style.background);
+            eq('every paragraph cached paints green',
+               painted().every(c => c === view.CLIP_STATUS.cached.colour), true);
+
+            answers = units.map((_, i) => (i === 0 ? 'pending' : 'missing'));
+            await panel.refreshStatus();
+            eq('a paragraph being generated paints blue',
+               painted()[0], view.CLIP_STATUS.pending.colour);
+            eq('and one with nothing cached paints red',
+               painted()[1], view.CLIP_STATUS.missing.colour);
+
+            // A skipped paragraph is not missing audio; it is not being read.
+            context.chat[0].extra.breeze_skip = [0];
+            answers = units.map(() => 'missing');
+            await panel.refreshStatus();
+            eq('a skipped paragraph is neither red nor green',
+               painted()[0], view.CLIP_STATUS.skipped.colour);
+            delete context.chat[0].extra.breeze_skip;
+
+            // An older provider cannot answer, and must not be shown as a fault.
+            globalThis.breezeTts = { ...globalThis.breezeTts, clipStatuses: undefined };
+            panel.repaint();
+            await panel.refreshStatus();
+            eq('a provider that cannot say leaves the dots neutral',
+               painted().every(c => c !== view.CLIP_STATUS.missing.colour
+                   && c !== view.CLIP_STATUS.cached.colour), true);
+
+            view.player.stop();
+            view.panels.delete(0);
+        } catch (error) {
+            fails++;
+            print('  FAIL clip status threw: ' + error);
+        }
+
         // What actually reaches Breeze. A request with neither an instruction nor
         // reference audio matches none of Breeze's three modes, so the one case
         // that can produce it — a blank take on a voice that says nothing about
@@ -1127,6 +1203,36 @@ function runCastScenarios() {
                (await plan('cloned')).instruction, '');
             eq('the fallback is part of the cache key, not smuggled past it',
                JSON.parse((await plan('plain')).key)[2].length > 0, true);
+
+            // The panel asks for a clip's key on every repaint, so planning one
+            // must not write direction — even under the setting that otherwise
+            // sends an undirected message off to the model.
+            const director = new Function(source + ';return { settings };')().settings();
+            const savedMissing = director.on_missing;
+            director.on_missing = 'generate';
+            director.profile = 'test';
+            context.chat = [{ name: 'Alice', swipe_id: 0, extra: {}, mes: MES }];
+
+            let asked = 0;
+            const answering = context.ConnectionManagerRequestService.sendRequest;
+            context.ConnectionManagerRequestService.sendRequest = (...args) => {
+                asked++;
+                return answering(...args);
+            };
+            try {
+                await provider._plan(context.chat[0].mes.split('\n')[0], 'designed',
+                                     { messageId: 0, paragraph: 0, peek: true });
+                eq('a peek asks the model for nothing', asked, 0);
+                eq('and writes no take', context.chat[0].extra.breeze_direction ?? null, null);
+
+                // The same plan without the peek is the path that does direct.
+                await provider._plan(context.chat[0].mes.split('\n')[0], 'designed',
+                                     { messageId: 0, paragraph: 0 });
+                eq('without it, an undirected message still gets directed', asked > 0, true);
+            } finally {
+                context.ConnectionManagerRequestService.sendRequest = answering;
+                director.on_missing = savedMissing;
+            }
         } catch (error) {
             fails++;
             print('  FAIL provider planning threw: ' + error);

@@ -146,6 +146,35 @@ const cache = {
             return null;
         }
     },
+    /**
+     * Is this key in the cache? Deliberately not `get()`: that reads the whole
+     * blob back and writes a new timestamp, and the panel asks this question
+     * about every paragraph on every repaint. Looking at a clip is not using
+     * one, so it must not touch recency either.
+     */
+    async hasMany(keys) {
+        const found = new Map();
+        if (!keys.length) return found;
+        try {
+            const database = await db();
+            return await new Promise((resolve, reject) => {
+                const transaction = database.transaction(STORE, 'readonly');
+                const store = transaction.objectStore(STORE);
+                for (const key of keys) {
+                    const request = store.count(key);
+                    request.onsuccess = () => found.set(key, request.result > 0);
+                }
+                transaction.oncomplete = () => resolve(found);
+                transaction.onerror = () => reject(transaction.error);
+            });
+        } catch (error) {
+            console.warn('[Breeze] cache probe failed:', error);
+            return found;
+        }
+    },
+    async has(key) {
+        return (await cache.hasMany([key])).get(key) ?? false;
+    },
     async put(key, blob, limit, meta = {}) {
         try {
             await tx('readwrite', store => store.put({
@@ -249,8 +278,33 @@ globalThis.breezeTts = {
     cacheStats() { return cache.stats(); },
     /** What would be sent for this line, without sending it. */
     explain(text, voice, hint) { return this._provider?._plan(text, voice, hint) ?? null; },
-    /** Is this plan's clip already in the cache? */
-    async isCached(key) { return !!(await cache.get(key)); },
+    /** Is this plan's clip already in the cache? Asked without using it. */
+    async isCached(key) { return cache.has(key); },
+    /**
+     * Where each of these clips stands: `cached`, `pending` (being generated
+     * right now, by playback or a pre-generate run) or `missing`.
+     *
+     * Planned with `peek`, so asking never writes direction, and probed in one
+     * cache transaction rather than one per clip — the panel asks this about
+     * every paragraph every time it repaints.
+     */
+    async clipStatuses(clips) {
+        const provider = this._provider;
+        if (!provider) return clips.map(() => 'unknown');
+
+        const plans = [];
+        for (const clip of clips) {
+            plans.push(clip.voice
+                ? await provider._plan(clip.text, clip.voice, { ...clip.hint, peek: true })
+                : null);
+        }
+        const found = await cache.hasMany(plans.filter(Boolean).map(plan => plan.key));
+        return plans.map(plan => {
+            if (!plan) return 'unknown';
+            if (provider._pending.has(plan.key)) return 'pending';
+            return found.get(plan.key) ? 'cached' : 'missing';
+        });
+    },
     /** Play a base voice under an instruction that is not stored anywhere. */
     previewWith(voice, instruction, cfgScale) {
         return this._provider?.previewTtsVoice(voice, { instruction, cfg_scale: cfgScale });
@@ -1545,12 +1599,18 @@ globalThis.breezeDirector = async function (text, voiceId, preset, hint) {
 
     let line = '';
     if (message) {
+        // A peek is the panel asking what a clip's key would be so it can say
+        // whether that clip exists. It must never write direction, and must
+        // never block on someone else writing it: a question about state cannot
+        // be allowed to change the state, or to hang the panel painting itself.
+        const peek = !!hint?.peek;
+
         // If a precompute is still running for this message, wait for it rather
         // than firing a second call or silently falling back.
-        if (inFlight.has(index)) await inFlight.get(index);
+        if (!peek && inFlight.has(index)) await inFlight.get(index);
 
         let direction = getDirection(message);
-        if (!direction && config.on_missing === 'generate') {
+        if (!peek && !direction && config.on_missing === 'generate') {
             await run(index);
             direction = getDirection(message);
         }
@@ -2034,12 +2094,19 @@ async function prefetchReport(index, { from = 0 } = {}) {
     const excluded = skipped(message);
     report.paragraphs = units.length;
 
+    // The panel, if this message has one open, follows along: a dot goes blue
+    // while its clip is generating and green as it lands, rather than the whole
+    // message changing colour at the end.
+    const nudge = () => panels.get(index)?.refreshStatus?.();
+
     for (let i = Math.max(0, from); i < units.length; i++) {
         if (excluded.has(i)) { report.skipped++; continue; }
         for (const clip of clipsFor(message, direction?.lines?.[i] ?? units[i], index, i)) {
             if (!clip.voice) { report.voiceless++; continue; }
 
+            nudge();
             const outcome = await breeze.prefetch(clip.text, clip.voice, clip.hint);
+            nudge();
             if (outcome === 'cached') report.cached++;
             else if (outcome === 'cache-off') report.reason = 'cache-off';
             else if (outcome) report.made++;
@@ -2306,6 +2373,38 @@ function button(icon, title, handler, label) {
     return element;
 }
 
+// Whether a paragraph's audio exists yet, as a colour. Red and green carry the
+// meaning, so they are the GitHub pair rather than pure hues: they stay apart
+// for the commonest colour blindness, and both hold up on a light or a dark
+// theme, which SillyTavern's own variables do not promise.
+const CLIP_STATUS = {
+    cached: { colour: '#3fb950', label: 'audio ready' },
+    pending: { colour: '#4493f8', label: 'generating now' },
+    missing: { colour: '#f85149', label: 'no audio yet' },
+    unknown: { colour: 'var(--white50a)', label: 'no voice for this line' },
+    skipped: { colour: 'var(--white30a)', label: 'skipped — not read aloud' },
+};
+
+/**
+ * One paragraph's standing, from its clips'. Pending wins over everything —
+ * something is happening and the panel should say so — and a paragraph counts
+ * as ready only when every clip in it is, since a half-cached paragraph still
+ * stops to generate when it is played.
+ */
+function rollUp(statuses) {
+    if (!statuses.length) return 'unknown';
+    if (statuses.includes('pending')) return 'pending';
+    if (statuses.every(s => s === 'cached')) return 'cached';
+    if (statuses.every(s => s === 'unknown')) return 'unknown';
+    return 'missing';
+}
+
+function paintDot(dot, status, detail) {
+    const { colour, label } = CLIP_STATUS[status] ?? CLIP_STATUS.unknown;
+    dot.style.background = colour;
+    dot.title = label + detail;
+}
+
 function stamp(ts) {
     if (!ts) return 'earlier take';
     const date = new Date(ts);
@@ -2410,6 +2509,12 @@ async function openPanel(messageId, { play = false, expandAll = false } = {}) {
     const status = document.createElement('small');
     status.style.cssText = 'opacity:0.7;display:block;margin-bottom:0.4em;';
     root.append(status);
+
+    // Built once, outside repaint(), so a status pass that finishes after a
+    // repaint still has somewhere to write.
+    const audioLine = document.createElement('small');
+    audioLine.style.cssText = 'opacity:0.7;display:block;margin-bottom:0.4em;';
+    root.append(audioLine);
 
     const list = document.createElement('div');
     root.append(list);
@@ -2528,7 +2633,16 @@ async function openPanel(messageId, { play = false, expandAll = false } = {}) {
                 await pregenerateFrom(messageId, { from: i });
             });
 
-            headRow.append(include, chevron, text, pregenOne, playOne);
+            // Where this paragraph's audio stands. Filled in by refreshStatus()
+            // once the cache has been asked; it starts neutral rather than red
+            // so a panel opening does not flash "missing" at everything.
+            const dot = document.createElement('span');
+            dot.style.cssText = 'flex:0 0 auto;width:0.6em;height:0.6em;border-radius:50%;'
+                + 'margin-top:0.45em;background:var(--white30a);'
+                + 'transition:background 0.2s;';
+            dot.title = 'Checking for cached audio…';
+
+            headRow.append(include, dot, chevron, text, pregenOne, playOne);
             headRow.addEventListener('click', () => {
                 expanded.has(i) ? expanded.delete(i) : expanded.add(i);
                 repaint(state, playingIndex);
@@ -2578,8 +2692,12 @@ async function openPanel(messageId, { play = false, expandAll = false } = {}) {
 
             if (i === playingIndex) row.style.background = 'var(--white20a)';
             list.append(row);
-            return { row, input };
+            return { row, input, dot };
         });
+
+        // Asking the cache is asynchronous; painting the rows is not. Kick it
+        // off and let it catch up, rather than holding the repaint on it.
+        refreshStatus();
 
         if (viewing !== 0) {
             const restore = button(null, 'Make this the current take', () => restoreTake(messageId), 'Restore this take');
@@ -2600,6 +2718,79 @@ async function openPanel(messageId, { play = false, expandAll = false } = {}) {
                     : `${units.length} paragraphs`;
     }
 
+    // --- audio status ---------------------------------------------------
+    // Which paragraphs already have their audio, which are being generated, and
+    // which have none. Repainting throws the rows away, so a pass in flight is
+    // abandoned by its token rather than painting onto elements nobody can see.
+    let statusToken = 0;
+    let statusTimer = null;
+
+    async function refreshStatus() {
+        const token = ++statusToken;
+        const breeze = globalThis.breezeTts;
+        const painting = rows;
+        if (!painting.length || !breeze?.available) return;
+
+        // An older provider cannot answer this. Leave every dot neutral rather
+        // than claim the audio is missing, which would read as a fault.
+        if (typeof breeze.clipStatuses !== 'function') return;
+
+        const lines = takeLines();
+        const units = buildUnits(message.mes);
+        const excluded = skipped(message);
+        const painted = [];
+
+        // Every clip in the message goes in one question, so the whole panel
+        // costs a single cache transaction rather than one per paragraph — and
+        // repainting during playback asks this on every clip boundary.
+        const perRow = painting.map((_, i) => (excluded.has(i)
+            ? []
+            : clipsFor(message, lines[i] ?? units[i], messageId, i)));
+
+        let statuses;
+        try {
+            statuses = await breeze.clipStatuses(perRow.flat());
+        } catch (error) {
+            // Nothing awaits this pass — it is kicked off by repaint — so a
+            // throw here would surface as an unhandled rejection and nothing else.
+            console.warn('[Breeze Player] could not read clip status:', error);
+            return;
+        }
+        // A repaint happened while the cache was being asked; these rows are
+        // gone, and the pass that replaced this one owns the new ones.
+        if (token !== statusToken) return;
+
+        let at = 0;
+        for (let i = 0; i < painting.length; i++) {
+            const mine = statuses.slice(at, at + perRow[i].length);
+            at += perRow[i].length;
+
+            const dot = painting[i]?.dot;
+            if (!dot) continue;
+            if (excluded.has(i)) {
+                paintDot(dot, 'skipped', '');
+                continue;
+            }
+
+            const ready = mine.filter(s => s === 'cached').length;
+            const detail = mine.length > 1 ? ` (${ready} of ${mine.length} clips)` : '';
+            const status = rollUp(mine);
+            paintDot(dot, status, detail);
+            painted.push(status);
+        }
+
+        const count = what => painted.filter(s => s === what).length;
+        audioLine.textContent = painted.length
+            ? `Audio: ${count('cached')} ready, ${count('pending')} generating, `
+                + `${count('missing')} not yet generated`
+            : '';
+
+        // Something is being generated: come back and watch it turn green.
+        // Self-limiting — the chain stops as soon as nothing is pending.
+        clearTimeout(statusTimer);
+        if (painted.includes('pending')) statusTimer = setTimeout(refreshStatus, 700);
+    }
+
     takes.addEventListener('change', () => {
         viewing = Number(takes.value);
         repaint();
@@ -2608,7 +2799,10 @@ async function openPanel(messageId, { play = false, expandAll = false } = {}) {
     const entry = {
         root,
         repaint,
+        refreshStatus,
         refreshTakes,
+        // The painted rows, so a check can read back what a status pass did.
+        get rows() { return rows; },
         get direction() { return direction; },
         set direction(value) { direction = value; },
         get viewing() { return viewing; },

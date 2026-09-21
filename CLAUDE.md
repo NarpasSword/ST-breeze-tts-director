@@ -20,8 +20,9 @@ A SillyTavern third-party extension: **Breeze TTS, Director & Player**. One
   configurable narrator voice.
 - **Player** — an inline panel per message with paragraph-level seek,
   per-message resume, per-segment voice overrides, and take history: takes can
-  be restored, deleted, or blanked, and audio pre-generated from any paragraph
-  without waiting for a director.
+  be restored, deleted, or blanked, audio pre-generated from any paragraph
+  without waiting for a director, and a dot per paragraph saying whether its
+  audio is cached, generating, or not there yet.
 
 There is no build or lint tooling beyond `tools/check.js`. The file is a plain
 ES module loaded directly by the browser.
@@ -376,6 +377,42 @@ the causes that look identical from outside: no voice assigned, an empty
 instruction, a clip already cached, a paragraph unchecked. It sends nothing —
 `breezeTts.explain()` runs `_plan()` and stops, and `breezeTts.isCached()` looks
 the key up without generating.
+
+### The dots: which paragraphs have their audio
+
+Every row in the panel carries a dot: **red** for a paragraph with no audio yet,
+**blue** while a clip of it is being generated, **green** once it is cached.
+Skipped paragraphs and lines with no voice sit neutral — neither is a fault, and
+painting them red would read as one. A tooltip names the state and, for a
+paragraph split across voices, how many of its clips are ready. Under the
+toolbar, `audioLine` totals the same thing in words.
+
+`rollUp()` decides a paragraph from its clips: pending beats everything, because
+something is happening and the panel should say so; ready needs *every* clip,
+since a half-cached paragraph still stops to generate when it is played.
+
+Colours are the GitHub pair (`#3fb950` / `#f85149`) plus `#4493f8`, written out
+rather than taken from SillyTavern's variables: these three carry the meaning,
+they have to stay apart for the commonest colour blindness, and they have to
+hold up on a light theme and a dark one.
+
+**Asking must not change anything.** `breezeTts.clipStatuses(clips)` plans each
+clip with `peek: true`, which tells the director hook to skip both the `inFlight`
+wait and the `on_missing: generate` branch — a question about state cannot write
+direction, or hang the panel behind someone else's model call. The keys are then
+probed with `cache.hasMany()`, which uses `count()` in **one** transaction:
+`cache.get()` would read every blob back and rewrite its timestamp, and looking
+at a clip is not using one, so it must not touch LRU recency either.
+
+Repainting throws the rows away, so each pass takes a token and abandons itself
+if another started. The pass is kicked off by `repaint()` and never awaited, so
+its body catches everything — an unhandled rejection is all a throw here would
+produce. A provider too old to answer leaves the dots neutral.
+
+Live updates come from two places: `prefetchReport()` nudges the panel around
+every clip it generates, and a pass that saw anything pending schedules itself
+again in 700 ms. The chain stops as soon as nothing is pending, so an idle panel
+costs nothing.
 
 ### A pre-generation that makes no sound says why
 
