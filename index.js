@@ -1361,6 +1361,62 @@ function run(index, options) {
     return pending;
 }
 
+/** A take that says nothing: every paragraph present, every instruction empty. */
+function isBlank(direction) {
+    return !!direction?.lines?.length
+        && direction.lines.every(line => !String(line?.instruction ?? '').trim());
+}
+
+/**
+ * Write an empty take, with no model call at all.
+ *
+ * A message with no take is not the same thing as a message told to be read
+ * plainly: the first still runs the director the moment `on_missing` is
+ * `generate`, and audio cached before that happens is audio thrown away. An
+ * empty take settles the question — every paragraph is present, every
+ * instruction is blank, so the lines are read with nothing but the voice's own
+ * preset behind them and the clips cached against that keep matching.
+ *
+ * Any cast the previous take carried is kept where the text still lines up:
+ * segments say who speaks, which is not delivery direction and is not what
+ * blanking a take is asking to throw away.
+ */
+async function blankTake(index) {
+    const message = ctx().chat?.[index];
+    if (!message) return null;
+
+    const units = buildUnits(message.mes);
+    if (!units.length) return null;
+
+    const previous = getDirection(message);
+    if (isBlank(previous)) return previous;   // already blank; don't churn history
+
+    const lines = units.map((unit, i) => {
+        const line = { text: unit.text, instruction: '' };
+        const carried = previous?.lines?.[i];
+        if (carried?.segments?.length && normalize(carried.text) === normalize(unit.text)) {
+            line.segments = carried.segments;
+        }
+        return line;
+    });
+
+    const history = previous
+        ? [{ ts: previous.ts ?? Date.now(), lines: previous.lines }, ...(previous.history ?? [])]
+        : [];
+
+    message.extra = message.extra ?? {};
+    message.extra.breeze_direction = {
+        swipe_id: message.swipe_id ?? 0,
+        ts: Date.now(),
+        lines,
+        history: history.slice(0, HISTORY_LIMIT),
+    };
+
+    await ctx().saveChat();
+    markButton(index);
+    return message.extra.breeze_direction;
+}
+
 // ---------------------------------------------------------------- the TTS hook
 
 function locate(text) {
@@ -1844,8 +1900,11 @@ function quotedMessages(limit) {
 /**
  * Generate every clip for a message ahead of playback, sequentially. Returns how
  * many were produced, which is what the pre-generate button and command report.
+ *
+ * `from` starts partway down a long message, so a run interrupted three
+ * paragraphs in can be picked up where it stopped rather than from the top.
  */
-async function prefetchMessage(index) {
+async function prefetchMessage(index, { from = 0 } = {}) {
     const breeze = globalThis.breezeTts;
     const message = ctx().chat?.[index];
     if (!breeze?.available || !message) return 0;
@@ -1855,7 +1914,7 @@ async function prefetchMessage(index) {
     const excluded = skipped(message);
 
     let made = 0;
-    for (let i = 0; i < units.length; i++) {
+    for (let i = Math.max(0, from); i < units.length; i++) {
         if (excluded.has(i)) continue;
         for (const clip of clipsFor(message, direction?.lines?.[i] ?? units[i], index, i)) {
             if (!clip.voice) continue;
@@ -1871,13 +1930,17 @@ async function prefetchMessage(index) {
  * Direction comes first even when only audio was asked for: a clip is cached
  * against the instruction it was generated under, so audio made before the
  * direction exists is audio that has to be thrown away and made again.
+ *
+ * `blank` is the other way of settling that: write an empty take instead of
+ * asking the model for one, and cache the audio the voice makes on its own.
  */
-async function pregenerate(index, { quiet = true } = {}) {
+async function pregenerate(index, { quiet = true, blank = false, from = 0 } = {}) {
     const message = ctx().chat?.[index];
     if (!message) return 0;
 
-    if (settings().enabled && !hasDirection(index)) await run(index, { quiet });
-    return prefetchMessage(index);
+    if (blank) await blankTake(index);
+    else if (settings().enabled && !hasDirection(index)) await run(index, { quiet });
+    return prefetchMessage(index, { from });
 }
 
 /** Everything that should happen before narration starts. */
@@ -2187,11 +2250,15 @@ async function openPanel(messageId, { play = false, expandAll = false } = {}) {
     const regenButton = button('fa-rotate', 'Generate a new take', () => regenerate(messageId));
     const pregenButton = button('fa-cloud-arrow-down',
         'Generate this message\'s audio now, ready for later', () => pregenerateFrom(messageId));
+    const blankButton = button('fa-eraser',
+        'Blank the take: clear every instruction, no model call, old take kept in the history',
+        () => blankFrom(messageId));
     const expandButton = button('fa-chevron-down', 'Expand or collapse every paragraph', () => toggleAll(messageId));
+    const dropButton = button('fa-xmark', 'Delete the take shown here', () => deleteTake(messageId));
     const eraseButton = button('fa-trash', 'Erase cached audio for this message', () => eraseClips(messageId));
 
     bar.append(playButton, prevButton, nextButton, stopButton, regenButton, pregenButton,
-        expandButton, takes, eraseButton);
+        blankButton, expandButton, takes, dropButton, eraseButton);
     root.append(bar);
 
     const status = document.createElement('small');
@@ -2211,6 +2278,8 @@ async function openPanel(messageId, { play = false, expandAll = false } = {}) {
 
     function refreshTakes() {
         takes.innerHTML = '';
+        // Nothing to show a take of, and nothing to delete either.
+        dropButton.style.opacity = direction ? '' : '0.4';
         if (!direction) {
             const option = document.createElement('option');
             option.textContent = 'No direction yet';
@@ -2221,12 +2290,13 @@ async function openPanel(messageId, { play = false, expandAll = false } = {}) {
         takes.disabled = false;
         const current = document.createElement('option');
         current.value = '0';
-        current.textContent = `Current — ${stamp(direction.ts)}`;
+        current.textContent = `Current — ${stamp(direction.ts)}${isBlank(direction) ? ' (blank)' : ''}`;
         takes.append(current);
         (direction.history ?? []).forEach((take, i) => {
             const option = document.createElement('option');
             option.value = String(i + 1);
-            option.textContent = `Take ${direction.history.length - i} — ${stamp(take.ts)}`;
+            option.textContent = `Take ${direction.history.length - i} — ${stamp(take.ts)}`
+                + (isBlank(take) ? ' (blank)' : '');
             takes.append(option);
         });
         takes.value = String(viewing);
@@ -2301,7 +2371,18 @@ async function openPanel(messageId, { play = false, expandAll = false } = {}) {
                 playFrom(messageId, i);
             });
 
-            headRow.append(include, chevron, text, playOne);
+            // Pre-generating from a paragraph rather than from the top: a long
+            // message interrupted partway need not pay for its first half twice.
+            const pregenOne = document.createElement('div');
+            pregenOne.className = 'fa-solid fa-cloud-arrow-down';
+            pregenOne.title = 'Generate audio from this paragraph on';
+            pregenOne.style.cssText = 'opacity:0.6;padding-top:0.25em;cursor:pointer;';
+            pregenOne.addEventListener('click', async event => {
+                event.stopPropagation();
+                await pregenerateFrom(messageId, { from: i });
+            });
+
+            headRow.append(include, chevron, text, pregenOne, playOne);
             headRow.addEventListener('click', () => {
                 expanded.has(i) ? expanded.delete(i) : expanded.add(i);
                 repaint(state, playingIndex);
@@ -2419,15 +2500,37 @@ async function regenerate(messageId) {
     }
 }
 
-/** Generate a message's audio up front, leaving it cached rather than playing it. */
-async function pregenerateFrom(messageId) {
-    const icon = panels.get(messageId)?.root.querySelector('.fa-cloud-arrow-down');
+/**
+ * Generate a message's audio up front, leaving it cached rather than playing it.
+ *
+ * `from` is the paragraph to start at — the panel passes the row that was
+ * clicked — and `blank` says to settle the direction by emptying it rather than
+ * by asking the model.
+ */
+async function pregenerateFrom(messageId, { from = 0, blank = false } = {}) {
+    const entry = panels.get(messageId);
+    // The row icons carry the same class as the toolbar button; querySelector
+    // returns the toolbar one, which is where a whole-message job belongs.
+    const icon = entry?.root.querySelector('.fa-cloud-arrow-down');
     icon?.classList.add('fa-spin');
     try {
-        const made = await pregenerate(messageId, { quiet: false });
+        const made = await pregenerate(messageId, { quiet: false, from, blank });
+
+        // Pre-generation can settle the direction on its own — by writing one or
+        // by blanking it — so the panel may be holding a take that no longer exists.
+        if (entry) {
+            const fresh = getDirection(ctx().chat?.[messageId]);
+            if (fresh !== entry.direction) {
+                entry.direction = fresh;
+                entry.viewing = 0;
+                entry.refreshTakes();
+            }
+            entry.repaint();
+        }
+        const where = from > 0 ? ` from paragraph ${from + 1}` : '';
         toastr.success(
-            made ? `Generated ${made} clip${made === 1 ? '' : 's'}, ready to play.`
-                : 'Nothing new to generate — it is already cached.',
+            made ? `Generated ${made} clip${made === 1 ? '' : 's'}${where}, ready to play.`
+                : `Nothing new to generate${where} — it is already cached.`,
             'Breeze',
         );
     } catch (error) {
@@ -2436,6 +2539,105 @@ async function pregenerateFrom(messageId) {
     } finally {
         icon?.classList.remove('fa-spin');
     }
+}
+
+/**
+ * A take change reaches what is already on air only if the player rebuilds its
+ * units from it — paragraphs and their clips come from the take's segments — so
+ * a message being read is reloaded, as unchecking a paragraph does. A reload
+ * that fails is not worth losing the change over; it is logged and left.
+ */
+async function reloadIfPlaying(messageId) {
+    if (player.messageId !== messageId) return;
+    try {
+        await player.load(messageId);
+    } catch (error) {
+        console.warn('[Breeze Player] could not reload after a take changed:', error);
+    }
+}
+
+/**
+ * Empty this message's take, so it is read with nothing but the voice's own
+ * preset behind it. Audio is not generated here: which paragraph to start from
+ * is the reader's call, and the row and toolbar cloud buttons ask it.
+ */
+async function blankFrom(messageId) {
+    const entry = panels.get(messageId);
+    const icon = entry?.root.querySelector('.fa-eraser');
+    icon?.classList.add('fa-spin');
+    try {
+        const direction = await blankTake(messageId);
+        if (!direction) return toastr.info('Nothing to blank.', 'Breeze Director');
+
+        if (entry) {
+            entry.direction = direction;
+            entry.viewing = 0;
+            entry.refreshTakes();
+            entry.repaint();
+        }
+        await reloadIfPlaying(messageId);
+        toastr.success(
+            'Take blanked. Use the cloud button for the whole message, '
+            + 'or a paragraph\'s own to start there.',
+            'Breeze Director',
+        );
+    } catch (error) {
+        console.error('[Breeze Director] blanking failed:', error);
+        toastr.error(String(error?.message ?? error), 'Breeze Director');
+    } finally {
+        icon?.classList.remove('fa-spin');
+    }
+}
+
+/**
+ * Drop the take the panel is showing.
+ *
+ * A take from the history is simply removed. Deleting the current one promotes
+ * the newest take behind it, so the undo path the history exists for still
+ * works; with nothing behind it the message goes back to having no direction at
+ * all, which is a real state — it is what a message starts in.
+ */
+async function deleteTake(messageId) {
+    const context = ctx();
+    const entry = panels.get(messageId);
+    const message = context.chat?.[messageId];
+    const direction = entry?.direction;
+    if (!entry || !message || !direction) return;
+
+    const at = entry.viewing;
+    const history = direction.history ?? [];
+    const label = at === 0
+        ? (history.length ? 'Delete the current take and go back to the one before it?'
+            : 'Delete the current take? This message has no earlier one, so it will be '
+              + 'left with no direction.')
+        : `Delete take ${history.length - (at - 1)}?`;
+
+    const confirmed = await context.callGenericPopup(label, context.POPUP_TYPE.CONFIRM);
+    if (!confirmed) return;
+
+    if (at > 0) {
+        history.splice(at - 1, 1);
+        direction.history = history;
+        message.extra.breeze_direction = direction;
+    } else if (history.length) {
+        const previous = history.shift();
+        direction.lines = previous.lines;
+        direction.ts = previous.ts ?? Date.now();
+        direction.history = history;
+        message.extra.breeze_direction = direction;
+    } else {
+        delete message.extra.breeze_direction;
+        entry.direction = null;
+    }
+
+    await context.saveChat();
+    markButton(messageId);
+
+    await reloadIfPlaying(messageId);
+
+    entry.viewing = 0;
+    entry.refreshTakes();
+    entry.repaint();
 }
 
 function restoreTake(messageId) {
@@ -2843,34 +3045,49 @@ function targetMessage(value) {
     return (index >= 0 && index < chat.length) ? index : -1;
 }
 
+/** STscript has no booleans; a named flag arrives as whatever was typed. */
+function isOn(value) {
+    return /^(?:true|1|on|yes)$/i.test(String(value ?? '').trim());
+}
+
 function registerSlashCommands() {
     const context = ctx();
-    const { SlashCommandParser, SlashCommand, SlashCommandArgument, ARGUMENT_TYPE } = context;
+    const {
+        SlashCommandParser, SlashCommand, SlashCommandArgument,
+        SlashCommandNamedArgument, ARGUMENT_TYPE,
+    } = context;
     if (!SlashCommandParser?.addCommandObject || !SlashCommand?.fromProps) {
         console.warn('[Breeze Director] this SillyTavern has no slash command API; skipping.');
         return;
     }
 
-    const add = (name, aliases, returns, help, act) => {
+    const add = (name, aliases, returns, help, act, named = []) => {
         SlashCommandParser.addCommandObject(SlashCommand.fromProps({
             name,
             aliases,
             returns,
+            namedArgumentList: named,
             unnamedArgumentList: [new SlashCommandArgument(
                 'message id; negative counts back from the end, default the last message',
                 [ARGUMENT_TYPE.NUMBER], false,
             )],
             helpString: help,
-            callback: async (_args, value) => {
+            callback: async (args, value) => {
                 const index = targetMessage(value);
                 if (index < 0) {
                     toastr.warning('No such message.', 'Breeze Director');
                     return '';
                 }
-                return String(await act(index) ?? '');
+                return String(await act(index, args ?? {}) ?? '');
             },
         }));
     };
+
+    // Named arguments are optional everywhere here; a build without the class
+    // simply gets the commands without their flags rather than no commands.
+    const flag = (props) => (SlashCommandNamedArgument
+        ? [new SlashCommandNamedArgument(props.name, props.description, props.typeList, false)]
+        : []);
 
     add('breeze-direct', ['breezedirect'], 'number of paragraphs directed', `
         <div>Write delivery direction for a message, as the director does automatically.</div>
@@ -2888,8 +3105,31 @@ function registerSlashCommands() {
         <div>Generate a message's audio now and leave it cached, without playing it.</div>
         <div>Directs the message first if it has no direction, since a clip is cached
         against the instruction it was made under.</div>
-        <div><strong>Example:</strong> <code>/breeze-audio</code></div>`,
-    (index) => pregenerate(index, { quiet: false }));
+        <div><code>blank=true</code> writes an empty take instead of calling the model,
+        so the lines are read with nothing but the voice's own preset behind them.</div>
+        <div><code>from=</code> starts at that paragraph, counting from 1, instead of
+        at the top.</div>
+        <div><strong>Example:</strong> <code>/breeze-audio</code>,
+        <code>/breeze-audio blank=true</code>, or
+        <code>/breeze-audio blank=true from=3 -2</code></div>`,
+    (index, args) => pregenerate(index, {
+        quiet: false,
+        blank: isOn(args.blank),
+        // Paragraphs are numbered from 1 in the panel; match that here.
+        from: Math.max(0, (Number(args.from) || 1) - 1),
+    }),
+    [
+        ...flag({ name: 'blank', description: 'write an empty take rather than calling the model', typeList: [ARGUMENT_TYPE.BOOLEAN] }),
+        ...flag({ name: 'from', description: 'first paragraph to generate, counting from 1', typeList: [ARGUMENT_TYPE.NUMBER] }),
+    ]);
+
+    add('breeze-blank', ['breezeblank'], 'number of paragraphs blanked', `
+        <div>Empty a message's take: every paragraph kept, every instruction cleared,
+        no model call. The take it replaces stays in the message's history.</div>
+        <div>Audio cached against a blank take keeps matching, since nothing will
+        direct the message later.</div>
+        <div><strong>Example:</strong> <code>/breeze-blank</code></div>`,
+    async (index) => (await blankTake(index))?.lines?.length ?? 0);
 }
 
 const SETTINGS_HTML = `

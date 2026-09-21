@@ -19,7 +19,8 @@ A SillyTavern third-party extension: **Breeze TTS, Director & Player**. One
   **base** and writes a description of them. Non-quote text reads in a
   configurable narrator voice.
 - **Player** — an inline panel per message with paragraph-level seek,
-  per-message resume, per-segment voice overrides, and take history.
+  per-message resume, per-segment voice overrides, and take history: takes can
+  be restored, deleted, or blanked, and audio pre-generated from any paragraph.
 
 There is no build or lint tooling beyond `tools/check.js`. The file is a plain
 ES module loaded directly by the browser.
@@ -205,6 +206,10 @@ unattributed spans store no voice and resolve live through `voiceForSegment()`,
 so editing the narrator setting or the TTS voice map keeps working on messages
 already in the chat. A voice picked by hand in the panel pins the same field.
 
+A take whose `lines` all hold an empty `instruction` is a *blank* take, written
+by `blankTake()` and recognised by `isBlank()`. It is not the same as no take at
+all: see "Takes: written, restored, deleted, blanked".
+
 `getDirection()` returns `null` when `swipe_id` no longer matches, so swiping
 silently invalidates a take rather than misapplying it. Text goes in the chat
 (small, worth exporting); audio never does — the provider caches clips in
@@ -309,6 +314,54 @@ nothing is skipped, so a chat that never uses the feature carries nothing extra.
 player needed to know. `prefetchMessage()` skips them too — there is no sense
 generating audio nobody will hear. Pressing play on a skipped paragraph checks
 it again first, since asking to hear it is asking for it back.
+
+### Takes: written, restored, deleted, blanked
+
+A message holds one current take plus up to `HISTORY_LIMIT` behind it. Four
+things move between those slots, all of them in the panel toolbar:
+
+| Control | Does |
+|---|---|
+| rotate | `generate()` — a new take, the old one pushed to the history |
+| restore | `restoreTake()` — swap the take being viewed with the current one |
+| ✕ | `deleteTake()` — drop the take being viewed |
+| eraser | `blankTake()` — empty every instruction, no model call |
+
+`deleteTake()` confirms first, then: a take from the history is spliced out; the
+current take is replaced by the newest one behind it, so the undo path the
+history exists for still works; and with nothing behind it the message is left
+with no direction at all — which is a real state, the one every message starts
+in. The trash button next to it erases *cached audio*, not takes; they are
+deliberately different icons for different kinds of loss.
+
+A **blank take** is the answer to "read this plainly". A message with no take is
+not the same thing: with `on_missing` set to `generate` it still calls the
+director the moment narration reaches it, and audio cached before that happens
+is audio thrown away, because a clip is keyed by the instruction it was made
+under. `blankTake()` settles it — every paragraph present, every instruction the
+empty string, so `breezeDirector()` contributes nothing and the line is read
+with the voice's own preset behind it, which is exactly what the clips were
+cached against.
+
+It writes no model call, pushes the take it replaces into the history like any
+other, and is a no-op when the take is already blank (`isBlank()`), so pressing
+it twice does not churn five real takes out of the history. Segments are carried
+across where the paragraph text still matches: who speaks is not delivery
+direction, and blanking a take is not asking to recast the message. Both the
+dropdown and `/breeze-audio blank=true` mark such a take `(blank)`.
+
+### Pre-generating from a paragraph
+
+`prefetchMessage(index, { from })` starts partway down a message. Each panel row
+carries its own cloud icon beside the play icon, so a long message interrupted
+three paragraphs in is picked up where it stopped rather than paid for twice;
+the toolbar cloud still does the whole message. Skipped paragraphs are skipped
+either way. `from` is 0-based in the code and 1-based in the UI and in
+`/breeze-audio from=`, matching the panel's own "Paragraph 3 of 9".
+
+`pregenerateFrom()` re-reads the take afterwards, because pre-generation can
+settle the direction on its own — by writing one or by blanking it — and the
+panel would otherwise hold a take that no longer exists.
 
 ### Casting a quoted speaker
 
@@ -517,9 +570,20 @@ proves nothing; running it is what catches a name that stopped resolving inside
 it. That pass also asserts the provider's voice list comes back untouched, so
 the no-writes invariant is checked from the UI as well as from `generate()`.
 
+### The player panel is fired, not just opened
+
+The same treatment as the cast sheet, and for the same reason: `openPanel()`
+builds a toolbar and a row per paragraph, and a name that stopped resolving
+inside one of those handlers is invisible until the button is pressed. The check
+opens a panel over a message with a history, fires every handler it bound, then
+**drains the pending promises and stops the player**. Without that the buttons
+that do not await their work leave a repaint in flight, and the elements it
+builds land inside the next section's marker — which is how a broken player
+button once showed up as four failures in the cast sheet.
+
 ### Slash commands
 
-`registerSlashCommands()` adds three, each taking an optional message id — no
+`registerSlashCommands()` adds four, each taking an optional message id — no
 argument means the last message, a negative one counts back from the end:
 
 | Command | Does | Returns |
@@ -527,11 +591,25 @@ argument means the last message, a negative one counts back from the end:
 | `/breeze-direct` | writes delivery direction, keeping the old take in history | paragraphs directed |
 | `/breeze-cast` | identifies speakers and casts anyone new, leaving direction alone | names cast |
 | `/breeze-audio` | generates the audio and leaves it cached, without playing | clips generated |
+| `/breeze-blank` | empties the take — every instruction cleared, no model call | paragraphs blanked |
 
-`/breeze-audio` and the panel's cloud button both go through `pregenerate()`,
+`/breeze-audio` takes two named arguments as well: `blank=true` settles the
+direction by emptying it rather than by calling the model, and `from=3` starts
+at that paragraph, counting from 1. So `/breeze-audio blank=true from=3 -2`
+means "the message before last, read plainly, from its third paragraph on".
+
+Named arguments go through `flag()`, which returns nothing at all when the
+running SillyTavern has no `SlashCommandNamedArgument`: a build without it gets
+the commands without their flags rather than no commands.
+
+STscript has no booleans — a flag arrives as whatever was typed — so `isOn()`
+reads it.
+
+`/breeze-audio` and the panel's cloud buttons all go through `pregenerate()`,
 which **directs first when a message has no direction**. A clip is cached
 against the instruction it was generated under, so audio made before the
-direction exists is audio that has to be thrown away and made again.
+direction exists is audio that has to be thrown away and made again. `blank`
+is the other way of settling that question, not an exception to it.
 
 `targetMessage()` tests its argument for emptiness before converting it.
 `Number('')` is `0`, so a plain `/breeze-audio` would otherwise silently act on

@@ -121,7 +121,10 @@ const context = {
     SlashCommandArgument: function (description, typeList, isRequired) {
         return { description, typeList, isRequired };
     },
-    ARGUMENT_TYPE: { STRING: 'string', NUMBER: 'number' },
+    SlashCommandNamedArgument: function (name, description, typeList, isRequired) {
+        return { name, description, typeList, isRequired };
+    },
+    ARGUMENT_TYPE: { STRING: 'string', NUMBER: 'number', BOOLEAN: 'bool' },
 };
 
 globalThis.$ = jq;
@@ -308,13 +311,16 @@ Promise.all(readyFns.map(fn => fn())).then(
     () => {
         print('ready handler OK\n');
         print('slash commands');
-        eq('registers the three commands', [...context.commands.keys()].sort(),
-           ['breeze-audio', 'breeze-cast', 'breeze-direct']);
+        eq('registers the four commands', [...context.commands.keys()].sort(),
+           ['breeze-audio', 'breeze-blank', 'breeze-cast', 'breeze-direct']);
         for (const [name, command] of context.commands) {
             eq(`${name} takes an optional message id`,
                command.unnamedArgumentList?.[0]?.isRequired, false);
             eq(`${name} documents itself`, (command.helpString ?? '').length > 40, true);
         }
+        eq('breeze-audio takes blank= and from=',
+           (context.commands.get('breeze-audio').namedArgumentList ?? []).map(a => a.name).sort(),
+           ['blank', 'from']);
         print('');
 
         print('provider selection');
@@ -839,6 +845,126 @@ function runCastScenarios() {
         } catch (error) {
             fails++;
             print('  FAIL pre-generation threw: ' + error);
+        }
+
+        // A blank take is the other way of settling the direction: no model
+        // call at all, and audio cached against it stays valid because nothing
+        // will direct the message later.
+        print('\nblank takes');
+        try {
+            const bt = new Function(source + ';return { settings, buildUnits, blankTake, isBlank,'
+                + ' getDirection, pregenerate, prefetchMessage, openPanel, deleteTake,'
+                + ' panels, player };')();
+            globalThis.breezeTts = {
+                available: true,
+                listVoices: () => [...BASE],
+                hasVoice: (n) => BASE.includes(n),
+                addVoice: async (n, preset) => { added.set(n, preset); return n; },
+                assignedVoice: () => 'narrator',
+                voiceForCharacter: () => 'narrator',
+                voicePreset: () => ({ cfg_scale: 4 }),
+                prefetch: async () => true,
+                getClip: async () => null,
+                // The panel's own buttons reach further into the provider than
+                // pre-generation does; the erase button wants all three.
+                cacheStats: async () => ({ count: 0, bytes: 0 }),
+                dropClips: async () => ({ count: 0, bytes: 0 }),
+                clearCache: async () => {},
+            };
+
+            let calls = 0;
+            context.ConnectionManagerRequestService.sendRequest = async () => {
+                calls++;
+                return { content: '[]' };
+            };
+            context.chat = [{ name: 'Alice', swipe_id: 0, extra: {}, mes: MES }];
+            const config = bt.settings();
+            config.profile = 'test';
+            config.cast = {};
+
+            const units = bt.buildUnits(MES);
+            const take = (instruction, extra = {}) => units.map((unit, i) => ({
+                text: unit.text, instruction, ...(i === 0 ? extra : {}),
+            }));
+
+            context.chat[0].extra.breeze_direction = {
+                swipe_id: 0, ts: 1, history: [],
+                lines: take('Weary.', { segments: [{ text: units[0].text, kind: 'dialogue', speaker: 'Bob' }] }),
+            };
+
+            const blanked = await bt.blankTake(0);
+            eq('every instruction is cleared', blanked.lines.every(l => l.instruction === ''), true);
+            eq('and the take reads as blank', bt.isBlank(blanked), true);
+            eq('the take it replaced went to the history', blanked.history.length, 1);
+            eq('which still says what it said', blanked.history[0].lines[0].instruction, 'Weary.');
+            eq('who speaks is not direction, so it rides along',
+               blanked.lines[0].segments?.[0]?.speaker, 'Bob');
+            eq('no model call was made', calls, 0);
+            eq('blanking twice does not churn the history', (await bt.blankTake(0)).history.length, 1);
+
+            delete context.chat[0].extra.breeze_direction;
+            const made = await bt.pregenerate(0, { blank: true });
+            eq('blank pre-generation asks the model for nothing', calls, 0);
+            eq('a clip per paragraph, none of them cast', made, units.length);
+            eq('and a blank take is left behind',
+               bt.isBlank(bt.getDirection(context.chat[0])), true);
+            eq('from= skips the paragraphs before it',
+               await bt.prefetchMessage(0, { from: units.length - 1 }), 1);
+            eq('past the end generates nothing',
+               await bt.prefetchMessage(0, { from: units.length }), 0);
+
+            // Deleting a take runs through the panel, so it exercises the
+            // toolbar handler as well as the bookkeeping underneath it.
+            context.chat[0].extra.breeze_direction = {
+                swipe_id: 0, ts: 3, lines: take('New.'),
+                history: [{ ts: 2, lines: take('Old.') }, { ts: 1, lines: take('Older.') }],
+            };
+            await bt.openPanel(0);
+            eq('the panel opened', bt.panels.has(0), true);
+
+            // Viewing take 2 ("Older.") and deleting it leaves the current one alone.
+            bt.panels.get(0).viewing = 2;
+            await bt.deleteTake(0);
+            let after = bt.getDirection(context.chat[0]);
+            eq('deleting a take from the history leaves the current one', after.lines[0].instruction, 'New.');
+            eq('and removes just that one', after.history.map(h => h.lines[0].instruction), ['Old.']);
+
+            await bt.deleteTake(0);
+            after = bt.getDirection(context.chat[0]);
+            eq('deleting the current take promotes the one behind it',
+               after.lines[0].instruction, 'Old.');
+            eq('which leaves nothing behind it', after.history.length, 0);
+
+            await bt.deleteTake(0);
+            eq('deleting the last take leaves no direction at all',
+               context.chat[0].extra.breeze_direction ?? null, null);
+            eq('still nothing to delete', await bt.deleteTake(0) ?? null, null);
+
+            // Every control the panel builds, run rather than merely bound —
+            // the toolbar's blank, delete and pre-generate buttons and each
+            // paragraph's own icons. A name that stopped resolving inside one
+            // is invisible until the button is pressed.
+            context.chat[0].extra.breeze_direction = {
+                swipe_id: 0, ts: 3, lines: take('New.'), history: [{ ts: 2, lines: take('Old.') }],
+            };
+            bt.panels.get(0)?.root.remove();
+            bt.panels.delete(0);
+            const marker = built.length;
+            await bt.openPanel(0);
+            const fired = await fireAll(marker, 'player panel');
+            eq('the panel bound handlers, and they ran', fired > 5, true);
+
+            // Pressing play left the player running, and the buttons that do not
+            // await their work left promises in flight. A repaint landing during
+            // a later section would build elements that section then fires as
+            // its own, so let them finish here and stop the player after.
+            for (let i = 0; i < 100; i++) await Promise.resolve();
+            bt.player.stop();
+            bt.panels.get(0)?.root.remove();
+            bt.panels.delete(0);
+        } catch (error) {
+            fails++;
+            print('  FAIL blank takes threw: ' + error);
         }
 
         // The cast sheet builds a lot of DOM and is otherwise untested; opening
