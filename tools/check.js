@@ -318,9 +318,9 @@ Promise.all(readyFns.map(fn => fn())).then(
                command.unnamedArgumentList?.[0]?.isRequired, false);
             eq(`${name} documents itself`, (command.helpString ?? '').length > 40, true);
         }
-        eq('breeze-audio takes blank= and from=',
+        eq('breeze-audio takes blank=, direct= and from=',
            (context.commands.get('breeze-audio').namedArgumentList ?? []).map(a => a.name).sort(),
-           ['blank', 'from']);
+           ['blank', 'direct', 'from']);
         print('');
 
         print('provider selection');
@@ -816,10 +816,32 @@ function runCastScenarios() {
             config.cast = {};
 
             eq('nothing directed yet', context.chat[0].extra.breeze_direction ?? null, null);
+
+            // The button exists for when directing would take longer than you
+            // want to wait, so pre-generation must not call the model at all.
+            // A message with no take gets a blank one instead, which is what
+            // keeps the cached clips valid: nothing will direct it later.
+            let calls = 0;
+            const answering = context.ConnectionManagerRequestService.sendRequest;
+            context.ConnectionManagerRequestService.sendRequest = (...args) => {
+                calls++;
+                return answering(...args);
+            };
+
             const made = await pre.pregenerate(0);
-            eq('directs before caching', !!context.chat[0].extra.breeze_direction, true);
-            eq('generates a clip per segment', made, 4);
+            eq('pre-generation asks the model for nothing', calls, 0);
+            eq('an undirected message is settled by blanking it',
+               (context.chat[0].extra.breeze_direction?.lines ?? []).every(l => l.instruction === ''),
+               true);
+            eq('a clip per paragraph', made, 2);
             eq('adds no provider voices', [...added.keys()], []);
+
+            // direct=true is the slow path, and the only one that asks the model.
+            delete context.chat[0].extra.breeze_direction;
+            const directed = await pre.pregenerate(0, { direct: true });
+            eq('direct=true writes direction first', calls > 0, true);
+            eq('and then generates a clip per segment', directed, 4);
+            context.ConnectionManagerRequestService.sendRequest = answering;
 
             // An unchecked paragraph is not generated and not played.
             context.chat[0].extra.breeze_skip = [0];

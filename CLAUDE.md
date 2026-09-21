@@ -20,7 +20,8 @@ A SillyTavern third-party extension: **Breeze TTS, Director & Player**. One
   configurable narrator voice.
 - **Player** — an inline panel per message with paragraph-level seek,
   per-message resume, per-segment voice overrides, and take history: takes can
-  be restored, deleted, or blanked, and audio pre-generated from any paragraph.
+  be restored, deleted, or blanked, and audio pre-generated from any paragraph
+  without waiting for a director.
 
 There is no build or lint tooling beyond `tools/check.js`. The file is a plain
 ES module loaded directly by the browser.
@@ -319,22 +320,18 @@ it again first, since asking to hear it is asking for it back.
 ### The model call has a deadline, because it blocks the audio
 
 `callModel()` races `sendRequest` against `MODEL_TIMEOUT_MS` (120 s) and clears
-the timer either way. Nothing else in the path had a deadline, and this call is
-not off to one side: the director hook waits on `inFlight` for the message
-before it plans a single clip, and `pregenerate()` calls `run()` outright when a
-message has no take. So a profile that never answers stops every clip behind it.
-What that looks like from the chat is the exact report that started this: the
-cloud button spins for ever and **nothing is ever sent to Breeze** — while a
-message that already has a directed take works perfectly, because it skips both
-awaits.
+the timer either way. Nothing else in the path had a deadline, and the director
+hook still waits on `inFlight` for a message before it plans a single clip — so
+a profile that never answers used to stop every clip behind it, with the button
+spinning for ever and nothing ever sent to Breeze.
 
 Giving up is safe here: `run()` catches, returns `null`, and narration falls
 back to the voice's own preset, which is the same soft failure every other
 director error takes.
 
-Pre-generation that has to direct first now says so, in the console and in a
-toast. A slow profile and a dead button looked identical, and only one of them
-is worth waiting for.
+Pre-generation itself no longer waits on the model at all (see below), so the
+remaining ways a model call can sit in front of playback are the automatic run
+on a new message, the rotate button, and `on_missing: generate` at play time.
 
 ### Breeze needs one of its three modes; "say nothing" is not one
 
@@ -442,6 +439,30 @@ it twice does not churn five real takes out of the history. Segments are carried
 across where the paragraph text still matches: who speaks is not delivery
 direction, and blanking a take is not asking to recast the message. Both the
 dropdown and `/breeze-audio blank=true` mark such a take `(blank)`.
+
+### Pre-generation does not direct
+
+The cloud buttons and `/breeze-audio` exist for the case where **directing takes
+longer than you are willing to wait** — you want the message read now, plainly.
+So `pregenerateReport()` makes no model call:
+
+| State of the message | What pre-generation does |
+|---|---|
+| a take already written | uses it as it stands |
+| no take | writes a blank one, then generates |
+| `blank=true` | blanks the take it has, keeping it in the history, then generates |
+| `direct=true` | the old behaviour: directs first, then generates |
+
+Writing the blank take rather than generating against no take at all is what
+keeps the clips valid: with no take and `on_missing: generate`, the director
+would run when playback reached the message and every clip cached beforehand
+would be keyed to an instruction that no longer applies. A blank take settles
+it, and nothing directs the message afterwards.
+
+This was originally built the other way round — direct first, since a clip is
+keyed by the instruction it was made under — which put a model call between the
+button and any audio, exactly the wait the button exists to avoid. `direct=true`
+is where that behaviour went.
 
 ### Pre-generating from a paragraph
 
@@ -699,10 +720,7 @@ STscript has no booleans — a flag arrives as whatever was typed — so `isOn()
 reads it.
 
 `/breeze-audio` and the panel's cloud buttons all go through `pregenerate()`,
-which **directs first when a message has no direction**. A clip is cached
-against the instruction it was generated under, so audio made before the
-direction exists is audio that has to be thrown away and made again. `blank`
-is the other way of settling that question, not an exception to it.
+which **never calls the model**. See "Pre-generation does not direct".
 
 `targetMessage()` tests its argument for emptiness before converting it.
 `Number('')` is `0`, so a plain `/breeze-audio` would otherwise silently act on

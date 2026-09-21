@@ -2062,27 +2062,22 @@ async function prefetchMessage(index, options) {
 /**
  * Everything a message needs to play later, generated now and left in the cache.
  *
- * Direction comes first even when only audio was asked for: a clip is cached
- * against the instruction it was generated under, so audio made before the
- * direction exists is audio that has to be thrown away and made again.
+ * **This never calls the model.** That is the whole point of the button: audio
+ * now, when directing would take longer than you want to wait. A take already
+ * written is used as it stands; a message without one gets a blank take on the
+ * spot, so the clips are cached against an instruction that will still be there
+ * at playback rather than against one the director has yet to write.
  *
- * `blank` is the other way of settling that: write an empty take instead of
- * asking the model for one, and cache the audio the voice makes on its own.
+ * `blank` blanks a take that does exist. `direct` is the opposite, and the only
+ * way a model call happens here: write direction first, then the audio.
  */
-async function pregenerateReport(index, { quiet = true, blank = false, from = 0 } = {}) {
+async function pregenerateReport(index, { quiet = true, blank = false, direct = false, from = 0 } = {}) {
     const message = ctx().chat?.[index];
     if (!message) return { made: 0, reason: 'no-message' };
 
-    if (blank) {
-        await blankTake(index);
-    } else if (settings().enabled && !hasDirection(index)) {
-        // This is a model call standing between a button press and any audio.
-        // Say so: a slow profile is otherwise indistinguishable from a dead
-        // button, which is exactly what it looked like.
-        console.info(`[Breeze Director] message ${index} has no take; directing before audio.`);
-        if (!quiet) toastr.info('No take yet — directing first, then generating audio.', 'Breeze Director');
-        await run(index, { quiet });
-    }
+    if (direct && settings().enabled && !hasDirection(index)) await run(index, { quiet });
+    else if (blank || !hasDirection(index)) await blankTake(index);
+
     return prefetchReport(index, { from });
 }
 
@@ -2090,6 +2085,7 @@ async function pregenerateReport(index, { quiet = true, blank = false, from = 0 
 async function pregenerate(index, options) {
     return (await pregenerateReport(index, options)).made;
 }
+
 
 /** Everything that should happen before narration starts. */
 async function prepare(index) {
@@ -2397,7 +2393,9 @@ async function openPanel(messageId, { play = false, expandAll = false } = {}) {
     const stopButton = button('fa-stop', 'Stop', () => player.stop());
     const regenButton = button('fa-rotate', 'Generate a new take', () => regenerate(messageId));
     const pregenButton = button('fa-cloud-arrow-down',
-        'Generate this message\'s audio now, ready for later', () => pregenerateFrom(messageId));
+        'Generate this message\'s audio now, ready for later. Never calls the director: '
+        + 'a message with no take gets a blank one and is read plainly',
+        () => pregenerateFrom(messageId));
     const blankButton = button('fa-eraser',
         'Blank the take: clear every instruction, no model call, old take kept in the history',
         () => blankFrom(messageId));
@@ -2523,7 +2521,7 @@ async function openPanel(messageId, { play = false, expandAll = false } = {}) {
             // message interrupted partway need not pay for its first half twice.
             const pregenOne = document.createElement('div');
             pregenOne.className = 'fa-solid fa-cloud-arrow-down';
-            pregenOne.title = 'Generate audio from this paragraph on';
+            pregenOne.title = 'Generate audio from this paragraph on, without directing';
             pregenOne.style.cssText = 'opacity:0.6;padding-top:0.25em;cursor:pointer;';
             pregenOne.addEventListener('click', async event => {
                 event.stopPropagation();
@@ -3297,23 +3295,28 @@ function registerSlashCommands() {
 
     add('breeze-audio', ['breezeaudio', 'breezepregen'], 'number of clips generated', `
         <div>Generate a message's audio now and leave it cached, without playing it.</div>
-        <div>Directs the message first if it has no direction, since a clip is cached
-        against the instruction it was made under.</div>
-        <div><code>blank=true</code> writes an empty take instead of calling the model,
-        so the lines are read with nothing but the voice's own preset behind them.</div>
+        <div><strong>No model call.</strong> A take already written is used as it stands;
+        a message without one gets a blank take, and is read with nothing but the voice's
+        own preset behind it.</div>
+        <div><code>blank=true</code> blanks a take that does exist, keeping it in the
+        message's history.</div>
+        <div><code>direct=true</code> writes direction first and then the audio — the slow
+        path, when you want it.</div>
         <div><code>from=</code> starts at that paragraph, counting from 1, instead of
         at the top.</div>
         <div><strong>Example:</strong> <code>/breeze-audio</code>,
         <code>/breeze-audio blank=true</code>, or
-        <code>/breeze-audio blank=true from=3 -2</code></div>`,
+        <code>/breeze-audio from=3 -2</code></div>`,
     (index, args) => pregenerate(index, {
         quiet: false,
         blank: isOn(args.blank),
+        direct: isOn(args.direct),
         // Paragraphs are numbered from 1 in the panel; match that here.
         from: Math.max(0, (Number(args.from) || 1) - 1),
     }),
     [
-        ...flag({ name: 'blank', description: 'write an empty take rather than calling the model', typeList: [ARGUMENT_TYPE.BOOLEAN] }),
+        ...flag({ name: 'blank', description: 'blank an existing take before generating', typeList: [ARGUMENT_TYPE.BOOLEAN] }),
+        ...flag({ name: 'direct', description: 'write direction first, calling the model', typeList: [ARGUMENT_TYPE.BOOLEAN] }),
         ...flag({ name: 'from', description: 'first paragraph to generate, counting from 1', typeList: [ARGUMENT_TYPE.NUMBER] }),
     ]);
 
