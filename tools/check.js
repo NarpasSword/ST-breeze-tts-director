@@ -943,6 +943,20 @@ function runCastScenarios() {
                (await bt.prefetchReport(0)).reason, 'no-provider');
             globalThis.breezeTts = savedProvider;
 
+            // The console's own view of why a line makes no sound. It reads the
+            // take, the voices and the plan, so it rots the moment any of them
+            // move; calling it here is what catches that.
+            globalThis.breezeTts = {
+                ...savedProvider,
+                explain: async (text, voice) => ({ instruction: `as ${voice}`, cfgScale: 4, key: text }),
+                isCached: async () => false,
+            };
+            const explained = await globalThis.breezeExplain(0);
+            eq('breezeExplain reports a row per clip', explained.length, units.length);
+            eq('naming the take it read', explained[0].take, 'blank');
+            eq('and the instruction that would be sent', explained[0].instruction.startsWith('as '), true);
+            globalThis.breezeTts = savedProvider;
+
             // Deleting a take runs through the panel, so it exercises the
             // toolbar handler as well as the bookkeeping underneath it.
             context.chat[0].extra.breeze_direction = {
@@ -995,6 +1009,46 @@ function runCastScenarios() {
         } catch (error) {
             fails++;
             print('  FAIL blank takes threw: ' + error);
+        }
+
+        // What actually reaches Breeze. A request with neither an instruction nor
+        // reference audio matches none of Breeze's three modes, so the one case
+        // that can produce it — a blank take on a voice that says nothing about
+        // itself — must not be sent as-is.
+        print('\nwhat reaches Breeze');
+        try {
+            // The constructor binds itself into the public API; the stub that
+            // the sections above left in globalThis has no _bind.
+            const savedApi = globalThis.breezeTts;
+            globalThis.breezeTts = { ...savedApi, _bind() {} };
+            const provider = new registeredProvider.cls();
+            globalThis.breezeTts = savedApi;
+            provider.settings = {
+                provider_endpoint: 'http://breeze.test',
+                seed: 42,
+                cache_enabled: true,
+                voices_json: JSON.stringify({
+                    plain: {},
+                    designed: { instruction: 'A calm narrator.', cfg_scale: 4 },
+                    cloned: { ref_audio_url: 'http://files.test/a.wav', ref_text: 'a' },
+                }),
+            };
+
+            // bypass keeps the director out of it: this is about the floor
+            // underneath, not about what any take says.
+            const plan = async (voice) => provider._plan('Hello.', voice, { bypass: true });
+
+            eq('a voice that says nothing about itself still sends an instruction',
+               (await plan('plain')).instruction.length > 0, true);
+            eq('a voice with its own instruction keeps it',
+               (await plan('designed')).instruction, 'A calm narrator.');
+            eq('a clone needs no instruction and is left alone',
+               (await plan('cloned')).instruction, '');
+            eq('the fallback is part of the cache key, not smuggled past it',
+               JSON.parse((await plan('plain')).key)[2].length > 0, true);
+        } catch (error) {
+            fails++;
+            print('  FAIL provider planning threw: ' + error);
         }
 
         // The cast sheet builds a lot of DOM and is otherwise untested; opening

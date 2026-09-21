@@ -109,6 +109,7 @@ Both register the name `Breeze`; the one that loses says so in a toast.
 Console checks while iterating:
 
 ```js
+await breezeExplain()                                        // what would be sent, line by line
 SillyTavern.getContext().extensionSettings.breeze_director   // settings actually persisted
 SillyTavern.getContext().chat.at(-1).extra.breeze_direction  // the stored take + history
 globalThis.breezeTts.available                               // provider bound?
@@ -314,6 +315,38 @@ nothing is skipped, so a chat that never uses the feature carries nothing extra.
 player needed to know. `prefetchMessage()` skips them too — there is no sense
 generating audio nobody will hear. Pressing play on a skipped paragraph checks
 it again first, since asking to hear it is asking for it back.
+
+### Breeze needs one of its three modes; "say nothing" is not one
+
+Breeze picks what it is doing from the fields in the request: an `instruction`
+alone is Voice Design, `ref_audio` + `ref_text` is Voice Clone, both together
+are Voice Direction. **A request carrying neither matches no template at all.**
+
+A blank take composes an empty instruction by design. If the voice reading the
+line also carries no `instruction` of its own — a base with nothing written in
+the voices JSON, or narration with no cast line behind it — then nothing is
+left, and what would go out is a request Breeze cannot place. That is why blank
+takes made no sound while directed ones did: the difference is not the extension
+refusing to ask, it is the ask being unanswerable.
+
+`_plan()` therefore floors it: with no instruction and no reference audio, the
+line is read with `PLAIN_INSTRUCTION`. A clone is left alone — reference audio
+is already a mode. The fallback is part of the cache key like any other
+instruction, so nothing is smuggled past the cache.
+
+### Seeing what would be sent
+
+`await breezeExplain()` in the console prints a table for the last message (or
+`breezeExplain(12)` for one by index): one row per clip, with the take it read
+(`none` / `blank` / `directed`), who is speaking, the voice, **the instruction
+actually composed**, the cfg scale, whether it is already cached, and the first
+of the text.
+
+It is the quickest way to place a line that makes no sound, because it separates
+the causes that look identical from outside: no voice assigned, an empty
+instruction, a clip already cached, a paragraph unchecked. It sends nothing —
+`breezeTts.explain()` runs `_plan()` and stops, and `breezeTts.isCached()` looks
+the key up without generating.
 
 ### A pre-generation that makes no sound says why
 

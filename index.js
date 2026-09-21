@@ -43,6 +43,11 @@ const SAMPLE_RATE = 24000; // Breeze streams mono s16le at 24 kHz
 const BYTES_PER_SAMPLE = 2;
 const DEFAULT_VOICE_MARKER = '[Default Voice]';
 
+// What a line is read with when nothing else says anything: a blank take on a
+// voice that carries no instruction. Breeze needs one of its three field
+// combinations to pick a mode, so "say nothing" cannot be sent as nothing.
+const PLAIN_INSTRUCTION = 'Read the line plainly and clearly, at a natural pace.';
+
 const DEFAULT_VOICES = {
     'narrator': {
         instruction: 'A calm, warm narrator with clear diction and unhurried pacing.',
@@ -242,6 +247,10 @@ globalThis.breezeTts = {
     prefetch(text, voice, hint) { return this._provider?.prefetch(text, voice, hint) ?? Promise.resolve(false); },
     getClip(text, voice, hint) { return this._provider?._clip(text, voice, hint); },
     cacheStats() { return cache.stats(); },
+    /** What would be sent for this line, without sending it. */
+    explain(text, voice, hint) { return this._provider?._plan(text, voice, hint) ?? null; },
+    /** Is this plan's clip already in the cache? */
+    async isCached(key) { return !!(await cache.get(key)); },
     /** Play a base voice under an instruction that is not stored anywhere. */
     previewWith(voice, instruction, cfgScale) {
         return this._provider?.previewTtsVoice(voice, { instruction, cfg_scale: cfgScale });
@@ -416,6 +425,17 @@ class BreezeTtsProvider {
             } catch (error) {
                 console.error('[Breeze] director hook failed, using static preset:', error);
             }
+        }
+
+        // Breeze chooses its mode from the fields present: an instruction alone
+        // is Voice Design, reference audio alone is Voice Clone, both together
+        // are Voice Direction. A request carrying neither matches no template
+        // at all — and that is exactly what a blank take on a voice with no
+        // instruction of its own would send, which is why blank takes made no
+        // sound while directed ones did. Read the line plainly instead.
+        if (!instruction && !preset.ref_audio_url) {
+            console.debug('[Breeze] nothing composed an instruction; reading plainly.');
+            instruction = PLAIN_INSTRUCTION;
         }
 
         const key = JSON.stringify([
@@ -1512,6 +1532,47 @@ globalThis.breezeDirector = async function (text, voiceId, preset, hint) {
 
     // A base the user maintains carries its own cfg_scale; respect it.
     return { instruction, cfg_scale: preset?.cfg_scale ?? Number(config.cfg_scale) };
+};
+
+/**
+ * What pre-generation would send for a message, without sending anything.
+ *
+ * `await breezeExplain()` in the console, for the last message, or with an
+ * index. One row per clip: the voice, the instruction actually composed, and
+ * whether it is already cached. Silence has several causes that look identical
+ * from the outside — no voice, an empty instruction, a clip already cached —
+ * and this is the one place that tells them apart line by line.
+ */
+globalThis.breezeExplain = async function (index = (ctx().chat?.length ?? 1) - 1) {
+    const breeze = globalThis.breezeTts;
+    const message = ctx().chat?.[index];
+    if (!message) return 'No such message.';
+    if (!breeze?.available) return 'The Breeze provider is not bound.';
+
+    const direction = getDirection(message);
+    const units = buildUnits(message.mes);
+    const excluded = skipped(message);
+    const take = direction ? (isBlank(direction) ? 'blank' : 'directed') : 'none';
+
+    const rows = [];
+    for (let i = 0; i < units.length; i++) {
+        for (const clip of clipsFor(message, direction?.lines?.[i] ?? units[i], index, i)) {
+            const plan = clip.voice ? await breeze.explain(clip.text, clip.voice, clip.hint) : null;
+            rows.push({
+                paragraph: i + 1,
+                take,
+                skipped: excluded.has(i),
+                who: clip.speaker ?? 'narration',
+                voice: clip.voice ?? '(none assigned)',
+                instruction: plan?.instruction ?? '(no voice, so nothing planned)',
+                cfg: plan?.cfgScale ?? null,
+                cached: plan ? await breeze.isCached(plan.key) : false,
+                text: clip.text.slice(0, 48),
+            });
+        }
+    }
+    console.table(rows);
+    return rows;
 };
 
 /** The character card for a name, matched forgivingly — the model supplies it. */
