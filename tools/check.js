@@ -1011,6 +1011,42 @@ function runCastScenarios() {
             print('  FAIL blank takes threw: ' + error);
         }
 
+        // The model call sits between the pre-generate button and Breeze: while
+        // it is outstanding, every clip for that message waits on it through
+        // `inFlight`. One that never comes back used to spin the button for
+        // ever and send nothing, which is indistinguishable from a dead button.
+        print('\na model that never answers');
+        try {
+            const hung = new Function(source + ';return { settings, run, getDirection };')();
+            const config = hung.settings();
+            config.profile = 'test';
+            context.chat = [{ name: 'Alice', swipe_id: 0, extra: {}, mes: MES }];
+            // These stubs are shared and the sections run in sequence, so a
+            // request that never answers has to be put back afterwards — or
+            // every later section hangs on it, silently, as this one did.
+            const realRequest = context.ConnectionManagerRequestService.sendRequest;
+            context.ConnectionManagerRequestService.sendRequest = () => new Promise(() => {});
+
+            // gjs runs no main loop, so its timers never fire. Stand one in: the
+            // deadline lands on the microtask queue, which is soon enough when
+            // the thing it is racing never settles at all.
+            const realTimeout = globalThis.setTimeout;
+            globalThis.setTimeout = (fn) => { Promise.resolve().then(fn); return 0; };
+            let result;
+            try {
+                result = await hung.run(0, { quiet: true });
+            } finally {
+                globalThis.setTimeout = realTimeout;
+                context.ConnectionManagerRequestService.sendRequest = realRequest;
+            }
+
+            eq('a call that never comes back is given up on', result, null);
+            eq('and leaves no take behind', context.chat[0].extra.breeze_direction ?? null, null);
+        } catch (error) {
+            fails++;
+            print('  FAIL model deadline threw: ' + error);
+        }
+
         // What actually reaches Breeze. A request with neither an instruction nor
         // reference audio matches none of Breeze's three modes, so the one case
         // that can produce it — a blank take on a voice that says nothing about

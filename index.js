@@ -460,6 +460,19 @@ class BreezeTtsProvider {
             form.append('ref_text', plan.preset.ref_text ?? '');
         }
 
+        // Logged before it goes out, not after: "no request was made" and "the
+        // request failed" look identical from the outside, and they have
+        // completely different causes.
+        console.info('[Breeze] POST /v1/audio/speech', {
+            endpoint: this.settings.provider_endpoint,
+            chars: text.length,
+            cfg_scale: plan.cfgScale,
+            mode: plan.preset.ref_audio_url
+                ? (plan.instruction ? 'voice direction' : 'voice clone')
+                : 'voice design',
+            instruction: plan.instruction,
+        });
+
         for (let attempt = 0; attempt < 40; attempt++) {
             const response = await fetch(`${this.settings.provider_endpoint}/v1/audio/speech`, {
                 method: 'POST',
@@ -817,6 +830,12 @@ const PLAYER_DEFAULTS = {
 
 const HISTORY_LIMIT = 5;
 
+// How long to wait for the director's model before giving up on it. The value
+// is generous — a reasoning model on a long message is slow — but it has to
+// exist: this call sits between the pre-generate button and Breeze, and an
+// unbounded one wedges everything behind it.
+const MODEL_TIMEOUT_MS = 120000;
+
 const ctx = () => SillyTavern.getContext();
 const inFlight = new Map();
 
@@ -1136,9 +1155,30 @@ async function callModel(label, prompt, minTokens, roomy) {
     // room rather than a longer answer.
     const budget = Math.max(Number(config.max_tokens) || 0, minTokens) * (roomy ? 3 : 1);
 
-    const result = await ctx().ConnectionManagerRequestService.sendRequest(
-        config.profile, prompt, budget,
-    );
+    // Nothing else in this path has a deadline. A request that never comes back
+    // — a wedged profile, a provider swallowing it — stops the model call, and
+    // through `inFlight` it stops every clip waiting on that message, so the
+    // button spins for ever and nothing ever reaches Breeze. Failing is fine
+    // here: the caller falls back to the voice's own preset.
+    const started = Date.now();
+    let deadline = null;
+    let result;
+    try {
+        result = await Promise.race([
+            ctx().ConnectionManagerRequestService.sendRequest(config.profile, prompt, budget),
+            new Promise((_, reject) => {
+                deadline = setTimeout(
+                    () => reject(new Error(`the ${label} call did not come back within `
+                        + `${Math.round(MODEL_TIMEOUT_MS / 1000)}s`)),
+                    MODEL_TIMEOUT_MS,
+                );
+            }),
+        ]);
+    } finally {
+        // Or every call leaves a two-minute timer behind it.
+        if (deadline !== null) clearTimeout(deadline);
+    }
+    console.debug(`[Breeze Director] ${label} answered in ${Date.now() - started}ms`);
 
     const clean = (value) => String(value ?? '')
         .replace(/<think>[\s\S]*?<\/think>/gi, '')
@@ -2033,8 +2073,16 @@ async function pregenerateReport(index, { quiet = true, blank = false, from = 0 
     const message = ctx().chat?.[index];
     if (!message) return { made: 0, reason: 'no-message' };
 
-    if (blank) await blankTake(index);
-    else if (settings().enabled && !hasDirection(index)) await run(index, { quiet });
+    if (blank) {
+        await blankTake(index);
+    } else if (settings().enabled && !hasDirection(index)) {
+        // This is a model call standing between a button press and any audio.
+        // Say so: a slow profile is otherwise indistinguishable from a dead
+        // button, which is exactly what it looked like.
+        console.info(`[Breeze Director] message ${index} has no take; directing before audio.`);
+        if (!quiet) toastr.info('No take yet — directing first, then generating audio.', 'Breeze Director');
+        await run(index, { quiet });
+    }
     return prefetchReport(index, { from });
 }
 

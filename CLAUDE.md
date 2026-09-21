@@ -316,6 +316,26 @@ player needed to know. `prefetchMessage()` skips them too — there is no sense
 generating audio nobody will hear. Pressing play on a skipped paragraph checks
 it again first, since asking to hear it is asking for it back.
 
+### The model call has a deadline, because it blocks the audio
+
+`callModel()` races `sendRequest` against `MODEL_TIMEOUT_MS` (120 s) and clears
+the timer either way. Nothing else in the path had a deadline, and this call is
+not off to one side: the director hook waits on `inFlight` for the message
+before it plans a single clip, and `pregenerate()` calls `run()` outright when a
+message has no take. So a profile that never answers stops every clip behind it.
+What that looks like from the chat is the exact report that started this: the
+cloud button spins for ever and **nothing is ever sent to Breeze** — while a
+message that already has a directed take works perfectly, because it skips both
+awaits.
+
+Giving up is safe here: `run()` catches, returns `null`, and narration falls
+back to the voice's own preset, which is the same soft failure every other
+director error takes.
+
+Pre-generation that has to direct first now says so, in the console and in a
+toast. A slow profile and a dead button looked identical, and only one of them
+is worth waiting for.
+
 ### Breeze needs one of its three modes; "say nothing" is not one
 
 Breeze picks what it is doing from the fields in the request: an `instruction`
@@ -333,6 +353,18 @@ refusing to ask, it is the ask being unanswerable.
 line is read with `PLAIN_INSTRUCTION`. A clone is left alone — reference audio
 is already a mode. The fallback is part of the cache key like any other
 instruction, so nothing is smuggled past the cache.
+
+Measured against the server on 2026-09-21, `192.168.0.199:8004`:
+
+| Request | Result |
+|---|---|
+| `text` + `cfg_scale` + `seed` + `instruction` | 200, 176 640 bytes of PCM in 1.8 s |
+| `text` + `cfg_scale` + `seed`, no instruction | **500 Internal Server Error in 13 ms** |
+| the same with `PLAIN_INSTRUCTION` | 200, 103 680 bytes in 1.1 s |
+
+Note the failure is fast and loud, not a hang: an instruction-less request *is*
+sent and *is* answered, just with a 500. So a symptom of **no request at all**
+is a different fault from this one — look at the model call's deadline instead.
 
 ### Seeing what would be sent
 
