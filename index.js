@@ -455,14 +455,19 @@ class BreezeTtsProvider {
         throw new Error('Breeze stayed busy for too long.');
     }
 
-    /** A complete WAV clip, from cache when possible. */
-    async _clip(text, voiceId, hint) {
+    /**
+     * A complete WAV clip, from cache when possible. `info`, when passed, comes
+     * back saying whether the clip was already there — the difference between
+     * "pre-generated" and "nothing to do" that the caller cannot otherwise see.
+     */
+    async _clip(text, voiceId, hint, info = {}) {
         const plan = await this._plan(text, voiceId, hint);
 
         if (this.settings.cache_enabled) {
             const hit = await cache.get(plan.key);
             if (hit) {
                 console.debug('[Breeze] cache hit');
+                info.cached = true;
                 return hit;
             }
         }
@@ -488,12 +493,21 @@ class BreezeTtsProvider {
         }
     }
 
-    /** Generate and cache ahead of playback. Errors are swallowed by design. */
+    /**
+     * Generate and cache ahead of playback. Errors are swallowed by design.
+     *
+     * Returns which of the four things happened, not a bare boolean: a clip
+     * already in the cache, a cache that is switched off and a request that
+     * failed are all "no audio was generated", and telling a reader they are
+     * the same thing is what made a silent pre-generation impossible to place.
+     * Every value but `'cache-off'` and `'failed'` is truthy, as before.
+     */
     async prefetch(text, voiceId, hint) {
-        if (!this.settings.cache_enabled) return false;
+        if (!this.settings.cache_enabled) return 'cache-off';
         try {
-            await this._clip(text, voiceId, hint);
-            return true;
+            const info = {};
+            await this._clip(text, voiceId, hint, info);
+            return info.cached ? 'cached' : 'generated';
         } catch (error) {
             console.warn('[Breeze] prefetch failed:', error);
             return false;
@@ -1904,24 +1918,44 @@ function quotedMessages(limit) {
  * `from` starts partway down a long message, so a run interrupted three
  * paragraphs in can be picked up where it stopped rather than from the top.
  */
-async function prefetchMessage(index, { from = 0 } = {}) {
+async function prefetchReport(index, { from = 0 } = {}) {
+    const report = {
+        made: 0, cached: 0, failed: 0, voiceless: 0, skipped: 0, paragraphs: 0,
+        reason: null,
+    };
     const breeze = globalThis.breezeTts;
     const message = ctx().chat?.[index];
-    if (!breeze?.available || !message) return 0;
+    if (!message) { report.reason = 'no-message'; return report; }
+    if (!breeze?.available) { report.reason = 'no-provider'; return report; }
 
     const direction = getDirection(message);
     const units = buildUnits(message.mes);
     const excluded = skipped(message);
+    report.paragraphs = units.length;
 
-    let made = 0;
     for (let i = Math.max(0, from); i < units.length; i++) {
-        if (excluded.has(i)) continue;
+        if (excluded.has(i)) { report.skipped++; continue; }
         for (const clip of clipsFor(message, direction?.lines?.[i] ?? units[i], index, i)) {
-            if (!clip.voice) continue;
-            if (await breeze.prefetch(clip.text, clip.voice, clip.hint)) made++;
+            if (!clip.voice) { report.voiceless++; continue; }
+
+            const outcome = await breeze.prefetch(clip.text, clip.voice, clip.hint);
+            if (outcome === 'cached') report.cached++;
+            else if (outcome === 'cache-off') report.reason = 'cache-off';
+            else if (outcome) report.made++;
+            else report.failed++;
         }
     }
-    return made;
+
+    // Pre-generation that produces nothing looks identical from the outside
+    // whatever the cause, so say which one it was every time.
+    console.info(`[Breeze Director] pre-generated message ${index}`
+        + ` from paragraph ${Math.max(0, from) + 1}:`, report);
+    return report;
+}
+
+/** How many clips were generated — what the pre-generate command reports. */
+async function prefetchMessage(index, options) {
+    return (await prefetchReport(index, options)).made;
 }
 
 /**
@@ -1934,13 +1968,18 @@ async function prefetchMessage(index, { from = 0 } = {}) {
  * `blank` is the other way of settling that: write an empty take instead of
  * asking the model for one, and cache the audio the voice makes on its own.
  */
-async function pregenerate(index, { quiet = true, blank = false, from = 0 } = {}) {
+async function pregenerateReport(index, { quiet = true, blank = false, from = 0 } = {}) {
     const message = ctx().chat?.[index];
-    if (!message) return 0;
+    if (!message) return { made: 0, reason: 'no-message' };
 
     if (blank) await blankTake(index);
     else if (settings().enabled && !hasDirection(index)) await run(index, { quiet });
-    return prefetchMessage(index, { from });
+    return prefetchReport(index, { from });
+}
+
+/** How many clips were generated — what `/breeze-audio` returns. */
+async function pregenerate(index, options) {
+    return (await pregenerateReport(index, options)).made;
 }
 
 /** Everything that should happen before narration starts. */
@@ -2501,6 +2540,57 @@ async function regenerate(messageId) {
 }
 
 /**
+ * Say what a pre-generation run actually did.
+ *
+ * Every one of these used to read "nothing new to generate — it is already
+ * cached", including the cases where that was untrue: no provider bound, the
+ * clip cache switched off, no voice for the speaker, the server refusing. A run
+ * that makes no sound is the one that most needs to say why.
+ */
+function announce(report, from) {
+    const where = from > 0 ? ` from paragraph ${from + 1}` : '';
+    const clips = n => `${n} clip${n === 1 ? '' : 's'}`;
+
+    if (report.reason === 'no-provider') {
+        return toastr.error(
+            'The Breeze TTS provider is not bound. Pick "Breeze" in the TTS extension.',
+            'Breeze',
+        );
+    }
+    if (report.reason === 'cache-off') {
+        return toastr.warning(
+            'Pre-generation has nowhere to put the audio: turn the clip cache back on '
+            + 'in the Breeze provider settings.',
+            'Breeze',
+        );
+    }
+    if (report.made) {
+        const also = report.cached ? `, ${clips(report.cached)} already cached` : '';
+        return toastr.success(`Generated ${clips(report.made)}${where}${also}, ready to play.`, 'Breeze');
+    }
+    if (report.failed) {
+        return toastr.error(
+            `${clips(report.failed)} failed to generate — see the console for what Breeze said.`,
+            'Breeze',
+        );
+    }
+    if (report.cached) {
+        return toastr.info(`Nothing to do${where}: ${clips(report.cached)} already cached.`, 'Breeze');
+    }
+    if (report.voiceless) {
+        return toastr.warning(
+            `No Breeze voice for ${report.voiceless} of these lines — assign one in the voice map, `
+            + 'or set a narrator voice in the director settings.',
+            'Breeze',
+        );
+    }
+    if (report.skipped) {
+        return toastr.info(`Every paragraph${where} is unchecked, so none was generated.`, 'Breeze');
+    }
+    return toastr.info(`Nothing to read${where}.`, 'Breeze');
+}
+
+/**
  * Generate a message's audio up front, leaving it cached rather than playing it.
  *
  * `from` is the paragraph to start at — the panel passes the row that was
@@ -2514,7 +2604,7 @@ async function pregenerateFrom(messageId, { from = 0, blank = false } = {}) {
     const icon = entry?.root.querySelector('.fa-cloud-arrow-down');
     icon?.classList.add('fa-spin');
     try {
-        const made = await pregenerate(messageId, { quiet: false, from, blank });
+        const report = await pregenerateReport(messageId, { quiet: false, from, blank });
 
         // Pre-generation can settle the direction on its own — by writing one or
         // by blanking it — so the panel may be holding a take that no longer exists.
@@ -2527,12 +2617,7 @@ async function pregenerateFrom(messageId, { from = 0, blank = false } = {}) {
             }
             entry.repaint();
         }
-        const where = from > 0 ? ` from paragraph ${from + 1}` : '';
-        toastr.success(
-            made ? `Generated ${made} clip${made === 1 ? '' : 's'}${where}, ready to play.`
-                : `Nothing new to generate${where} — it is already cached.`,
-            'Breeze',
-        );
+        announce(report, from);
     } catch (error) {
         console.error('[Breeze Director] pre-generation failed:', error);
         toastr.error(String(error?.message ?? error), 'Breeze');

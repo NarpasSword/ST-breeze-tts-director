@@ -315,6 +315,34 @@ player needed to know. `prefetchMessage()` skips them too — there is no sense
 generating audio nobody will hear. Pressing play on a skipped paragraph checks
 it again first, since asking to hear it is asking for it back.
 
+### A pre-generation that makes no sound says why
+
+`prefetchReport()` counts every outcome separately — `made`, `cached`,
+`failed`, `voiceless`, `skipped`, plus a `reason` of `no-provider` or
+`cache-off` — logs the tally to the console, and `announce()` turns it into the
+toast. `prefetchMessage()` and `pregenerate()` are thin wrappers returning
+`made`, which is what `/breeze-audio` reports.
+
+This exists because five different things all used to produce the same
+"Nothing new to generate — it is already cached", and two of them were lies:
+
+| What happened | Why no audio |
+|---|---|
+| provider not bound | `globalThis.breezeTts.available` is false — TTS is on another provider |
+| **clip cache off** | `prefetch()` returns before the network: there is nowhere to put the audio |
+| no voice | the speaker has no base and there is no narrator voice, so the clip is skipped |
+| request failed | Breeze refused or was unreachable; the provider logs what it said |
+| already cached | the only one that was ever true |
+
+The provider's `prefetch()` returns `'generated'`, `'cached'`, `'cache-off'` or
+`false` rather than a boolean, and `_clip()` takes an `info` object it marks
+when the clip came from the cache. Both of the first two are truthy, so a caller
+that only tests truthiness still behaves as it did.
+
+**The clip cache being off makes every pre-generation a no-op**, quietly, at the
+provider. That is the first thing to check when the cloud button spins and
+nothing reaches the server.
+
 ### Takes: written, restored, deleted, blanked
 
 A message holds one current take plus up to `HISTORY_LIMIT` behind it. Four
@@ -649,6 +677,11 @@ uncaught throw there would abort the rest of the ready handler.
   JSON, which defeats the naive slice. `extractJson()` scans for the first
   balanced, string-aware, actually-parsing object. Quote ids likewise come back
   as `Q1`, `q1` or bare `1`; `normalizeQuoteId()` settles them.
+- **Pre-generation needs the clip cache switched on.** `prefetch()` returns
+  `'cache-off'` before it touches the network, because pre-generating into
+  nothing is pointless — but for a long time it returned a bare `false` and the
+  panel reported it as "already cached". If a cloud button makes no request,
+  check the Breeze provider's cache checkbox before anything else.
 - **Erasing a message's audio needs provider v2.** `eraseClips()` calls
   `breezeTts.dropClips(texts, voice)`, which resolves clips through the
   IndexedDB `voiceText` index added in the provider's DB version 2. Clips cached

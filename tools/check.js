@@ -853,8 +853,8 @@ function runCastScenarios() {
         print('\nblank takes');
         try {
             const bt = new Function(source + ';return { settings, buildUnits, blankTake, isBlank,'
-                + ' getDirection, pregenerate, prefetchMessage, openPanel, deleteTake,'
-                + ' panels, player };')();
+                + ' getDirection, pregenerate, prefetchMessage, prefetchReport,'
+                + ' openPanel, deleteTake, panels, player };')();
             globalThis.breezeTts = {
                 available: true,
                 listVoices: () => [...BASE],
@@ -912,6 +912,36 @@ function runCastScenarios() {
                await bt.prefetchMessage(0, { from: units.length - 1 }), 1);
             eq('past the end generates nothing',
                await bt.prefetchMessage(0, { from: units.length }), 0);
+
+            // Every way of producing no audio used to look like every other one,
+            // which is what made a silent pre-generation impossible to place.
+            const outcome = async (prefetch, extra = {}) => {
+                globalThis.breezeTts = { ...globalThis.breezeTts, prefetch, ...extra };
+                return bt.prefetchReport(0);
+            };
+            const base = globalThis.breezeTts;
+
+            eq('a clip already in the cache is not a clip generated',
+               await outcome(async () => 'cached').then(r => [r.made, r.cached]), [0, units.length]);
+            eq('a cache switched off says so rather than "already cached"',
+               await outcome(async () => 'cache-off').then(r => r.reason), 'cache-off');
+            eq('a refused request is counted as failed',
+               await outcome(async () => false).then(r => [r.made, r.failed]), [0, units.length]);
+            eq('lines with no voice are counted apart',
+               await outcome(base.prefetch, { hasVoice: () => false, voiceForCharacter: () => null, assignedVoice: () => null })
+                   .then(r => [r.made, r.voiceless]), [0, units.length]);
+
+            globalThis.breezeTts = base;
+            context.chat[0].extra.breeze_skip = [...units.keys()];
+            eq('unchecked paragraphs are counted apart',
+               await bt.prefetchReport(0).then(r => [r.made, r.skipped]), [0, units.length]);
+            delete context.chat[0].extra.breeze_skip;
+
+            const savedProvider = globalThis.breezeTts;
+            globalThis.breezeTts = { available: false };
+            eq('an unbound provider is named outright',
+               (await bt.prefetchReport(0)).reason, 'no-provider');
+            globalThis.breezeTts = savedProvider;
 
             // Deleting a take runs through the panel, so it exercises the
             // toolbar handler as well as the bookkeeping underneath it.
