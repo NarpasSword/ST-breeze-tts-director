@@ -121,7 +121,10 @@ const context = {
     SlashCommandArgument: function (description, typeList, isRequired) {
         return { description, typeList, isRequired };
     },
-    ARGUMENT_TYPE: { STRING: 'string', NUMBER: 'number' },
+    SlashCommandNamedArgument: function (name, description, typeList, isRequired) {
+        return { name, description, typeList, isRequired };
+    },
+    ARGUMENT_TYPE: { STRING: 'string', NUMBER: 'number', BOOLEAN: 'bool' },
 };
 
 globalThis.$ = jq;
@@ -308,13 +311,16 @@ Promise.all(readyFns.map(fn => fn())).then(
     () => {
         print('ready handler OK\n');
         print('slash commands');
-        eq('registers the three commands', [...context.commands.keys()].sort(),
-           ['breeze-audio', 'breeze-cast', 'breeze-direct']);
+        eq('registers the four commands', [...context.commands.keys()].sort(),
+           ['breeze-audio', 'breeze-blank', 'breeze-cast', 'breeze-direct']);
         for (const [name, command] of context.commands) {
             eq(`${name} takes an optional message id`,
                command.unnamedArgumentList?.[0]?.isRequired, false);
             eq(`${name} documents itself`, (command.helpString ?? '').length > 40, true);
         }
+        eq('breeze-audio takes blank=, direct= and from=',
+           (context.commands.get('breeze-audio').namedArgumentList ?? []).map(a => a.name).sort(),
+           ['blank', 'direct', 'from']);
         print('');
 
         print('provider selection');
@@ -810,10 +816,32 @@ function runCastScenarios() {
             config.cast = {};
 
             eq('nothing directed yet', context.chat[0].extra.breeze_direction ?? null, null);
+
+            // The button exists for when directing would take longer than you
+            // want to wait, so pre-generation must not call the model at all.
+            // A message with no take gets a blank one instead, which is what
+            // keeps the cached clips valid: nothing will direct it later.
+            let calls = 0;
+            const answering = context.ConnectionManagerRequestService.sendRequest;
+            context.ConnectionManagerRequestService.sendRequest = (...args) => {
+                calls++;
+                return answering(...args);
+            };
+
             const made = await pre.pregenerate(0);
-            eq('directs before caching', !!context.chat[0].extra.breeze_direction, true);
-            eq('generates a clip per segment', made, 4);
+            eq('pre-generation asks the model for nothing', calls, 0);
+            eq('an undirected message is settled by blanking it',
+               (context.chat[0].extra.breeze_direction?.lines ?? []).every(l => l.instruction === ''),
+               true);
+            eq('a clip per paragraph', made, 2);
             eq('adds no provider voices', [...added.keys()], []);
+
+            // direct=true is the slow path, and the only one that asks the model.
+            delete context.chat[0].extra.breeze_direction;
+            const directed = await pre.pregenerate(0, { direct: true });
+            eq('direct=true writes direction first', calls > 0, true);
+            eq('and then generates a clip per segment', directed, 4);
+            context.ConnectionManagerRequestService.sendRequest = answering;
 
             // An unchecked paragraph is not generated and not played.
             context.chat[0].extra.breeze_skip = [0];
@@ -839,6 +867,269 @@ function runCastScenarios() {
         } catch (error) {
             fails++;
             print('  FAIL pre-generation threw: ' + error);
+        }
+
+        // A blank take is the other way of settling the direction: no model
+        // call at all, and audio cached against it stays valid because nothing
+        // will direct the message later.
+        print('\nblank takes');
+        try {
+            const bt = new Function(source + ';return { settings, buildUnits, blankTake, isBlank,'
+                + ' getDirection, pregenerate, prefetchMessage, prefetchReport,'
+                + ' openPanel, deleteTake, panels, player, playFrom };')();
+            globalThis.breezeTts = {
+                available: true,
+                listVoices: () => [...BASE],
+                hasVoice: (n) => BASE.includes(n),
+                addVoice: async (n, preset) => { added.set(n, preset); return n; },
+                assignedVoice: () => 'narrator',
+                voiceForCharacter: () => 'narrator',
+                voicePreset: () => ({ cfg_scale: 4 }),
+                prefetch: async () => true,
+                getClip: async () => null,
+                // The panel's own buttons reach further into the provider than
+                // pre-generation does; the erase button wants all three.
+                cacheStats: async () => ({ count: 0, bytes: 0 }),
+                dropClips: async () => ({ count: 0, bytes: 0 }),
+                clearCache: async () => {},
+            };
+
+            let calls = 0;
+            context.ConnectionManagerRequestService.sendRequest = async () => {
+                calls++;
+                return { content: '[]' };
+            };
+            context.chat = [{ name: 'Alice', swipe_id: 0, extra: {}, mes: MES }];
+            const config = bt.settings();
+            config.profile = 'test';
+            config.cast = {};
+
+            const units = bt.buildUnits(MES);
+            const take = (instruction, extra = {}) => units.map((unit, i) => ({
+                text: unit.text, instruction, ...(i === 0 ? extra : {}),
+            }));
+
+            context.chat[0].extra.breeze_direction = {
+                swipe_id: 0, ts: 1, history: [],
+                lines: take('Weary.', { segments: [{ text: units[0].text, kind: 'dialogue', speaker: 'Bob' }] }),
+            };
+
+            const blanked = await bt.blankTake(0);
+            eq('every instruction is cleared', blanked.lines.every(l => l.instruction === ''), true);
+            eq('and the take reads as blank', bt.isBlank(blanked), true);
+            eq('the take it replaced went to the history', blanked.history.length, 1);
+            eq('which still says what it said', blanked.history[0].lines[0].instruction, 'Weary.');
+            eq('who speaks is not direction, so it rides along',
+               blanked.lines[0].segments?.[0]?.speaker, 'Bob');
+            eq('no model call was made', calls, 0);
+            eq('blanking twice does not churn the history', (await bt.blankTake(0)).history.length, 1);
+
+            delete context.chat[0].extra.breeze_direction;
+            const made = await bt.pregenerate(0, { blank: true });
+            eq('blank pre-generation asks the model for nothing', calls, 0);
+            eq('a clip per paragraph, none of them cast', made, units.length);
+            eq('and a blank take is left behind',
+               bt.isBlank(bt.getDirection(context.chat[0])), true);
+            eq('from= skips the paragraphs before it',
+               await bt.prefetchMessage(0, { from: units.length - 1 }), 1);
+            eq('past the end generates nothing',
+               await bt.prefetchMessage(0, { from: units.length }), 0);
+
+            // Every way of producing no audio used to look like every other one,
+            // which is what made a silent pre-generation impossible to place.
+            const outcome = async (prefetch, extra = {}) => {
+                globalThis.breezeTts = { ...globalThis.breezeTts, prefetch, ...extra };
+                return bt.prefetchReport(0);
+            };
+            const base = globalThis.breezeTts;
+
+            eq('a clip already in the cache is not a clip generated',
+               await outcome(async () => 'cached').then(r => [r.made, r.cached]), [0, units.length]);
+            eq('a cache switched off says so rather than "already cached"',
+               await outcome(async () => 'cache-off').then(r => r.reason), 'cache-off');
+            eq('a refused request is counted as failed',
+               await outcome(async () => false).then(r => [r.made, r.failed]), [0, units.length]);
+            eq('lines with no voice are counted apart',
+               await outcome(base.prefetch, { hasVoice: () => false, voiceForCharacter: () => null, assignedVoice: () => null })
+                   .then(r => [r.made, r.voiceless]), [0, units.length]);
+
+            globalThis.breezeTts = base;
+            context.chat[0].extra.breeze_skip = [...units.keys()];
+            eq('unchecked paragraphs are counted apart',
+               await bt.prefetchReport(0).then(r => [r.made, r.skipped]), [0, units.length]);
+            delete context.chat[0].extra.breeze_skip;
+
+            const savedProvider = globalThis.breezeTts;
+            globalThis.breezeTts = { available: false };
+            eq('an unbound provider is named outright',
+               (await bt.prefetchReport(0)).reason, 'no-provider');
+            globalThis.breezeTts = savedProvider;
+
+            // The console's own view of why a line makes no sound. It reads the
+            // take, the voices and the plan, so it rots the moment any of them
+            // move; calling it here is what catches that.
+            globalThis.breezeTts = {
+                ...savedProvider,
+                explain: async (text, voice) => ({ instruction: `as ${voice}`, cfgScale: 4, key: text }),
+                isCached: async () => false,
+            };
+            const explained = await globalThis.breezeExplain(0);
+            eq('breezeExplain reports a row per clip', explained.length, units.length);
+            eq('naming the take it read', explained[0].take, 'blank');
+            eq('and the instruction that would be sent', explained[0].instruction.startsWith('as '), true);
+            globalThis.breezeTts = savedProvider;
+
+            // Pressing play must not wait for a director either: with no take it
+            // writes a blank one and reads the message plainly, even under the
+            // setting that used to send playback off to the model first.
+            delete context.chat[0].extra.breeze_direction;
+            let asked = 0;
+            const answering = context.ConnectionManagerRequestService.sendRequest;
+            context.ConnectionManagerRequestService.sendRequest = (...args) => {
+                asked++;
+                return answering(...args);
+            };
+            const savedMissing = config.on_missing;
+            config.on_missing = 'generate';
+            try {
+                await bt.playFrom(0, 0);
+            } finally {
+                context.ConnectionManagerRequestService.sendRequest = answering;
+                config.on_missing = savedMissing;
+                bt.player.stop();
+            }
+            eq('pressing play asks the model for nothing', asked, 0);
+            eq('and settles the take by blanking it',
+               bt.isBlank(bt.getDirection(context.chat[0])), true);
+
+            // Deleting a take runs through the panel, so it exercises the
+            // toolbar handler as well as the bookkeeping underneath it.
+            context.chat[0].extra.breeze_direction = {
+                swipe_id: 0, ts: 3, lines: take('New.'),
+                history: [{ ts: 2, lines: take('Old.') }, { ts: 1, lines: take('Older.') }],
+            };
+            await bt.openPanel(0);
+            eq('the panel opened', bt.panels.has(0), true);
+
+            // Viewing take 2 ("Older.") and deleting it leaves the current one alone.
+            bt.panels.get(0).viewing = 2;
+            await bt.deleteTake(0);
+            let after = bt.getDirection(context.chat[0]);
+            eq('deleting a take from the history leaves the current one', after.lines[0].instruction, 'New.');
+            eq('and removes just that one', after.history.map(h => h.lines[0].instruction), ['Old.']);
+
+            await bt.deleteTake(0);
+            after = bt.getDirection(context.chat[0]);
+            eq('deleting the current take promotes the one behind it',
+               after.lines[0].instruction, 'Old.');
+            eq('which leaves nothing behind it', after.history.length, 0);
+
+            await bt.deleteTake(0);
+            eq('deleting the last take leaves no direction at all',
+               context.chat[0].extra.breeze_direction ?? null, null);
+            eq('still nothing to delete', await bt.deleteTake(0) ?? null, null);
+
+            // Every control the panel builds, run rather than merely bound —
+            // the toolbar's blank, delete and pre-generate buttons and each
+            // paragraph's own icons. A name that stopped resolving inside one
+            // is invisible until the button is pressed.
+            context.chat[0].extra.breeze_direction = {
+                swipe_id: 0, ts: 3, lines: take('New.'), history: [{ ts: 2, lines: take('Old.') }],
+            };
+            bt.panels.get(0)?.root.remove();
+            bt.panels.delete(0);
+            const marker = built.length;
+            await bt.openPanel(0);
+            const fired = await fireAll(marker, 'player panel');
+            eq('the panel bound handlers, and they ran', fired > 5, true);
+
+            // Pressing play left the player running, and the buttons that do not
+            // await their work left promises in flight. A repaint landing during
+            // a later section would build elements that section then fires as
+            // its own, so let them finish here and stop the player after.
+            for (let i = 0; i < 100; i++) await Promise.resolve();
+            bt.player.stop();
+            bt.panels.get(0)?.root.remove();
+            bt.panels.delete(0);
+        } catch (error) {
+            fails++;
+            print('  FAIL blank takes threw: ' + error);
+        }
+
+        // The model call sits between the pre-generate button and Breeze: while
+        // it is outstanding, every clip for that message waits on it through
+        // `inFlight`. One that never comes back used to spin the button for
+        // ever and send nothing, which is indistinguishable from a dead button.
+        print('\na model that never answers');
+        try {
+            const hung = new Function(source + ';return { settings, run, getDirection };')();
+            const config = hung.settings();
+            config.profile = 'test';
+            context.chat = [{ name: 'Alice', swipe_id: 0, extra: {}, mes: MES }];
+            // These stubs are shared and the sections run in sequence, so a
+            // request that never answers has to be put back afterwards — or
+            // every later section hangs on it, silently, as this one did.
+            const realRequest = context.ConnectionManagerRequestService.sendRequest;
+            context.ConnectionManagerRequestService.sendRequest = () => new Promise(() => {});
+
+            // gjs runs no main loop, so its timers never fire. Stand one in: the
+            // deadline lands on the microtask queue, which is soon enough when
+            // the thing it is racing never settles at all.
+            const realTimeout = globalThis.setTimeout;
+            globalThis.setTimeout = (fn) => { Promise.resolve().then(fn); return 0; };
+            let result;
+            try {
+                result = await hung.run(0, { quiet: true });
+            } finally {
+                globalThis.setTimeout = realTimeout;
+                context.ConnectionManagerRequestService.sendRequest = realRequest;
+            }
+
+            eq('a call that never comes back is given up on', result, null);
+            eq('and leaves no take behind', context.chat[0].extra.breeze_direction ?? null, null);
+        } catch (error) {
+            fails++;
+            print('  FAIL model deadline threw: ' + error);
+        }
+
+        // What actually reaches Breeze. A request with neither an instruction nor
+        // reference audio matches none of Breeze's three modes, so the one case
+        // that can produce it — a blank take on a voice that says nothing about
+        // itself — must not be sent as-is.
+        print('\nwhat reaches Breeze');
+        try {
+            // The constructor binds itself into the public API; the stub that
+            // the sections above left in globalThis has no _bind.
+            const savedApi = globalThis.breezeTts;
+            globalThis.breezeTts = { ...savedApi, _bind() {} };
+            const provider = new registeredProvider.cls();
+            globalThis.breezeTts = savedApi;
+            provider.settings = {
+                provider_endpoint: 'http://breeze.test',
+                seed: 42,
+                cache_enabled: true,
+                voices_json: JSON.stringify({
+                    plain: {},
+                    designed: { instruction: 'A calm narrator.', cfg_scale: 4 },
+                    cloned: { ref_audio_url: 'http://files.test/a.wav', ref_text: 'a' },
+                }),
+            };
+
+            // bypass keeps the director out of it: this is about the floor
+            // underneath, not about what any take says.
+            const plan = async (voice) => provider._plan('Hello.', voice, { bypass: true });
+
+            eq('a voice that says nothing about itself still sends an instruction',
+               (await plan('plain')).instruction.length > 0, true);
+            eq('a voice with its own instruction keeps it',
+               (await plan('designed')).instruction, 'A calm narrator.');
+            eq('a clone needs no instruction and is left alone',
+               (await plan('cloned')).instruction, '');
+            eq('the fallback is part of the cache key, not smuggled past it',
+               JSON.parse((await plan('plain')).key)[2].length > 0, true);
+        } catch (error) {
+            fails++;
+            print('  FAIL provider planning threw: ' + error);
         }
 
         // The cast sheet builds a lot of DOM and is otherwise untested; opening
