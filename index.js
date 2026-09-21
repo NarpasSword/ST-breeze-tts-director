@@ -767,7 +767,7 @@ const DEFAULTS = {
     max_tokens: 2000,
     cfg_scale: 4,
     mode: 'replace',      // replace | append
-    on_missing: 'static', // static | generate
+    on_missing: 'static', // static | generate — SillyTavern's narration path only
     prompt: DEFAULT_PROMPT,
     prefetch: true,
     cast_enabled: true,
@@ -2913,8 +2913,36 @@ async function eraseClips(messageId) {
     );
 }
 
+/**
+ * Pressing play must not wait for a director either.
+ *
+ * A message with no take gets a blank one first — the same settling the cloud
+ * button does — so the line is read plainly, now, with the voice's own preset
+ * behind it. Waiting on a model call with a finger on the play button is the
+ * one thing this player exists not to do.
+ *
+ * It writes rather than just reading plainly so the clips stay valid: with no
+ * take at all, `on_missing: generate` would direct the message the next time
+ * something narrated it, and every clip cached under the plain reading would be
+ * keyed to an instruction that no longer applies.
+ */
+async function settleBeforePlaying(messageId) {
+    if (!settings().enabled || hasDirection(messageId)) return;
+
+    console.info(`[Breeze Director] message ${messageId} has no take; reading it plainly.`);
+    const direction = await blankTake(messageId);
+
+    const entry = panels.get(messageId);
+    if (entry && direction) {
+        entry.direction = direction;
+        entry.viewing = 0;
+        entry.refreshTakes();
+    }
+}
+
 async function playFrom(messageId, index) {
     try {
+        await settleBeforePlaying(messageId);
         await player.load(messageId);
     } catch (error) {
         toastr.warning(String(error?.message ?? error), 'Breeze Player');
@@ -3351,11 +3379,14 @@ const SETTINGS_HTML = `
       <label for="bd_profile">Connection Profile:</label>
       <select id="bd_profile" class="text_pole"></select>
 
-      <label for="bd_missing">If a message has no direction when narration starts:</label>
+      <label for="bd_missing">If a message has no direction when SillyTavern's own
+      narration starts:</label>
       <select id="bd_missing" class="text_pole">
         <option value="static">Use the voice's own instruction (no LLM call)</option>
         <option value="generate">Generate it now (delays playback)</option>
       </select>
+      <small>The panel's own player never waits: it writes a blank take and reads the
+      message plainly, then you can direct it with the rotate button.</small>
 
       <label for="bd_mode">Combine with the voice's own instruction:</label>
       <select id="bd_mode" class="text_pole">

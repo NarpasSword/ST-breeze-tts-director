@@ -414,7 +414,7 @@ things move between those slots, all of them in the panel toolbar:
 |---|---|
 | rotate | `generate()` — a new take, the old one pushed to the history |
 | restore | `restoreTake()` — swap the take being viewed with the current one |
-| ✕ | `deleteTake()` — drop the take being viewed |
+| ✕ | `deleteTake()` — drop the take being viewed (playing it again writes a blank one) |
 | eraser | `blankTake()` — empty every instruction, no model call |
 
 `deleteTake()` confirms first, then: a take from the history is spliced out; the
@@ -463,6 +463,17 @@ This was originally built the other way round — direct first, since a clip is
 keyed by the instruction it was made under — which put a model call between the
 button and any audio, exactly the wait the button exists to avoid. `direct=true`
 is where that behaviour went.
+
+**Pressing play settles the same way.** `playFrom()` calls
+`settleBeforePlaying()` first: a message with no take gets a blank one, and the
+line is read with the voice's own preset behind it rather than waiting on a
+model. `on_missing: generate` therefore no longer reaches the panel player at
+all — it applies to SillyTavern's own narration queue, which starts without
+passing through here, and the settings drawer says so.
+
+Settling in `playFrom()` rather than in `player.load()` is deliberate:
+`load()` also runs on a reload, and blanking there would make a take you just
+deleted reappear as a blank one under your hand.
 
 ### Pre-generating from a paragraph
 

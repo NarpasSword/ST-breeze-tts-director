@@ -876,7 +876,7 @@ function runCastScenarios() {
         try {
             const bt = new Function(source + ';return { settings, buildUnits, blankTake, isBlank,'
                 + ' getDirection, pregenerate, prefetchMessage, prefetchReport,'
-                + ' openPanel, deleteTake, panels, player };')();
+                + ' openPanel, deleteTake, panels, player, playFrom };')();
             globalThis.breezeTts = {
                 available: true,
                 listVoices: () => [...BASE],
@@ -978,6 +978,29 @@ function runCastScenarios() {
             eq('naming the take it read', explained[0].take, 'blank');
             eq('and the instruction that would be sent', explained[0].instruction.startsWith('as '), true);
             globalThis.breezeTts = savedProvider;
+
+            // Pressing play must not wait for a director either: with no take it
+            // writes a blank one and reads the message plainly, even under the
+            // setting that used to send playback off to the model first.
+            delete context.chat[0].extra.breeze_direction;
+            let asked = 0;
+            const answering = context.ConnectionManagerRequestService.sendRequest;
+            context.ConnectionManagerRequestService.sendRequest = (...args) => {
+                asked++;
+                return answering(...args);
+            };
+            const savedMissing = config.on_missing;
+            config.on_missing = 'generate';
+            try {
+                await bt.playFrom(0, 0);
+            } finally {
+                context.ConnectionManagerRequestService.sendRequest = answering;
+                config.on_missing = savedMissing;
+                bt.player.stop();
+            }
+            eq('pressing play asks the model for nothing', asked, 0);
+            eq('and settles the take by blanking it',
+               bt.isBlank(bt.getDirection(context.chat[0])), true);
 
             // Deleting a take runs through the panel, so it exercises the
             // toolbar handler as well as the bookkeeping underneath it.
