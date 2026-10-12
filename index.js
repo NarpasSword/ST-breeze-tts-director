@@ -1,25 +1,29 @@
-// SillyTavern extension: Breeze TTS, Director & Player.
+// SillyTavern extension: Breeze TTS, Cast & Player.
 //
 // One extension, three halves that were once three folders:
 //
 //   Provider — registers "Breeze" in the TTS provider dropdown, wraps its raw
 //              PCM in WAV, caches clips in IndexedDB, and publishes
 //              globalThis.breezeTts.
-//   Director — an LLM call per message writes per-paragraph delivery direction,
-//              another works out who speaks each quote, and each speaker is
-//              cast a voice of their own.
-//   Player   — an inline panel per message: paragraph seek, resume, take
-//              history, per-segment voice overrides.
+//   Cast     — works out who speaks each quote in a message, and casts each
+//              speaker a voice of their own: one of the user's Breeze voices
+//              as a base, plus a description.
+//   Player   — an inline panel per message: paragraph seek, resume, and
+//              per-segment voice overrides.
 //
 // The two halves still talk through globalThis.breezeTts and
 // globalThis.breezeDirector rather than calling each other directly. That
-// boundary is worth keeping: the provider must work with no director present,
-// and the director must tolerate a provider that is absent or older.
+// boundary is worth keeping: the provider must work with no cast present,
+// and the cast must tolerate a provider that is absent or older.
 //
 // They were separate extensions until they drifted apart once too often — a
 // director deployed against a months-old provider fails silently, because an
 // exception inside casting is indistinguishable from the model declining.
 // Shipping them together removes that failure mode entirely.
+//
+// There is no per-paragraph delivery direction any more. A line is read with
+// its voice's own instruction, plus the speaker's description when they have
+// been cast.
 //
 // The provider's voices are the user's to curate, in its own settings box.
 // Nothing here writes one: a cast member is one of those voices as a base, plus
@@ -43,9 +47,10 @@ const SAMPLE_RATE = 24000; // Breeze streams mono s16le at 24 kHz
 const BYTES_PER_SAMPLE = 2;
 const DEFAULT_VOICE_MARKER = '[Default Voice]';
 
-// What a line is read with when nothing else says anything: a blank take on a
-// voice that carries no instruction. Breeze needs one of its three field
-// combinations to pick a mode, so "say nothing" cannot be sent as nothing.
+// What a line is read with when nothing else says anything: a voice that
+// carries no instruction, for a speaker with no description. Breeze needs one
+// of its three field combinations to pick a mode, so "say nothing" cannot be
+// sent as nothing.
 const PLAIN_INSTRUCTION = 'Read the line plainly and clearly, at a natural pace.';
 
 const DEFAULT_VOICES = {
@@ -396,10 +401,9 @@ class BreezeTtsProvider {
     }
 
     /**
-     * Settle the instruction for this line, consulting the director if present.
-     * `hint` names the message and paragraph the text came from. Callers that
-     * know it should pass it: without one the director has to find the line by
-     * matching text, which a short quoted fragment can defeat.
+     * Settle the instruction for this line, consulting the cast hook if present.
+     * `hint` names the message, paragraph and speaker the text came from.
+     * Without one there is no speaker, and the line reads in its voice as written.
      */
     async _plan(text, voiceId, hint) {
         const preset = this._presets()[voiceId];
@@ -413,7 +417,7 @@ class BreezeTtsProvider {
         if (hint?.instruction) {
             instruction = hint.instruction;
             cfgScale = hint.cfg_scale ?? cfgScale;
-        // `bypass` plays the voice as written, undirected.
+        // `bypass` plays the voice as written, with no cast description.
         } else if (!hint?.bypass && preset.dynamic !== false
             && typeof globalThis.breezeDirector === 'function') {
             try {
@@ -430,9 +434,8 @@ class BreezeTtsProvider {
         // Breeze chooses its mode from the fields present: an instruction alone
         // is Voice Design, reference audio alone is Voice Clone, both together
         // are Voice Direction. A request carrying neither matches no template
-        // at all — and that is exactly what a blank take on a voice with no
-        // instruction of its own would send, which is why blank takes made no
-        // sound while directed ones did. Read the line plainly instead.
+        // at all — which is what a voice with no instruction of its own, read
+        // for a speaker with no description, would send. Read it plainly instead.
         if (!instruction && !preset.ref_audio_url) {
             console.debug('[Breeze] nothing composed an instruction; reading plainly.');
             instruction = PLAIN_INSTRUCTION;
@@ -677,26 +680,11 @@ try {
 }
 
 // ===========================================================================
-// DIRECTOR AND PLAYER
+// CAST AND PLAYER
 // ===========================================================================
 
 const MODULE = 'breeze_director';
 const PLAYER_MODULE = 'breeze_player';
-
-const DEFAULT_PROMPT = `You are directing a voice actor about to read the following message aloud.
-It has been split into {{count}} numbered paragraphs, performed in order as one continuous reading.
-
-For each paragraph, write ONE short sentence describing how to deliver it: tone, emotion, pace, energy.
-Describe delivery only — never the speaker's age, gender, accent, or timbre.
-Let the direction develop across the paragraphs so the reading has an arc.
-Do not summarise or quote the text.
-
-Reply with ONLY a JSON array of exactly {{count}} strings, no commentary, no code fences.
-
-Character: {{char}}
-
-Paragraphs:
-{{parts}}`;
 
 const DEFAULT_IDENTIFY_PROMPT = `Work out who speaks each line of quoted speech in this passage.
 {{context}}
@@ -735,9 +723,9 @@ Then describe the voice itself:
             phrases, no semicolons, no dashes, no sub-clauses.
   accent  — only where there is a clear basis for one, else ""
 
-Describe the voice as it always sounds, not how it changes with mood. How a line is
-felt is directed separately, line by line; this is the instrument, not the
-performance. Nothing about appearance, history, or what is happening to them.
+Describe the voice as it always sounds, not how it changes with mood: this is the
+instrument, not the performance. Nothing about appearance, history, or what is
+happening to them.
 
 Good tone: "Bright and light. Quick, clipped delivery with an upward lilt."
 Too much: anything naming what they feel, when they feel it, or what lies beneath it.
@@ -766,9 +754,7 @@ const DEFAULTS = {
     profile: '',
     max_tokens: 2000,
     cfg_scale: 4,
-    mode: 'replace',      // replace | append
-    on_missing: 'static', // static | generate — SillyTavern's narration path only
-    prompt: DEFAULT_PROMPT,
+    mode: 'replace',      // replace | append: the base's own instruction under a cast description
     prefetch: true,
     cast_enabled: true,
     narrator_voice: '',   // '' = the character's own voice
@@ -792,7 +778,6 @@ const CAST_SCAN_LIMIT = 20;
 // it came from: if it still matches, nobody edited it and it upgrades silently.
 // If it does not, the user customised it and it is left alone.
 const SHIPPED_PROMPTS = {
-    prompt: () => DEFAULT_PROMPT,
     voice_cast_prompt: () => DEFAULT_VOICE_CAST_PROMPT,
     identify_prompt: () => DEFAULT_IDENTIFY_PROMPT,
 };
@@ -818,7 +803,7 @@ function syncPrompts(config) {
         if (config.prompt_stamps[key] && config.prompt_stamps[key] === hash(stored)) {
             config[key] = current;
             config.prompt_stamps[key] = hash(current);
-            console.info(`[Breeze Director] upgraded the unedited "${key}" to the new default.`);
+            console.info(`[Breeze Cast] upgraded the unedited "${key}" to the new default.`);
         }
     }
 }
@@ -828,12 +813,10 @@ const PLAYER_DEFAULTS = {
     resume: {}, // "chatId:messageId" -> unit index
 };
 
-const HISTORY_LIMIT = 5;
-
-// How long to wait for the director's model before giving up on it. The value
-// is generous — a reasoning model on a long message is slow — but it has to
-// exist: this call sits between the pre-generate button and Breeze, and an
-// unbounded one wedges everything behind it.
+// How long to wait for the model before giving up on it. The value is generous
+// — a reasoning model on a long message is slow — but it has to exist: this
+// call sits between the pre-generate button and Breeze, and an unbounded one
+// wedges everything behind it.
 const MODEL_TIMEOUT_MS = 120000;
 
 const ctx = () => SillyTavern.getContext();
@@ -856,8 +839,15 @@ function fill(store, key, defaults) {
     return config;
 }
 
+// Settings that belonged to per-paragraph delivery direction, which is gone.
+const RETIRED_SETTINGS = ['prompt', 'on_missing'];
+
 function settings() {
     const config = fill(ctx().extensionSettings, MODULE, DEFAULTS);
+    for (const key of RETIRED_SETTINGS) {
+        delete config[key];
+        if (config.prompt_stamps) delete config.prompt_stamps[key];
+    }
     syncPrompts(config);
     return config;
 }
@@ -919,7 +909,7 @@ function exclusionPatterns() {
             patterns.push(new RegExp(pattern));
         } catch (error) {
             // One bad pattern must not silence the rest, or the whole message.
-            console.warn(`[Breeze Director] ignoring invalid exclusion /${pattern}/:`, error.message);
+            console.warn(`[Breeze Cast] ignoring invalid exclusion /${pattern}/:`, error.message);
         }
     }
 
@@ -941,7 +931,7 @@ function buildUnits(mes) {
 // alternative: this chat is plaintext, so an asterisk is an asterisk. Leaving
 // that alternative in would let a stray pair — "2 * 3 * 4", a footnote marker —
 // be read as markup and silently stripped out of what gets spoken.
-// A paragraph stays the unit of direction; segments only decide who reads what.
+// A paragraph stays the unit of playback; segments only decide who reads what.
 const SEGMENT_PATTERN = /(".*?")|(\u201C.*?\u201D)|(\u00AB.*?\u00BB)|(\u300C.*?\u300D)|(\u300E.*?\u300F)|(\uFF02.*?\uFF02)/gim;
 
 /**
@@ -977,7 +967,7 @@ function splitSegments(line) {
     return whole ? [{ text: whole, kind: 'narration' }] : [];
 }
 
-/** Every quoted span in the message, numbered Q1..Qn for the director to attribute. */
+/** Every quoted span in the message, numbered Q1..Qn for the model to attribute. */
 function collectQuotes(layout) {
     const quotes = [];
     layout.forEach((segments, paragraph) => {
@@ -1021,7 +1011,7 @@ function basePreset(name) {
     try {
         return globalThis.breezeTts?.voicePreset(name) ?? null;
     } catch (error) {
-        console.warn('[Breeze Director] could not read base voice', name, error);
+        console.warn('[Breeze Cast] could not read base voice', name, error);
         return null;
     }
 }
@@ -1062,8 +1052,8 @@ function voiceForSegment(segment, message) {
 
 /**
  * The clips one paragraph plays, in order. Each carries a hint naming the
- * message and paragraph it came from, so the director returns that paragraph's
- * instruction outright instead of matching a fragment back to it.
+ * message, paragraph and speaker it came from; the speaker is what lets the
+ * hook lay their cast description over the base voice.
  */
 function clipsFor(message, line, messageId, paragraph) {
     const segments = line?.segments;
@@ -1081,8 +1071,8 @@ function clipsFor(message, line, messageId, paragraph) {
             text: segment.text,
             voice: voiceForSegment(segment, message),
             speaker,
-            // The speaker rides along so the director can lay their voice
-            // description over the paragraph's delivery direction.
+            // The speaker rides along so the hook can lay their description
+            // over the base voice.
             hint: { messageId, paragraph, speaker },
         };
     });
@@ -1093,9 +1083,9 @@ function clipsFor(message, line, messageId, paragraph) {
 const normalize = s => String(s ?? '').replace(/["'`\u201C\u201D\u00AB\u00BB]/g, '').replace(/\s+/g, ' ').trim().toLowerCase();
 
 // ------------------------------------------------------------------- skipping
-// Paragraphs the reader has unchecked. Kept on the message rather than on a
-// take, so regenerating direction or restoring an earlier take leaves the
-// choice alone — it is about the text, not about how the text is read.
+// Paragraphs the reader has unchecked. Kept on the message rather than on the
+// speakers record, so identifying the speakers again leaves the choice alone —
+// it is about the text, not about who reads it.
 
 /** Paragraph indices excluded from playback. */
 function skipped(message) {
@@ -1119,23 +1109,29 @@ async function setSkipped(message, paragraph, skip) {
     await ctx().saveChat();
 }
 
-/** Stored direction, but only if it still belongs to the current swipe. */
-function getDirection(message) {
-    const stored = message?.extra?.breeze_direction;
+/**
+ * Who speaks each quote in a message, but only if it still belongs to the
+ * current swipe and the current text.
+ *
+ * Records written by the old per-paragraph director, under `breeze_direction`,
+ * are not read: that feature is gone, and its instructions with it.
+ */
+function getSpeakers(message) {
+    const stored = message?.extra?.breeze_speakers;
     if (!stored) return null;
     if ((stored.swipe_id ?? 0) !== (message.swipe_id ?? 0)) return null;
 
-    // Paragraphs are addressed by index, so a take with a different number of
-    // them belongs to different text — an edited message, or an exclusion or tag
-    // setting changed since. Regenerating beats reading paragraph four's
-    // direction over paragraph three.
+    // Paragraphs are addressed by index, so a record with a different number of
+    // them belongs to different text — an edited message, or an exclusion or
+    // tag setting changed since. Identifying again beats giving paragraph four's
+    // speakers to paragraph three.
     if ((stored.lines?.length ?? 0) !== splitLines(message.mes).length) return null;
 
     return stored;
 }
 
-function hasDirection(index) {
-    return !!getDirection(ctx().chat?.[index]);
+function hasSpeakers(index) {
+    return !!getSpeakers(ctx().chat?.[index]);
 }
 
 // ---------------------------------------------------------------- generation
@@ -1178,7 +1174,7 @@ async function callModel(label, prompt, minTokens, roomy) {
         // Or every call leaves a two-minute timer behind it.
         if (deadline !== null) clearTimeout(deadline);
     }
-    console.debug(`[Breeze Director] ${label} answered in ${Date.now() - started}ms`);
+    console.debug(`[Breeze Cast] ${label} answered in ${Date.now() - started}ms`);
 
     const clean = (value) => String(value ?? '')
         .replace(/<think>[\s\S]*?<\/think>/gi, '')
@@ -1192,12 +1188,12 @@ async function callModel(label, prompt, minTokens, roomy) {
 async function askModel(label, prompt, minTokens) {
     let reply = await callModel(label, prompt, minTokens);
     if (!reply.content) {
-        console.warn(`[Breeze Director] ${label}: empty at budget ${reply.budget}, `
+        console.warn(`[Breeze Cast] ${label}: empty at budget ${reply.budget}, `
             + 'retrying with room to think.');
         reply = await callModel(label, prompt, minTokens, true);
     }
     if (!reply.content) {
-        console.warn(`[Breeze Director] ${label}: still empty at budget ${reply.budget}. `
+        console.warn(`[Breeze Cast] ${label}: still empty at budget ${reply.budget}. `
             + 'Raise Max response tokens, or use a non-reasoning connection profile.');
     }
     return reply.content;
@@ -1214,7 +1210,7 @@ async function askJson(label, prompt, minTokens) {
         const parsed = extractJson(reply.content) ?? extractJson(reply.reasoning);
         if (parsed) return parsed;
 
-        console.warn(`[Breeze Director] ${label}: no usable JSON at budget ${reply.budget}`
+        console.warn(`[Breeze Cast] ${label}: no usable JSON at budget ${reply.budget}`
             + (roomy ? '. Giving up.' : ', retrying with room to think.'),
             reply.content || '(empty completion)');
     }
@@ -1262,82 +1258,14 @@ function put(template, token, value) {
     return template.replace(token, () => value);
 }
 
-function buildPrompt(message, units) {
-    const context = ctx();
-    const parts = units.map((unit, i) => `${i + 1}. ${unit.text}`).join('\n\n');
-
-    let prompt = put(settings().prompt, /{{parts}}/g, parts);
-    prompt = put(prompt, /{{count}}/g, String(units.length));
-    prompt = put(prompt, /{{message}}/g, String(message?.mes ?? ''));
-    prompt = put(prompt, /{{char}}/g, String(message?.name ?? context.name2 ?? ''));
-    prompt = put(prompt, /{{user}}/g, String(context.name1 ?? ''));
-    return prompt;
-}
-
 /**
- * Read a completion into { instructions, speakers }. Three shapes are accepted,
- * because prompts persist in settings: the current object form, a bare array
- * from a pre-cast saved prompt, and anything else via the first-line fallback.
+ * Work out who speaks every quote in a message, cast anyone new, and store the
+ * result on the message. A message with no quotes costs no model call at all:
+ * everything in it is narration.
  */
-function parseDirection(raw, count) {
-    const text = String(raw ?? '')
-        .replace(/<think>[\s\S]*?<\/think>/gi, '')
-        .replace(/```(?:json)?/gi, '')
-        .trim();
-
-    // Pad short replies with the last usable direction.
-    const pad = (list) => {
-        const clean = list.map(v => String(v ?? '').trim()).filter(Boolean);
-        if (!clean.length) return null;
-        while (clean.length < count) clean.push(clean[clean.length - 1]);
-        return clean.slice(0, count);
-    };
-
-    const objectStart = text.indexOf('{');
-    const objectEnd = text.lastIndexOf('}');
-    if (objectStart !== -1 && objectEnd > objectStart) {
-        try {
-            const parsed = JSON.parse(text.slice(objectStart, objectEnd + 1));
-            const instructions = Array.isArray(parsed?.directions) ? pad(parsed.directions) : null;
-            if (instructions) {
-                const speakers = {};
-                for (const [id, name] of Object.entries(parsed?.speakers ?? {})) {
-                    speakers[String(id).trim().toUpperCase()] = String(name ?? '').trim();
-                }
-                return { instructions, speakers };
-            }
-        } catch { /* fall through to the array form */ }
-    }
-
-    const arrayStart = text.indexOf('[');
-    const arrayEnd = text.lastIndexOf(']');
-    if (arrayStart !== -1 && arrayEnd > arrayStart) {
-        try {
-            const parsed = JSON.parse(text.slice(arrayStart, arrayEnd + 1));
-            if (Array.isArray(parsed)) {
-                const instructions = pad(parsed);
-                if (instructions) return { instructions, speakers: {} };
-            }
-        } catch { /* fall through to the single-instruction path */ }
-    }
-
-    // Model ignored the format: use its first line as one direction for everything.
-    const single = text.split('\n').map(l => l.trim()).filter(Boolean)[0];
-    if (!single) return null;
-    return {
-        instructions: new Array(count).fill(single.replace(/^["\'`]|["\'`]$/g, '')),
-        speakers: {},
-    };
-}
-
 async function generate(index, { quiet = true } = {}) {
     const config = settings();
     const context = ctx();
-
-    if (!config.profile) {
-        if (!quiet) toastr.warning('Pick a connection profile first.', 'Breeze Director');
-        return null;
-    }
 
     const message = context.chat?.[index];
     if (!message) return null;
@@ -1349,36 +1277,32 @@ async function generate(index, { quiet = true } = {}) {
     const quotes = collectQuotes(layout);
     const attribute = config.cast_enabled && quotes.length > 0;
 
-    // Who speaks gets its own call, or several: one job per prompt, and each
-    // chunk knows who the ones before it named.
+    if (attribute && !config.profile) {
+        if (!quiet) toastr.warning('Pick a connection profile first.', 'Breeze Cast');
+        return null;
+    }
+
     const speakers = attribute ? await identifySpeakers(message, units, quotes) : {};
-
-    const completion = await askModel('direction', buildPrompt(message, units), 600 + 80 * units.length);
-    if (!completion) {
-        if (!quiet) toastr.error('Model returned an empty completion.', 'Breeze Director');
-        return null;
-    }
-
-    const parsed = parseDirection(completion, units.length);
-    if (!parsed) {
-        console.warn('[Breeze Director] could not parse a completion:', result?.content);
-        if (!quiet) toastr.error('Model returned nothing usable.', 'Breeze Director');
-        return null;
-    }
 
     // askCasting quotes a speaker's own lines back at the model; tag them now.
     for (const quote of quotes) {
         quote.speaker = String(speakers[quote.id] ?? '').trim();
     }
 
+    // A voice picked by hand for a segment survives identifying again, as long
+    // as the segment is still the same text in the same place.
+    const previous = getSpeakers(message);
+
     const lines = [];
     for (let i = 0; i < units.length; i++) {
-        const line = { text: units[i].text, instruction: parsed.instructions[i] };
+        const line = { text: units[i].text };
         const segments = layout[i];
 
-        // One plain narration span is the common case: store nothing extra, so
-        // records stay small and pre-casting directions keep loading unchanged.
+        // One plain narration span is the common case: store nothing extra.
         if (segments.length !== 1 || segments[0].kind !== 'narration') {
+            const before = normalize(previous?.lines?.[i]?.text) === normalize(units[i].text)
+                ? previous.lines[i].segments ?? []
+                : [];
             line.segments = [];
             for (let at = 0; at < segments.length; at++) {
                 const segment = segments[at];
@@ -1394,39 +1318,36 @@ async function generate(index, { quiet = true } = {}) {
                     // already in the chat.
                     if (isNamedSpeaker(speaker, message)) await castVoice(speaker, quotes);
                 }
+                const kept = before[at];
+                if (kept?.voice && kept.text === entry.text) entry.voice = kept.voice;
                 line.segments.push(entry);
             }
         }
         lines.push(line);
     }
 
-    // Keep the previous take so a regeneration you dislike can be undone.
-    const previous = getDirection(message);
-    const history = previous
-        ? [{ ts: previous.ts ?? Date.now(), lines: previous.lines }, ...(previous.history ?? [])]
-        : [];
-
     message.extra = message.extra ?? {};
-    message.extra.breeze_direction = {
+    // What the retired director left behind is dead weight in the chat file.
+    delete message.extra.breeze_direction;
+    message.extra.breeze_speakers = {
         swipe_id: message.swipe_id ?? 0,
         ts: Date.now(),
         lines,
-        history: history.slice(0, HISTORY_LIMIT),
     };
 
     await context.saveChat();
     markButton(index);
-    return message.extra.breeze_direction;
+    return message.extra.breeze_speakers;
 }
 
-/** Single-flight per message, so auto-run and narration never duplicate a call. */
+/** Single-flight per message, so the auto-run and a button never duplicate a call. */
 function run(index, options) {
     if (inFlight.has(index)) return inFlight.get(index);
 
     const pending = generate(index, options)
         .catch(error => {
-            console.error('[Breeze Director] generation failed:', error);
-            if (!options?.quiet) toastr.error(String(error?.message ?? error), 'Breeze Director');
+            console.error('[Breeze Cast] identifying speakers failed:', error);
+            if (!options?.quiet) toastr.error(String(error?.message ?? error), 'Breeze Cast');
             return null;
         })
         .finally(() => inFlight.delete(index));
@@ -1435,100 +1356,14 @@ function run(index, options) {
     return pending;
 }
 
-/** A take that says nothing: every paragraph present, every instruction empty. */
-function isBlank(direction) {
-    return !!direction?.lines?.length
-        && direction.lines.every(line => !String(line?.instruction ?? '').trim());
-}
-
-/**
- * Write an empty take, with no model call at all.
- *
- * A message with no take is not the same thing as a message told to be read
- * plainly: the first still runs the director the moment `on_missing` is
- * `generate`, and audio cached before that happens is audio thrown away. An
- * empty take settles the question — every paragraph is present, every
- * instruction is blank, so the lines are read with nothing but the voice's own
- * preset behind them and the clips cached against that keep matching.
- *
- * Any cast the previous take carried is kept where the text still lines up:
- * segments say who speaks, which is not delivery direction and is not what
- * blanking a take is asking to throw away.
- */
-async function blankTake(index) {
-    const message = ctx().chat?.[index];
-    if (!message) return null;
-
-    const units = buildUnits(message.mes);
-    if (!units.length) return null;
-
-    const previous = getDirection(message);
-    if (isBlank(previous)) return previous;   // already blank; don't churn history
-
-    const lines = units.map((unit, i) => {
-        const line = { text: unit.text, instruction: '' };
-        const carried = previous?.lines?.[i];
-        if (carried?.segments?.length && normalize(carried.text) === normalize(unit.text)) {
-            line.segments = carried.segments;
-        }
-        return line;
-    });
-
-    const history = previous
-        ? [{ ts: previous.ts ?? Date.now(), lines: previous.lines }, ...(previous.history ?? [])]
-        : [];
-
-    message.extra = message.extra ?? {};
-    message.extra.breeze_direction = {
-        swipe_id: message.swipe_id ?? 0,
-        ts: Date.now(),
-        lines,
-        history: history.slice(0, HISTORY_LIMIT),
-    };
-
-    await ctx().saveChat();
-    markButton(index);
-    return message.extra.breeze_direction;
-}
-
 // ---------------------------------------------------------------- the TTS hook
 
-function locate(text) {
-    const chat = ctx().chat ?? [];
-    const needle = normalize(text).slice(0, 40);
-    for (let i = chat.length - 1; i >= 0; i--) {
-        if (needle && normalize(chat[i]?.mes).includes(needle)) return i;
-    }
-    return chat.length - 1;
-}
-
 /**
- * Which paragraph's instruction applies to this text. Only used when no hint
- * was passed — SillyTavern's own narration path, where the text is a whole
- * paragraph and matching is dependable.
+ * What the provider asks before generating a line: which instruction to read
+ * it with. Only the speaker matters now — their cast description, laid over
+ * the base voice's own. SillyTavern's own narration passes no hint, so it
+ * reads everything in the voice the voice map gives, as it always did.
  */
-function pickLine(direction, text) {
-    const needle = normalize(text);
-    if (!needle) return direction.lines[0]?.instruction;
-
-    const exact = direction.lines.find(l => normalize(l.text) === needle);
-    if (exact) return exact.instruction;
-
-    // A fragment can sit inside more than one paragraph; the longest container
-    // is the least bad guess. Pass a hint and this never runs.
-    let best = null;
-    let bestLength = -1;
-    for (const line of direction.lines) {
-        const body = normalize(line.text);
-        if (!body.includes(needle) && !needle.includes(body)) continue;
-        if (body.length > bestLength) {
-            best = line;
-            bestLength = body.length;
-        }
-    }
-    return (best ?? direction.lines[0])?.instruction;
-}
-
 globalThis.breezeDirector = async function (text, voiceId, preset, hint) {
     const config = settings();
     if (!config.enabled) return null;
@@ -1539,34 +1374,12 @@ globalThis.breezeDirector = async function (text, voiceId, preset, hint) {
     const cast = castFor(hint?.speaker);
     const voiceLine = cast ? voiceInstruction(cast, cloned) : '';
 
-    // A hint names the paragraph outright; locate() only guesses from the text.
-    const index = Number.isInteger(hint?.messageId) ? hint.messageId : locate(text);
-    const message = ctx().chat?.[index];
-
-    let line = '';
-    if (message) {
-        // If a precompute is still running for this message, wait for it rather
-        // than firing a second call or silently falling back.
-        if (inFlight.has(index)) await inFlight.get(index);
-
-        let direction = getDirection(message);
-        if (!direction && config.on_missing === 'generate') {
-            await run(index);
-            direction = getDirection(message);
-        }
-        if (direction) {
-            line = (Number.isInteger(hint?.paragraph)
-                ? direction.lines[hint.paragraph]?.instruction
-                : pickLine(direction, text)) ?? '';
-        }
-    }
-
     // The base's own instruction is the user's description of that voice. A cast
     // member's description supersedes it, being about someone specific — but
     // only if there is one. With nothing said about the speaker, dropping it
     // would leave them sounding like nobody at all rather than like their base.
     const carried = (config.mode === 'append' || !voiceLine) ? (preset?.instruction ?? '') : '';
-    const instruction = [carried, voiceLine, line].map(part => String(part ?? '').trim())
+    const instruction = [carried, voiceLine].map(part => String(part ?? '').trim())
         .filter(Boolean).join(' ');
     if (!instruction) return null;
 
@@ -1589,18 +1402,18 @@ globalThis.breezeExplain = async function (index = (ctx().chat?.length ?? 1) - 1
     if (!message) return 'No such message.';
     if (!breeze?.available) return 'The Breeze provider is not bound.';
 
-    const direction = getDirection(message);
+    const record = getSpeakers(message);
     const units = buildUnits(message.mes);
     const excluded = skipped(message);
-    const take = direction ? (isBlank(direction) ? 'blank' : 'directed') : 'none';
+    const identified = !!record;
 
     const rows = [];
     for (let i = 0; i < units.length; i++) {
-        for (const clip of clipsFor(message, direction?.lines?.[i] ?? units[i], index, i)) {
+        for (const clip of clipsFor(message, record?.lines?.[i] ?? units[i], index, i)) {
             const plan = clip.voice ? await breeze.explain(clip.text, clip.voice, clip.hint) : null;
             rows.push({
                 paragraph: i + 1,
-                take,
+                identified,
                 skipped: excluded.has(i),
                 who: clip.speaker ?? 'narration',
                 voice: clip.voice ?? '(none assigned)',
@@ -1673,9 +1486,7 @@ function pruneCast() {
 }
 
 // ------------------------------------------------------------- identification
-// Who speaks each quote is its own question, with its own call. Asking the
-// director to do it alongside the delivery direction gave it two jobs and not
-// enough context for either.
+// Who speaks each quote is its own question, with its own call.
 
 const PROFILE_FIELDS = ['gender', 'age', 'tone', 'accent'];
 
@@ -1693,7 +1504,7 @@ function cleanProfile(raw) {
 
     const words = profile.tone ? profile.tone.split(/\s+/).length : 0;
     if (words > TONE_WORD_LIMIT) {
-        console.warn(`[Breeze Director] a ${words}-word tone came back where 15 were `
+        console.warn(`[Breeze Cast] a ${words}-word tone came back where 15 were `
             + 'asked for; Breeze follows a short instruction more closely. '
             + 'Shorten it in the voice cast, or tighten the casting prompt.', profile.tone);
     }
@@ -1750,7 +1561,7 @@ async function askIdentify(message, units, from, to, quotes, known) {
     }
 
     const missed = quotes.filter(q => !speakers[q.id]).length;
-    console.info(`[Breeze Director] identified ${quotes.length - missed} of ${quotes.length} quotes`
+    console.info(`[Breeze Cast] identified ${quotes.length - missed} of ${quotes.length} quotes`
         + (missed ? ` (${missed} unattributed)` : '') + '.');
     return speakers;
 }
@@ -1842,7 +1653,7 @@ function rememberSpeaker(speaker) {
     return entry;
 }
 
-/** Ask the director for this speaker's voice: a base to build on, and a description. */
+/** Ask the model for this speaker's voice: a base to build on, and a description. */
 async function askCasting(speaker, quotes, base = null) {
     const config = settings();
     const breeze = globalThis.breezeTts;
@@ -1873,7 +1684,7 @@ async function askCasting(speaker, quotes, base = null) {
     // lines are being read by the narrator rather than described.
     const description = cardText(speaker);
     if (description) known.push(`Their character description:\n${description}`);
-    else console.info(`[Breeze Director] no character card for "${speaker}"; `
+    else console.info(`[Breeze Cast] no character card for "${speaker}"; `
         + 'casting from their lines alone.');
 
     // When the base is already settled, say so: the description should fit the
@@ -1902,7 +1713,7 @@ async function askCasting(speaker, quotes, base = null) {
 /**
  * Settle which base a foreign speaker speaks through, and record them on the
  * cast sheet. A sheet edit pins the entry and wins outright; otherwise a
- * hand-assigned voice-map entry wins; otherwise the director picks one. Never
+ * hand-assigned voice-map entry wins; otherwise the model picks one. Never
  * throws — the caller falls back to the default voice.
  */
 async function castVoice(speaker, quotes = []) {
@@ -1926,7 +1737,7 @@ async function castVoice(speaker, quotes = []) {
     // description. Only an explicit assignment counts: SillyTavern marks every
     // character [Default Voice] until someone chooses, and taking that as a
     // choice pinned every character to whatever the default pointed at — which
-    // is what made the director look like it always picked the same base.
+    // is what made casting look like it always picked the same base.
     const mapped = breeze.assignedVoice(speaker);
     if (mapped && !entry.base) {
         entry.base = mapped;
@@ -1955,18 +1766,18 @@ async function castVoice(speaker, quotes = []) {
     })()
         .then(base => {
             if (base) {
-                console.info(`[Breeze Director] cast ${speaker} on base "${base}": `
+                console.info(`[Breeze Cast] cast ${speaker} on base "${base}": `
                     + (castInstruction(entry) || '(no description)'));
-                toastr.info(`Cast ${speaker} on "${base}".`, 'Breeze Director');
+                toastr.info(`Cast ${speaker} on "${base}".`, 'Breeze Cast');
             } else {
-                console.info(`[Breeze Director] ${speaker} is on the cast sheet `
+                console.info(`[Breeze Cast] ${speaker} is on the cast sheet `
                     + 'with no base yet — give them one there.');
             }
             return settle(base);
         })
         .catch(error => {
-            console.error('[Breeze Director] casting failed for', speaker, error);
-            toastr.error(`Could not cast ${speaker}: ${error?.message ?? error}`, 'Breeze Director');
+            console.error('[Breeze Cast] casting failed for', speaker, error);
+            toastr.error(`Could not cast ${speaker}: ${error?.message ?? error}`, 'Breeze Cast');
             return settle(null);
         })
         .finally(() => castJobs.delete(speaker));
@@ -1976,29 +1787,21 @@ async function castVoice(speaker, quotes = []) {
 }
 
 /**
- * Identify and cast the speakers in one message, leaving its direction alone.
- * This is the casting half of generate(), for when that is all you want.
+ * Identify and cast the speakers in one message, returning who was named.
+ * What the scan and `/breeze-cast` use: generate() with a list for an answer.
  */
-async function castMessage(index) {
-    const message = ctx().chat?.[index];
-    if (!message) return [];
-
-    const units = buildUnits(message.mes);
-    const quotes = collectQuotes(units.map(unit => splitSegments(unit.text)));
-    if (!quotes.length) return [];
-
-    const speakers = await identifySpeakers(message, units, quotes);
-    for (const quote of quotes) {
-        quote.speaker = String(speakers[quote.id] ?? '').trim();
+async function castMessage(index, options) {
+    const record = await run(index, options);
+    const named = [];
+    for (const line of record?.lines ?? []) {
+        for (const segment of line.segments ?? []) {
+            const speaker = segment.speaker;
+            if (isNamedSpeaker(speaker, ctx().chat?.[index]) && !named.includes(speaker)) {
+                named.push(speaker);
+            }
+        }
     }
-
-    const cast = [];
-    for (const quote of quotes) {
-        if (!isNamedSpeaker(quote.speaker, message) || cast.includes(quote.speaker)) continue;
-        cast.push(quote.speaker);
-        await castVoice(quote.speaker, quotes);
-    }
-    return cast;
+    return named;
 }
 
 /** Messages with quoted speech in them, newest first. */
@@ -2029,14 +1832,14 @@ async function prefetchReport(index, { from = 0 } = {}) {
     if (!message) { report.reason = 'no-message'; return report; }
     if (!breeze?.available) { report.reason = 'no-provider'; return report; }
 
-    const direction = getDirection(message);
+    const record = getSpeakers(message);
     const units = buildUnits(message.mes);
     const excluded = skipped(message);
     report.paragraphs = units.length;
 
     for (let i = Math.max(0, from); i < units.length; i++) {
         if (excluded.has(i)) { report.skipped++; continue; }
-        for (const clip of clipsFor(message, direction?.lines?.[i] ?? units[i], index, i)) {
+        for (const clip of clipsFor(message, record?.lines?.[i] ?? units[i], index, i)) {
             if (!clip.voice) { report.voiceless++; continue; }
 
             const outcome = await breeze.prefetch(clip.text, clip.voice, clip.hint);
@@ -2049,7 +1852,7 @@ async function prefetchReport(index, { from = 0 } = {}) {
 
     // Pre-generation that produces nothing looks identical from the outside
     // whatever the cause, so say which one it was every time.
-    console.info(`[Breeze Director] pre-generated message ${index}`
+    console.info(`[Breeze Cast] pre-generated message ${index}`
         + ` from paragraph ${Math.max(0, from) + 1}:`, report);
     return report;
 }
@@ -2062,21 +1865,18 @@ async function prefetchMessage(index, options) {
 /**
  * Everything a message needs to play later, generated now and left in the cache.
  *
- * **This never calls the model.** That is the whole point of the button: audio
- * now, when directing would take longer than you want to wait. A take already
- * written is used as it stands; a message without one gets a blank take on the
- * spot, so the clips are cached against an instruction that will still be there
- * at playback rather than against one the director has yet to write.
- *
- * `blank` blanks a take that does exist. `direct` is the opposite, and the only
- * way a model call happens here: write direction first, then the audio.
+ * Speakers are identified first when they have not been yet, because they
+ * decide the voice: a quote cached in the narrator's voice is audio thrown away
+ * the moment its speaker is known. An identification already running for the
+ * message is waited for rather than raced. A message with no quotes, or with
+ * casting switched off, makes no model call.
  */
-async function pregenerateReport(index, { quiet = true, blank = false, direct = false, from = 0 } = {}) {
+async function pregenerateReport(index, { quiet = true, from = 0 } = {}) {
     const message = ctx().chat?.[index];
     if (!message) return { made: 0, reason: 'no-message' };
 
-    if (direct && settings().enabled && !hasDirection(index)) await run(index, { quiet });
-    else if (blank || !hasDirection(index)) await blankTake(index);
+    if (inFlight.has(index)) await inFlight.get(index);
+    else if (settings().enabled && !hasSpeakers(index)) await run(index, { quiet });
 
     return prefetchReport(index, { from });
 }
@@ -2086,7 +1886,6 @@ async function pregenerate(index, options) {
     return (await pregenerateReport(index, options)).made;
 }
 
-
 /** Everything that should happen before narration starts. */
 async function prepare(index) {
     const config = settings();
@@ -2095,23 +1894,23 @@ async function prepare(index) {
     const message = ctx().chat?.[index];
     if (!message) return;
 
-    if (config.auto && !hasDirection(index)) await run(index);
+    if (config.auto && !hasSpeakers(index)) await run(index);
     if (config.prefetch) await prefetchMessage(index);
 }
 
 // ----------------------------------------------------------- message buttons
 
-const DIRECT_BUTTON_HTML = '<div title="Voice direction" class="mes_button mes_breeze_direct fa-solid fa-masks-theater"></div>';
+const PANEL_BUTTON_HTML = '<div title="Voices and narration panel" class="mes_button mes_breeze_panel fa-solid fa-users"></div>';
 const PLAY_BUTTON_HTML = '<div title="Narration player" class="mes_button mes_breeze_play fa-solid fa-headphones"></div>';
 
 function markButton(index) {
-    $(`#chat .mes[mesid="${index}"] .mes_breeze_direct`).css('opacity', hasDirection(index) ? '1' : '');
+    $(`#chat .mes[mesid="${index}"] .mes_breeze_panel`).css('opacity', hasSpeakers(index) ? '1' : '');
 }
 
 function addButtons() {
     const inject = (host) => {
         if (!host.find('.mes_breeze_play').length) host.prepend(PLAY_BUTTON_HTML);
-        if (!host.find('.mes_breeze_direct').length) host.prepend(DIRECT_BUTTON_HTML);
+        if (!host.find('.mes_breeze_panel').length) host.prepend(PANEL_BUTTON_HTML);
     };
 
     inject($('#message_template .extraMesButtons'));
@@ -2173,7 +1972,7 @@ const player = {
 
         // Paragraph-granular units keep resume keys and panel rows unchanged;
         // the voice switching lives inside each unit's clip list.
-        const direction = getDirection(message);
+        const record = getSpeakers(message);
         const excluded = skipped(message);
         this.units = buildUnits(message.mes).map((unit, i) => ({
             text: unit.text,
@@ -2181,7 +1980,7 @@ const player = {
             // nextPosition() already step over a unit with no clips.
             clips: excluded.has(i)
                 ? []
-                : clipsFor(message, direction?.lines?.[i] ?? unit, messageId, i).filter(c => c.voice),
+                : clipsFor(message, record?.lines?.[i] ?? unit, messageId, i).filter(c => c.voice),
         }));
 
         this.index = Math.min(loadPosition(messageId), Math.max(this.units.length - 1, 0));
@@ -2280,7 +2079,7 @@ player.audio.addEventListener('ended', () => {
 // One panel per message, rendered into the message block itself rather than a
 // popup, so the chat stays visible and playback can highlight as it goes.
 
-const panels = new Map(); // messageId -> { root, rows, repaint, refreshTakes }
+const panels = new Map(); // messageId -> { root, repaint, expanded }
 
 function panelHost(messageId) {
     const block = $(`#chat .mes[mesid="${messageId}"] .mes_block`);
@@ -2306,14 +2105,8 @@ function button(icon, title, handler, label) {
     return element;
 }
 
-function stamp(ts) {
-    if (!ts) return 'earlier take';
-    const date = new Date(ts);
-    return `${date.toLocaleDateString()} ${date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}`;
-}
-
 /** Who reads each span of a paragraph, with a per-segment voice override. */
-function castRows(message, segments, editable) {
+function castRows(message, messageId, segments) {
     const box = document.createElement('div');
     box.style.cssText = 'margin-top:0.35em;display:flex;flex-direction:column;gap:0.25em;';
     const available = globalThis.breezeTts?.listVoices?.() ?? [];
@@ -2349,11 +2142,11 @@ function castRows(message, segments, editable) {
         }
 
         select.value = segment.voice ?? '';
-        select.disabled = !editable;
         select.addEventListener('change', async () => {
             if (select.value) segment.voice = select.value;
             else delete segment.voice;
             await ctx().saveChat();
+            await reloadIfPlaying(messageId);
         });
 
         line.append(who, text, select);
@@ -2371,9 +2164,6 @@ async function openPanel(messageId, { play = false, expandAll = false } = {}) {
     if (panels.has(messageId) && !play) return closePanel(messageId);
     if (!panels.has(messageId)) closeAllPanels();
 
-    let direction = getDirection(message);
-    let viewing = 0; // 0 = current take, 1..n = history
-
     const root = document.createElement('div');
     root.className = 'breeze-panel';
     root.style.cssText = 'margin-top:0.6em;padding:0.6em;border:1px solid var(--white20a);border-radius:6px;';
@@ -2383,28 +2173,20 @@ async function openPanel(messageId, { play = false, expandAll = false } = {}) {
     bar.className = 'flex-container';
     bar.style.cssText = 'gap:0.35em;align-items:center;flex-wrap:wrap;margin-bottom:0.5em;';
 
-    const takes = document.createElement('select');
-    takes.className = 'text_pole';
-    takes.style.cssText = 'flex:1 1 12em;min-width:8em;';
-
     const playButton = button('fa-play', 'Play / pause', () => togglePlayback(messageId));
     const prevButton = button('fa-backward-step', 'Previous paragraph', () => player.prev());
     const nextButton = button('fa-forward-step', 'Next paragraph', () => player.next());
     const stopButton = button('fa-stop', 'Stop', () => player.stop());
-    const regenButton = button('fa-rotate', 'Generate a new take', () => regenerate(messageId));
+    const identifyButton = button('fa-rotate', 'Work out who speaks each quote again',
+        () => reidentify(messageId));
     const pregenButton = button('fa-cloud-arrow-down',
-        'Generate this message\'s audio now, ready for later. Never calls the director: '
-        + 'a message with no take gets a blank one and is read plainly',
+        'Generate this message\'s audio now, ready for later',
         () => pregenerateFrom(messageId));
-    const blankButton = button('fa-eraser',
-        'Blank the take: clear every instruction, no model call, old take kept in the history',
-        () => blankFrom(messageId));
     const expandButton = button('fa-chevron-down', 'Expand or collapse every paragraph', () => toggleAll(messageId));
-    const dropButton = button('fa-xmark', 'Delete the take shown here', () => deleteTake(messageId));
     const eraseButton = button('fa-trash', 'Erase cached audio for this message', () => eraseClips(messageId));
 
-    bar.append(playButton, prevButton, nextButton, stopButton, regenButton, pregenButton,
-        blankButton, expandButton, takes, dropButton, eraseButton);
+    bar.append(playButton, prevButton, nextButton, stopButton, identifyButton, pregenButton,
+        expandButton, eraseButton);
     root.append(bar);
 
     const status = document.createElement('small');
@@ -2417,42 +2199,14 @@ async function openPanel(messageId, { play = false, expandAll = false } = {}) {
     host.append(root);
 
     // --- painting -------------------------------------------------------
-    let rows = [];
     const expanded = new Set(expandAll ? buildUnits(message.mes).map((_, i) => i) : []);
-
-    const takeLines = () => (viewing === 0 ? direction?.lines : direction?.history?.[viewing - 1]?.lines) ?? [];
-
-    function refreshTakes() {
-        takes.innerHTML = '';
-        // Nothing to show a take of, and nothing to delete either.
-        dropButton.style.opacity = direction ? '' : '0.4';
-        if (!direction) {
-            const option = document.createElement('option');
-            option.textContent = 'No direction yet';
-            takes.append(option);
-            takes.disabled = true;
-            return;
-        }
-        takes.disabled = false;
-        const current = document.createElement('option');
-        current.value = '0';
-        current.textContent = `Current — ${stamp(direction.ts)}${isBlank(direction) ? ' (blank)' : ''}`;
-        takes.append(current);
-        (direction.history ?? []).forEach((take, i) => {
-            const option = document.createElement('option');
-            option.value = String(i + 1);
-            option.textContent = `Take ${direction.history.length - i} — ${stamp(take.ts)}`
-                + (isBlank(take) ? ' (blank)' : '');
-            takes.append(option);
-        });
-        takes.value = String(viewing);
-    }
 
     function repaint(state = 'ready', playingIndex = -1) {
         const units = buildUnits(message.mes);
-        const lines = takeLines();
-        const editable = viewing === 0;
+        const record = getSpeakers(message);
+        const lines = record?.lines ?? [];
         const excluded = skipped(message);
+        const quoted = units.some(unit => splitSegments(unit.text).some(s => s.kind === 'dialogue'));
 
         // The exact clip on air, so the panel can name the voice reading it.
         const active = playingIndex >= 0 && player.messageId === messageId
@@ -2461,7 +2215,7 @@ async function openPanel(messageId, { play = false, expandAll = false } = {}) {
         const who = active?.voice ? ` — ${active.speaker ?? 'narration'} in "${active.voice}"` : '';
 
         list.innerHTML = '';
-        rows = units.map((unit, i) => {
+        units.forEach((unit, i) => {
             const row = document.createElement('div');
             row.style.cssText = 'border-top:1px solid var(--white20a);padding:0.35em 0;';
 
@@ -2521,7 +2275,7 @@ async function openPanel(messageId, { play = false, expandAll = false } = {}) {
             // message interrupted partway need not pay for its first half twice.
             const pregenOne = document.createElement('div');
             pregenOne.className = 'fa-solid fa-cloud-arrow-down';
-            pregenOne.title = 'Generate audio from this paragraph on, without directing';
+            pregenOne.title = 'Generate audio from this paragraph on';
             pregenOne.style.cssText = 'opacity:0.6;padding-top:0.25em;cursor:pointer;';
             pregenOne.addEventListener('click', async event => {
                 event.stopPropagation();
@@ -2555,92 +2309,53 @@ async function openPanel(messageId, { play = false, expandAll = false } = {}) {
                 row.append(chips);
             }
 
-            let input = null;
             if (expanded.has(i)) {
-                input = document.createElement('textarea');
-                input.className = 'text_pole textarea_compact';
-                input.rows = 2;
-                input.style.marginTop = '0.3em';
-                input.placeholder = direction ? 'No instruction for this paragraph' : 'Generate a take first';
-                input.value = lines[i]?.instruction ?? '';
-                input.readOnly = !editable || !direction;
-                input.addEventListener('change', async () => {
-                    if (!editable || !direction) return;
-                    if (direction.lines[i]) direction.lines[i].instruction = input.value.trim();
-                    message.extra.breeze_direction = direction;
-                    await ctx().saveChat();
-                });
-                row.append(input);
-
                 const segments = lines[i]?.segments ?? [];
-                if (segments.length) row.append(castRows(message, segments, editable));
+                if (segments.length) row.append(castRows(message, messageId, segments));
             }
 
             if (i === playingIndex) row.style.background = 'var(--white20a)';
             list.append(row);
-            return { row, input };
         });
-
-        if (viewing !== 0) {
-            const restore = button(null, 'Make this the current take', () => restoreTake(messageId), 'Restore this take');
-            restore.style.marginTop = '0.5em';
-            list.append(restore);
-        }
 
         playButton.classList.toggle('fa-play', state !== 'playing');
         playButton.classList.toggle('fa-pause', state === 'playing');
-        status.textContent = !direction
-            ? 'No direction yet — press the rotate button to generate one.'
-            : state === 'loading'
-                ? `Generating audio for paragraph ${playingIndex + 1}…${who}`
-                : playingIndex >= 0
-                    ? `Paragraph ${playingIndex + 1} of ${units.length} — ${state}${who}`
+        status.textContent = state === 'loading'
+            ? `Generating audio for paragraph ${playingIndex + 1}…${who}`
+            : playingIndex >= 0
+                ? `Paragraph ${playingIndex + 1} of ${units.length} — ${state}${who}`
+                : quoted && !record
+                    ? 'Speakers not identified yet — quotes read in the narrator\'s voice. '
+                        + 'The rotate button works them out.'
                     : excluded.size
-                    ? `${units.length} paragraphs, ${excluded.size} skipped`
-                    : `${units.length} paragraphs`;
+                        ? `${units.length} paragraphs, ${excluded.size} skipped`
+                        : `${units.length} paragraphs`;
     }
 
-    takes.addEventListener('change', () => {
-        viewing = Number(takes.value);
-        repaint();
-    });
-
-    const entry = {
-        root,
-        repaint,
-        refreshTakes,
-        get direction() { return direction; },
-        set direction(value) { direction = value; },
-        get viewing() { return viewing; },
-        set viewing(value) { viewing = value; },
-        expanded,
-    };
-    panels.set(messageId, entry);
-
-    refreshTakes();
+    panels.set(messageId, { root, repaint, expanded });
     repaint();
 
     if (play) await playFrom(messageId, loadPosition(messageId));
 }
 
-async function regenerate(messageId) {
+/** Work out the speakers again, keeping any voice picked by hand. */
+async function reidentify(messageId) {
     const entry = panels.get(messageId);
-    if (!entry) return;
-
-    const icon = entry.root.querySelector('.fa-rotate');
+    const icon = entry?.root.querySelector('.fa-rotate');
     icon?.classList.add('fa-spin');
     try {
-        const fresh = await generate(messageId, { quiet: false });
+        if (!settings().cast_enabled) {
+            return toastr.info('Per-speaker voices are switched off in the settings.', 'Breeze Cast');
+        }
+        const fresh = await run(messageId, { quiet: false });
         if (fresh) {
-            entry.direction = fresh;
-            entry.viewing = 0;
-            entry.refreshTakes();
-            entry.repaint();
+            await reloadIfPlaying(messageId);
+            entry?.repaint();
         }
     } catch (error) {
         // Surfaced rather than swallowed: a silent no-op looks like a broken button.
-        console.error('[Breeze Director] regenerate failed:', error);
-        toastr.error(String(error?.message ?? error), 'Breeze Director');
+        console.error('[Breeze Cast] identifying speakers failed:', error);
+        toastr.error(String(error?.message ?? error), 'Breeze Cast');
     } finally {
         icon?.classList.remove('fa-spin');
     }
@@ -2687,7 +2402,7 @@ function announce(report, from) {
     if (report.voiceless) {
         return toastr.warning(
             `No Breeze voice for ${report.voiceless} of these lines — assign one in the voice map, `
-            + 'or set a narrator voice in the director settings.',
+            + 'or set a narrator voice in the Breeze Voice Cast settings.',
             'Breeze',
         );
     }
@@ -2699,34 +2414,22 @@ function announce(report, from) {
 
 /**
  * Generate a message's audio up front, leaving it cached rather than playing it.
- *
  * `from` is the paragraph to start at — the panel passes the row that was
- * clicked — and `blank` says to settle the direction by emptying it rather than
- * by asking the model.
+ * clicked.
  */
-async function pregenerateFrom(messageId, { from = 0, blank = false } = {}) {
+async function pregenerateFrom(messageId, { from = 0 } = {}) {
     const entry = panels.get(messageId);
     // The row icons carry the same class as the toolbar button; querySelector
     // returns the toolbar one, which is where a whole-message job belongs.
     const icon = entry?.root.querySelector('.fa-cloud-arrow-down');
     icon?.classList.add('fa-spin');
     try {
-        const report = await pregenerateReport(messageId, { quiet: false, from, blank });
-
-        // Pre-generation can settle the direction on its own — by writing one or
-        // by blanking it — so the panel may be holding a take that no longer exists.
-        if (entry) {
-            const fresh = getDirection(ctx().chat?.[messageId]);
-            if (fresh !== entry.direction) {
-                entry.direction = fresh;
-                entry.viewing = 0;
-                entry.refreshTakes();
-            }
-            entry.repaint();
-        }
+        const report = await pregenerateReport(messageId, { quiet: false, from });
+        // Pre-generation may have identified the speakers on its way.
+        entry?.repaint();
         announce(report, from);
     } catch (error) {
-        console.error('[Breeze Director] pre-generation failed:', error);
+        console.error('[Breeze Cast] pre-generation failed:', error);
         toastr.error(String(error?.message ?? error), 'Breeze');
     } finally {
         icon?.classList.remove('fa-spin');
@@ -2734,122 +2437,18 @@ async function pregenerateFrom(messageId, { from = 0, blank = false } = {}) {
 }
 
 /**
- * A take change reaches what is already on air only if the player rebuilds its
- * units from it — paragraphs and their clips come from the take's segments — so
- * a message being read is reloaded, as unchecking a paragraph does. A reload
- * that fails is not worth losing the change over; it is logged and left.
+ * A change to who reads what reaches what is already on air only if the player
+ * rebuilds its units — paragraphs and their clips come from the stored
+ * segments — so a message being read is reloaded, as unchecking a paragraph
+ * does. A reload that fails is not worth losing the change over.
  */
 async function reloadIfPlaying(messageId) {
     if (player.messageId !== messageId) return;
     try {
         await player.load(messageId);
     } catch (error) {
-        console.warn('[Breeze Player] could not reload after a take changed:', error);
+        console.warn('[Breeze Player] could not reload after the speakers changed:', error);
     }
-}
-
-/**
- * Empty this message's take, so it is read with nothing but the voice's own
- * preset behind it. Audio is not generated here: which paragraph to start from
- * is the reader's call, and the row and toolbar cloud buttons ask it.
- */
-async function blankFrom(messageId) {
-    const entry = panels.get(messageId);
-    const icon = entry?.root.querySelector('.fa-eraser');
-    icon?.classList.add('fa-spin');
-    try {
-        const direction = await blankTake(messageId);
-        if (!direction) return toastr.info('Nothing to blank.', 'Breeze Director');
-
-        if (entry) {
-            entry.direction = direction;
-            entry.viewing = 0;
-            entry.refreshTakes();
-            entry.repaint();
-        }
-        await reloadIfPlaying(messageId);
-        toastr.success(
-            'Take blanked. Use the cloud button for the whole message, '
-            + 'or a paragraph\'s own to start there.',
-            'Breeze Director',
-        );
-    } catch (error) {
-        console.error('[Breeze Director] blanking failed:', error);
-        toastr.error(String(error?.message ?? error), 'Breeze Director');
-    } finally {
-        icon?.classList.remove('fa-spin');
-    }
-}
-
-/**
- * Drop the take the panel is showing.
- *
- * A take from the history is simply removed. Deleting the current one promotes
- * the newest take behind it, so the undo path the history exists for still
- * works; with nothing behind it the message goes back to having no direction at
- * all, which is a real state — it is what a message starts in.
- */
-async function deleteTake(messageId) {
-    const context = ctx();
-    const entry = panels.get(messageId);
-    const message = context.chat?.[messageId];
-    const direction = entry?.direction;
-    if (!entry || !message || !direction) return;
-
-    const at = entry.viewing;
-    const history = direction.history ?? [];
-    const label = at === 0
-        ? (history.length ? 'Delete the current take and go back to the one before it?'
-            : 'Delete the current take? This message has no earlier one, so it will be '
-              + 'left with no direction.')
-        : `Delete take ${history.length - (at - 1)}?`;
-
-    const confirmed = await context.callGenericPopup(label, context.POPUP_TYPE.CONFIRM);
-    if (!confirmed) return;
-
-    if (at > 0) {
-        history.splice(at - 1, 1);
-        direction.history = history;
-        message.extra.breeze_direction = direction;
-    } else if (history.length) {
-        const previous = history.shift();
-        direction.lines = previous.lines;
-        direction.ts = previous.ts ?? Date.now();
-        direction.history = history;
-        message.extra.breeze_direction = direction;
-    } else {
-        delete message.extra.breeze_direction;
-        entry.direction = null;
-    }
-
-    await context.saveChat();
-    markButton(messageId);
-
-    await reloadIfPlaying(messageId);
-
-    entry.viewing = 0;
-    entry.refreshTakes();
-    entry.repaint();
-}
-
-function restoreTake(messageId) {
-    const entry = panels.get(messageId);
-    const message = ctx().chat?.[messageId];
-    const direction = entry?.direction;
-    if (!entry || !direction || entry.viewing === 0) return;
-
-    const chosen = direction.history.splice(entry.viewing - 1, 1)[0];
-    direction.history.unshift({ ts: direction.ts ?? Date.now(), lines: direction.lines });
-    direction.lines = chosen.lines;
-    direction.ts = chosen.ts ?? Date.now();
-    direction.history = direction.history.slice(0, HISTORY_LIMIT);
-
-    message.extra.breeze_direction = direction;
-    ctx().saveChat();
-
-    entry.viewing = 0;
-    entry.refreshTakes();
-    entry.repaint();
 }
 
 function toggleAll(messageId) {
@@ -2869,11 +2468,11 @@ async function eraseClips(messageId) {
     if (!message || !breeze?.available) return;
 
     // A message can now span several voices, and clips are keyed per voice.
-    const direction = getDirection(message);
+    const record = getSpeakers(message);
     const units = buildUnits(message.mes);
     const byVoice = new Map();
     units.forEach((unit, i) => {
-        for (const clip of clipsFor(message, direction?.lines?.[i] ?? unit, messageId, i)) {
+        for (const clip of clipsFor(message, record?.lines?.[i] ?? unit, messageId, i)) {
             if (!clip.voice) continue;
             if (!byVoice.has(clip.voice)) byVoice.set(clip.voice, []);
             byVoice.get(clip.voice).push(clip.text);
@@ -2914,35 +2513,13 @@ async function eraseClips(messageId) {
 }
 
 /**
- * Pressing play must not wait for a director either.
- *
- * A message with no take gets a blank one first — the same settling the cloud
- * button does — so the line is read plainly, now, with the voice's own preset
- * behind it. Waiting on a model call with a finger on the play button is the
- * one thing this player exists not to do.
- *
- * It writes rather than just reading plainly so the clips stay valid: with no
- * take at all, `on_missing: generate` would direct the message the next time
- * something narrated it, and every clip cached under the plain reading would be
- * keyed to an instruction that no longer applies.
+ * Pressing play waits for an identification already running for the message,
+ * since it is about to change the voices, but never starts one: a message not
+ * yet identified plays now, quotes and all in the narrator's voice.
  */
-async function settleBeforePlaying(messageId) {
-    if (!settings().enabled || hasDirection(messageId)) return;
-
-    console.info(`[Breeze Director] message ${messageId} has no take; reading it plainly.`);
-    const direction = await blankTake(messageId);
-
-    const entry = panels.get(messageId);
-    if (entry && direction) {
-        entry.direction = direction;
-        entry.viewing = 0;
-        entry.refreshTakes();
-    }
-}
-
 async function playFrom(messageId, index) {
     try {
-        await settleBeforePlaying(messageId);
+        if (inFlight.has(messageId)) await inFlight.get(messageId);
         await player.load(messageId);
     } catch (error) {
         toastr.warning(String(error?.message ?? error), 'Breeze Player');
@@ -2975,15 +2552,15 @@ function resumeLatest() {
     openPanel(Math.max(...candidates), { play: true });
 }
 // ------------------------------------------------------------------ cast sheet
-// One row per speaker the director has cast in this chat: the base voice it
-// built them from, and the tone description that separates them from it.
+// One row per speaker cast in this chat: the base voice they are built from,
+// and the tone description that separates them from it.
 // Edits apply immediately — there is no save button to forget to press.
 
 async function openCastSheet() {
     const context = ctx();
     const breeze = globalThis.breezeTts;
     if (!breeze?.available) {
-        return toastr.warning('Select the Breeze TTS provider first.', 'Breeze Director');
+        return toastr.warning('Select the Breeze TTS provider first.', 'Breeze Cast');
     }
 
     const cast = castMap();
@@ -3025,7 +2602,7 @@ async function openCastSheet() {
         );
         const speaker = String(name ?? '').trim();
         if (!speaker) return;
-        if (cast[speaker]) return toastr.info(`${speaker} is already cast.`, 'Breeze Director');
+        if (cast[speaker]) return toastr.info(`${speaker} is already cast.`, 'Breeze Cast');
 
         cast[speaker] = { voice: null, base: null, pinned: true };
         context.saveSettingsDebounced();
@@ -3033,15 +2610,15 @@ async function openCastSheet() {
         paint();
     }
 
-    /** Run the casting half of the director over recent messages. */
+    /** Identify and cast the speakers in recent messages. */
     async function scanChat() {
         if (!settings().profile) {
-            return toastr.warning('Pick a connection profile first.', 'Breeze Director');
+            return toastr.warning('Pick a connection profile first.', 'Breeze Cast');
         }
 
         const targets = quotedMessages(CAST_SCAN_LIMIT);
         if (!targets.length) {
-            return toastr.info('No quoted speech in this chat yet.', 'Breeze Director');
+            return toastr.info('No quoted speech in this chat yet.', 'Breeze Cast');
         }
 
         const confirmed = await context.callGenericPopup(
@@ -3063,7 +2640,7 @@ async function openCastSheet() {
                 ? `Found ${[...named].join(', ')}.`
                 : 'No new speakers found.';
         } catch (error) {
-            console.error('[Breeze Director] cast scan failed:', error);
+            console.error('[Breeze Cast] cast scan failed:', error);
             progress.textContent = 'Scan failed — see the console.';
         } finally {
             scanButton.classList.remove('disabled');
@@ -3078,7 +2655,7 @@ async function openCastSheet() {
         if (!speakers.length) {
             const empty = document.createElement('small');
             empty.style.opacity = '0.6';
-            empty.textContent = 'Nobody cast yet. Speakers appear here as the director names them.';
+            empty.textContent = 'Nobody cast yet. Speakers appear here as they are identified.';
             list.append(empty);
             return;
         }
@@ -3129,7 +2706,7 @@ async function openCastSheet() {
 
             const preview = button('fa-play', `Hear ${speaker}`, async () => {
                 if (!voiced) {
-                    return toastr.info('Pick a base voice for them first.', 'Breeze Director');
+                    return toastr.info('Pick a base voice for them first.', 'Breeze Cast');
                 }
                 try {
                     // Composed on the fly: nothing about this member is stored
@@ -3147,7 +2724,7 @@ async function openCastSheet() {
 
             const recast = button('fa-rotate', 'Choose a base voice again', async () => {
                 const base = await askCasting(speaker, [], entry);
-                if (!base) return toastr.warning('Nothing usable came back.', 'Breeze Director');
+                if (!base) return toastr.warning('Nothing usable came back.', 'Breeze Cast');
                 entry.base = base;
                 cast[speaker] = entry;
                 await rederive(speaker, entry);
@@ -3165,7 +2742,7 @@ async function openCastSheet() {
             head.append(baseSelect, preview, recast, forget);
             row.append(head);
 
-            // The fields the director filled in, all editable.
+            // The fields the model filled in, all editable.
             const fields = document.createElement('div');
             fields.style.cssText = 'display:flex;gap:0.4em;flex-wrap:wrap;margin-top:0.35em;';
             for (const field of ['gender', 'age', 'accent']) {
@@ -3277,7 +2854,7 @@ function registerSlashCommands() {
         SlashCommandNamedArgument, ARGUMENT_TYPE,
     } = context;
     if (!SlashCommandParser?.addCommandObject || !SlashCommand?.fromProps) {
-        console.warn('[Breeze Director] this SillyTavern has no slash command API; skipping.');
+        console.warn('[Breeze Cast] this SillyTavern has no slash command API; skipping.');
         return;
     }
 
@@ -3295,7 +2872,7 @@ function registerSlashCommands() {
             callback: async (args, value) => {
                 const index = targetMessage(value);
                 if (index < 0) {
-                    toastr.warning('No such message.', 'Breeze Director');
+                    toastr.warning('No such message.', 'Breeze Cast');
                     return '';
                 }
                 return String(await act(index, args ?? {}) ?? '');
@@ -3309,68 +2886,44 @@ function registerSlashCommands() {
         ? [new SlashCommandNamedArgument(props.name, props.description, props.typeList, false)]
         : []);
 
-    add('breeze-direct', ['breezedirect'], 'number of paragraphs directed', `
-        <div>Write delivery direction for a message, as the director does automatically.</div>
-        <div>Replaces any existing take, keeping the old one in the message's history.</div>
-        <div><strong>Example:</strong> <code>/breeze-direct</code> or <code>/breeze-direct -2</code></div>`,
-    async (index) => (await run(index, { quiet: false }))?.lines?.length ?? 0);
-
     add('breeze-cast', ['breezecast'], 'names of the speakers cast', `
         <div>Work out who speaks each quoted line, and cast a voice for anyone new.</div>
-        <div>Leaves the message's direction alone.</div>
+        <div>Replaces the message's speakers, keeping any voice picked by hand.</div>
         <div><strong>Example:</strong> <code>/breeze-cast</code></div>`,
     async (index) => (await castMessage(index)).join(', '));
 
     add('breeze-audio', ['breezeaudio', 'breezepregen'], 'number of clips generated', `
         <div>Generate a message's audio now and leave it cached, without playing it.</div>
-        <div><strong>No model call.</strong> A take already written is used as it stands;
-        a message without one gets a blank take, and is read with nothing but the voice's
-        own preset behind it.</div>
-        <div><code>blank=true</code> blanks a take that does exist, keeping it in the
-        message's history.</div>
-        <div><code>direct=true</code> writes direction first and then the audio — the slow
-        path, when you want it.</div>
+        <div>Speakers are identified first if they have not been, since they decide
+        the voices. A message with no quotes makes no model call.</div>
         <div><code>from=</code> starts at that paragraph, counting from 1, instead of
         at the top.</div>
-        <div><strong>Example:</strong> <code>/breeze-audio</code>,
-        <code>/breeze-audio blank=true</code>, or
+        <div><strong>Example:</strong> <code>/breeze-audio</code> or
         <code>/breeze-audio from=3 -2</code></div>`,
     (index, args) => pregenerate(index, {
         quiet: false,
-        blank: isOn(args.blank),
-        direct: isOn(args.direct),
         // Paragraphs are numbered from 1 in the panel; match that here.
         from: Math.max(0, (Number(args.from) || 1) - 1),
     }),
     [
-        ...flag({ name: 'blank', description: 'blank an existing take before generating', typeList: [ARGUMENT_TYPE.BOOLEAN] }),
-        ...flag({ name: 'direct', description: 'write direction first, calling the model', typeList: [ARGUMENT_TYPE.BOOLEAN] }),
         ...flag({ name: 'from', description: 'first paragraph to generate, counting from 1', typeList: [ARGUMENT_TYPE.NUMBER] }),
     ]);
-
-    add('breeze-blank', ['breezeblank'], 'number of paragraphs blanked', `
-        <div>Empty a message's take: every paragraph kept, every instruction cleared,
-        no model call. The take it replaces stays in the message's history.</div>
-        <div>Audio cached against a blank take keeps matching, since nothing will
-        direct the message later.</div>
-        <div><strong>Example:</strong> <code>/breeze-blank</code></div>`,
-    async (index) => (await blankTake(index))?.lines?.length ?? 0);
 }
 
 const SETTINGS_HTML = `
 <div class="breeze-director-settings">
   <div class="inline-drawer">
     <div class="inline-drawer-toggle inline-drawer-header">
-      <b>Breeze Voice Director</b>
+      <b>Breeze Voice Cast</b>
       <div class="inline-drawer-icon fa-solid fa-circle-chevron-down down"></div>
     </div>
     <div class="inline-drawer-content">
       <label class="checkbox_label"><input id="bd_enabled" type="checkbox"> Enabled</label>
-      <label class="checkbox_label"><input id="bd_auto" type="checkbox"> Generate automatically on new character messages</label>
+      <label class="checkbox_label"><input id="bd_auto" type="checkbox"> Identify speakers automatically on new character messages</label>
       <label class="checkbox_label"><input id="bd_auto_user" type="checkbox"> …and on user messages</label>
-      <label class="checkbox_label"><input id="bd_prefetch" type="checkbox"> Pre-generate audio after directing</label>
+      <label class="checkbox_label"><input id="bd_prefetch" type="checkbox"> Pre-generate audio for new messages</label>
       <label class="checkbox_label"><input id="bd_cast" type="checkbox"> Give quoted speech its own voice per speaker</label>
-      <small>Click the masks icon on any message to view, generate, or edit its direction.</small>
+      <small>Click the people icon on any message to see who reads each line.</small>
       <small id="bd_paragraph_warn" style="color:var(--golden);display:block;"></small>
 
       <label for="bd_narrator">Narrator voice (everything outside quotes):</label>
@@ -3379,19 +2932,10 @@ const SETTINGS_HTML = `
       <label for="bd_profile">Connection Profile:</label>
       <select id="bd_profile" class="text_pole"></select>
 
-      <label for="bd_missing">If a message has no direction when SillyTavern's own
-      narration starts:</label>
-      <select id="bd_missing" class="text_pole">
-        <option value="static">Use the voice's own instruction (no LLM call)</option>
-        <option value="generate">Generate it now (delays playback)</option>
-      </select>
-      <small>The panel's own player never waits: it writes a blank take and reads the
-      message plainly, then you can direct it with the rotate button.</small>
-
-      <label for="bd_mode">Combine with the voice's own instruction:</label>
+      <label for="bd_mode">A cast member's description, against their base voice's own instruction:</label>
       <select id="bd_mode" class="text_pole">
-        <option value="replace">Replace it</option>
-        <option value="append">Append to it</option>
+        <option value="replace">Replaces it</option>
+        <option value="append">Is added to it</option>
       </select>
 
       <label for="bd_identify_chunk">Paragraphs per speaker-identification call:</label>
@@ -3414,11 +2958,6 @@ const SETTINGS_HTML = `
       <label for="bd_tokens">Max response tokens:</label>
       <input id="bd_tokens" type="number" min="64" max="4096" step="32" class="text_pole">
 
-      <label for="bd_prompt">Prompt (<code>{{parts}}</code>, <code>{{count}}</code>,
-      <code>{{message}}</code>, <code>{{char}}</code>, <code>{{user}}</code>):</label>
-      <textarea id="bd_prompt" class="text_pole textarea_compact" rows="14"></textarea>
-      <input id="bd_reset" class="menu_button" type="button" value="Reset prompt">
-
       <label for="bd_identify_prompt">Speaker identification prompt (<code>{{context}}</code>,
       <code>{{parts}}</code>, <code>{{quotes}}</code>, <code>{{char}}</code>,
       <code>{{user}}</code>):</label>
@@ -3434,7 +2973,7 @@ const SETTINGS_HTML = `
 
       <hr>
       <b>Cast for this chat</b>
-      <small>Each speaker the director names is given one of your Breeze voices as a
+      <small>Each speaker identified is given one of your Breeze voices as a
       base, plus a description of their own. Breeze's own voices are never modified.</small>
       <div class="flex-container" style="gap:0.5em;align-items:center;margin-top:0.4em;">
         <input id="bd_cast_open" class="menu_button" type="button" value="Open voice cast">
@@ -3445,7 +2984,7 @@ const SETTINGS_HTML = `
       <hr>
       <b>Player</b>
       <label class="checkbox_label"><input id="bp_autoplay" type="checkbox"> Continue to the next paragraph automatically</label>
-      <small>The masks icon on a message opens its panel inline; the headphones icon opens it
+      <small>The people icon on a message opens its panel inline; the headphones icon opens it
       and starts playing. Position is remembered per message, so stopping mid-way and coming
       back picks up where you left off.</small>
 
@@ -3475,7 +3014,6 @@ function bind() {
     checkbox('#bd_auto_user', 'auto_user');
     checkbox('#bd_prefetch', 'prefetch');
     checkbox('#bd_cast', 'cast_enabled');
-    field('#bd_missing', 'on_missing');
     field('#bd_mode', 'mode');
     field('#bd_cfg', 'cfg_scale', Number);
     field('#bd_tokens', 'max_tokens', Number);
@@ -3483,24 +3021,23 @@ function bind() {
     field('#bd_exclusions', 'exclusions');
     checkbox('#bd_skip_tags', 'skip_tags');
     field('#bd_identify_prompt', 'identify_prompt');
-    field('#bd_prompt', 'prompt');
     field('#bd_voice_cast_prompt', 'voice_cast_prompt');
 
-    // Two silent-failure modes worth naming: a saved prompt from before casting
-    // never returns speakers, and with ST's own paragraph narration off it hands
-    // the provider the whole message as one job.
+    // Two silent-failure modes worth naming: a saved casting prompt that cannot
+    // see the cast, and ST's own paragraph narration being off, which hands the
+    // provider the whole message as one job.
     const warn = () => {
         $('#bd_cast_prompt_warn').text(config.voice_cast_prompt.includes('{{cast}}')
             ? ''
             : 'This saved casting prompt cannot see the existing cast — click '
-                + '"Reset casting prompt" so the director keeps voices consistent.');
+                + '"Reset casting prompt" so voices stay consistent across the scene.');
         $('#bd_paragraph_warn').text(ctx().extensionSettings?.tts?.narrate_by_paragraphs
             ? ''
             : 'SillyTavern\'s "Narrate by paragraphs" is off, so its own narration reads '
                 + 'each message as a single job. The player here is unaffected.');
     };
     warn();
-    $('#bd_prompt').on('input', warn);
+    $('#bd_voice_cast_prompt').on('input', warn);
 
     // Voices come from the provider's JSON, which the user can edit at any time.
     const fillVoices = () => {
@@ -3532,14 +3069,7 @@ function bind() {
         for (const speaker of Object.keys(cast)) delete cast[speaker];
         save();
         renderCast();
-        toastr.info('Cast forgotten for this chat.', 'Breeze Director');
-    });
-
-    $('#bd_reset').on('click', () => {
-        config.prompt = DEFAULT_PROMPT;
-        $('#bd_prompt').val(DEFAULT_PROMPT);
-        save();
-        warn();
+        toastr.info('Cast forgotten for this chat.', 'Breeze Cast');
     });
 
     $('#bd_exclusions_reset').on('click', () => {
@@ -3593,7 +3123,7 @@ jQuery(async () => {
     bind();
     addButtons();
 
-    $(document).on('click', '.mes_breeze_direct', function () {
+    $(document).on('click', '.mes_breeze_panel', function () {
         const index = Number($(this).closest('.mes').attr('mesid'));
         if (Number.isInteger(index)) openPanel(index);
     });
@@ -3604,14 +3134,14 @@ jQuery(async () => {
     });
 
     $('#tts_wand_container').append(`
-        <div id="breezeDirectorEdit" class="list-group-item flex-container flexGap5" title="Voice direction for the last message">
-            <div class="extensionsMenuExtensionButton fa-solid fa-masks-theater"></div>
-            <span>Voice direction</span>
+        <div id="breezeDirectorEdit" class="list-group-item flex-container flexGap5" title="Who reads each line of the last message">
+            <div class="extensionsMenuExtensionButton fa-solid fa-comments"></div>
+            <span>Speakers in last message</span>
         </div>`);
     $('#breezeDirectorEdit').on('click', () => {
         const index = (ctx().chat?.length ?? 0) - 1;
         if (index >= 0) openPanel(index, { expandAll: true });
-        else toastr.info('No messages in this chat.', 'Breeze Director');
+        else toastr.info('No messages in this chat.', 'Breeze Cast');
     });
 
     $('#tts_wand_container').append(`
@@ -3625,7 +3155,7 @@ jQuery(async () => {
     try {
         registerSlashCommands();
     } catch (error) {
-        console.error('[Breeze Director] could not register slash commands:', error);
+        console.error('[Breeze Cast] could not register slash commands:', error);
     }
 
     $('#tts_wand_container').append(`

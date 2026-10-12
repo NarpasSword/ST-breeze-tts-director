@@ -4,38 +4,45 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-A SillyTavern third-party extension: **Breeze TTS, Director & Player**. One
-`index.js` (~2900 lines, no build step, no dependencies beyond SillyTavern's own
-`tts` extension) doing four things:
+A SillyTavern third-party extension: **Breeze TTS, Cast & Player**. One
+`index.js` (no build step, no dependencies beyond SillyTavern's own `tts`
+extension) doing three things:
 
 - **Provider** — registers `Breeze` in the TTS provider dropdown, wraps its raw
   24 kHz PCM in a WAV header, caches clips in IndexedDB keyed by content, and
   publishes `globalThis.breezeTts`. **Its voices are the user's to manage;
   nothing in this extension writes one.**
-- **Director** — one LLM call per message writes a delivery instruction for
-  every paragraph, stored in the chat file.
-- **Identification and casting** — a second call works out who speaks each
-  quoted span; a third, per new speaker, picks one of the Breeze voices as their
+- **Identification and casting** — one call works out who speaks each quoted
+  span; another, per new speaker, picks one of the Breeze voices as their
   **base** and writes a description of them. Non-quote text reads in a
   configurable narrator voice.
 - **Player** — an inline panel per message with paragraph-level seek,
-  per-message resume, per-segment voice overrides, and take history: takes can
-  be restored, deleted, or blanked, and audio pre-generated from any paragraph
-  without waiting for a director.
+  per-message resume, per-segment voice overrides, and audio pre-generated from
+  any paragraph.
+
+**There is no per-paragraph delivery direction any more.** An earlier version
+had an LLM write a stage direction for every paragraph, kept takes of it, and
+let you blank, restore and delete them. It was rarely used and cost a model
+call per message, so it was removed in 3.0.0. What reaches Breeze is the
+speaker's voice and nothing else. Old `extra.breeze_direction` records in chats
+are ignored, and deleted when a message's speakers are next written.
 
 There is no build or lint tooling beyond `tools/check.js`. The file is a plain
 ES module loaded directly by the browser.
 
 ## One extension, two halves
 
-The provider and the director speak only through two globals —
+The provider and the cast speak only through two globals —
 `globalThis.breezeTts` and `globalThis.breezeDirector` — even though they now
 live in the same file. Keep that boundary:
 
-- the provider must work with no director present, falling back to each voice's
+- the provider must work with no cast present, falling back to each voice's
   own static instruction whenever `breezeDirector` returns `null` or throws;
-- the director must tolerate a provider that is absent or older, which is what
-  `PROVIDER_FEATURES` and `basePreset()` guard.
+- the cast must tolerate a provider that is absent or older, which is what
+  `basePreset()` guards.
+
+`breezeDirector` keeps its name for the provider's sake, though it no longer
+directs: it composes a cast member's description over their base voice.
 
 **They used to be two extensions and drifted apart once too often.** The
 provider lived outside version control and was copied into SillyTavern by hand,
@@ -112,7 +119,7 @@ Console checks while iterating:
 ```js
 await breezeExplain()                                        // what would be sent, line by line
 SillyTavern.getContext().extensionSettings.breeze_director   // settings actually persisted
-SillyTavern.getContext().chat.at(-1).extra.breeze_direction  // the stored take + history
+SillyTavern.getContext().chat.at(-1).extra.breeze_speakers   // who speaks each segment
 globalThis.breezeTts.available                               // provider bound?
 globalThis.breezeTts.voiceForCharacter('Name')
 await globalThis.breezeTts.cacheStats()
@@ -120,32 +127,27 @@ await globalThis.breezeTts.cacheStats()
 
 ## Architecture
 
-### Paragraphs direct; segments only pick a voice
+### Paragraphs play; segments only pick a voice
 
 Two levels of splitting, and the distinction is load-bearing:
 
 - `buildUnits()` splits a message by `\n`, dropping lines that **look** empty.
-  This is the unit of *direction*, of panel rows, and of resume positions.
+  This is the unit of panel rows, of resume positions, and of the speakers
+  record.
 
   ST itself drops only lines of length zero. That is not enough: a message with
   CRLF endings splits into lines still carrying their `\r`, so every paragraph
   break becomes a one-character line that survives the test and shows up as a
-  blank paragraph — a panel row, a unit to direct, a clip of nothing to
-  generate. Lines of spaces or of zero-width characters do the same, so
-  `splitLines()` trims both before deciding.
+  blank paragraph — a panel row and a clip of nothing to generate. Lines of
+  spaces or of zero-width characters do the same, so `splitLines()` trims both
+  before deciding.
 
   This makes our paragraph numbering diverge from ST's line numbering, which
-  costs nothing: the player addresses paragraphs through an explicit hint, and
-  ST's own path finds them by matching text.
+  costs nothing: the player addresses paragraphs through an explicit hint.
 - `splitSegments()` splits one paragraph into quoted and unquoted spans, so each
   can take its own voice. It follows ST's `parseMessageSegments`
   (`tts/index.js:537`) — delimiters stripped, pieces trimmed, empties dropped —
   with one deliberate difference below.
-
-An earlier design used segments for *direction* too, and was reverted because
-one-sentence fragments made for poor stage directions — that history is in
-`.bak`. Segments are back for voices only; every segment in a paragraph
-inherits that paragraph's single instruction, so the arc survives.
 
 ### This chat is plaintext
 
@@ -161,65 +163,51 @@ alone as content. Don't reintroduce markup stripping without a reason to.
 
 ### How a segment finds its instruction
 
-Every segment of a paragraph is generated with that paragraph's single
-instruction, so tone context is intact no matter how many voices a paragraph
-uses. There are two ways it gets there:
+The player knows exactly which message, paragraph and speaker it is playing, so
+`clipsFor()` attaches `{ messageId, paragraph, speaker }` to every clip and it
+rides through `getClip` → `_plan` → `breezeDirector`. Only the `speaker` matters
+to the instruction: it selects the cast entry whose description is composed
+over the base voice.
 
-- **With a hint** — the player knows exactly which message and paragraph it is
-  playing, so `clipsFor()` attaches `{ messageId, paragraph }` to every clip and
-  it rides through `getClip` → `_plan` → `breezeDirector`. Exact, and the only
-  path the player uses.
-- **Without one** — SillyTavern's own narration calls the provider with nothing
-  but text, so `locate()` and `pickLine()` have to find the paragraph by
-  matching. That is dependable for a whole paragraph, which is all ST ever
-  sends.
-
-Never rely on matching for a fragment. `locate()` scans the chat newest-first
-for any message containing the text, and `pickLine()` falls back to the longest
-paragraph containing it — a short quote like `"Yes."` can match the wrong
-paragraph, or the wrong message. If a new caller generates sub-paragraph audio,
-it must pass a hint.
-
-**Caveat on the first rule.** ST only splits by line when
-`extension_settings.tts.narrate_by_paragraphs` is on (`tts/index.js:274`). With
-it off, ST enqueues the whole message as one job, `pickLine()` matches
-paragraph 1, and the entire message is read with paragraph 1's instruction. The
-settings panel warns when it is off. The player here does its own splitting and
-is unaffected.
+SillyTavern's own narration calls the provider with nothing but text, so there
+is no speaker and every line reads in the voice the voice map gives it, as
+written. Per-speaker voices are the panel player's; ST's queue never had them.
+If a new caller generates sub-paragraph audio, it must pass a hint.
 
 ### Data model
 
-`message.extra.breeze_direction`, saved into the chat file by `saveChat()`:
+`message.extra.breeze_speakers`, saved into the chat file by `saveChat()`:
 
 ```js
 {
   swipe_id, ts,
-  lines: [{ text, instruction, segments? }],   // segments only when the paragraph needs them
-  history: [{ ts, lines }],                    // capped at HISTORY_LIMIT = 5
+  lines: [{ text, segments? }],   // segments only when the paragraph needs them
 }
 ```
 
 `segments` is `[{ text, kind, speaker?, voice? }]` and is **omitted entirely**
 when a paragraph is one plain narration span — the common case — so records stay
-small and directions written before casting still load.
+small. A message with no quotes still gets a record, so it reads as settled and
+the auto-run does not revisit it; it costs no model call to write.
 
-`voice` is pinned only for a *foreign* speaker. The character's own dialogue and
-unattributed spans store no voice and resolve live through `voiceForSegment()`,
-so editing the narrator setting or the TTS voice map keeps working on messages
-already in the chat. A voice picked by hand in the panel pins the same field.
+`voice` is pinned only by a hand pick in the panel. Everything else resolves
+live through `voiceForSegment()`, so editing the narrator setting, the cast, or
+the TTS voice map keeps working on messages already in the chat. Identifying a
+message again keeps a hand-picked voice wherever the segment is still the same
+text in the same place.
 
-A take whose `lines` all hold an empty `instruction` is a *blank* take, written
-by `blankTake()` and recognised by `isBlank()`. It is not the same as no take at
-all: see "Takes: written, restored, deleted, blanked".
+`getSpeakers()` returns `null` when `swipe_id` no longer matches, or when the
+paragraph count no longer does, so swiping or editing silently invalidates the
+record rather than misapplying it. Text goes in the chat (small, worth
+exporting); audio never does — the provider caches clips in IndexedDB.
 
-`getDirection()` returns `null` when `swipe_id` no longer matches, so swiping
-silently invalidates a take rather than misapplying it. Text goes in the chat
-(small, worth exporting); audio never does — the provider caches clips in
-IndexedDB.
+Old `extra.breeze_direction` records, from when this extension wrote delivery
+direction, are never read. `generate()` deletes one when it writes the new
+record.
 
 Player resume positions live in `extensionSettings.breeze_player.resume`, keyed
 `"<chatId>:<messageId>"`, pruned past 200 entries. Resume stays
-paragraph-granular even though playback is now segment-granular.
+paragraph-granular even though playback is segment-granular.
 
 The speaker→voice cast lives in `breeze_director.cast` as
 `{ [chatId]: { [speaker]: voice } }`, pruned past `CAST_CHAT_LIMIT` chats. It is
@@ -231,23 +219,21 @@ would make the same stranger sound like a different person every paragraph.
 
 Settings are split across `breeze_director` and `breeze_player` because these
 were once separate extensions. Keep both keys — renaming drops users' configs.
+`settings()` deletes the keys that belonged to delivery direction
+(`RETIRED_SETTINGS`: `prompt`, `on_missing`) along with their prompt stamps.
 
 ### Flow
 
-1. `CHARACTER_MESSAGE_RENDERED` → `prepare(index)`: generate direction, design a
-   voice if the character has none, then prefetch every clip. Doing this before
-   narration means **no LLM call happens during playback**.
-2. The provider calls `globalThis.breezeDirector(text, …)` per line. It locates
-   the message from the hint, or by matching text when there is none, awaits
-   any in-flight precompute for that message rather than racing it, and returns
-   `{ instruction, cfg_scale }`.
-3. `on_missing` decides the no-direction case: `static` (provider's own preset,
-   no LLM call) or `generate` (blocks playback).
+1. `CHARACTER_MESSAGE_RENDERED` → `prepare(index)`: identify the speakers and
+   cast anyone new, then prefetch every clip. Doing this before narration means
+   **no LLM call happens during playback**.
+2. The provider calls `globalThis.breezeDirector(text, …, hint)` per clip and
+   gets back the speaker's composed instruction and `cfg_scale`, or `null` to
+   read the voice as written.
 
-`run()`, `ensureVoice()` and `castVoice()` are single-flight via `inFlight` /
-`voiceJobs` / `castJobs`, so the auto-run and the narration hook never issue
-duplicate calls, and two paragraphs naming the same stranger cannot race into
-two different voices.
+`run()` and `castVoice()` are single-flight via `inFlight` / `castJobs`, so the
+auto-run and a button never issue duplicate calls, and two paragraphs naming the
+same stranger cannot race into two different voices.
 
 ### The cast layers on top; it never writes a voice
 
@@ -263,11 +249,10 @@ The composed instruction is, in order:
    base's, but only if there is one; dropping it otherwise would leave them
    sounding like nobody rather than like their base;
 2. `voiceInstruction(castEntry, cloned)`, the speaker's own description, with
-   identity words dropped when the base is a clone;
-3. the paragraph's delivery direction.
+   identity words dropped when the base is a clone.
 
 `cfg_scale` comes from the base when it sets one, since the base is
-hand-maintained, falling back to the director's setting.
+hand-maintained, falling back to the cast setting.
 
 This resolves at play time, not at generation time: `clipsFor()` puts the
 `speaker` in the hint and `voiceForSegment()` looks up their base. So editing a
@@ -296,9 +281,9 @@ Three filters, applied in order inside `splitLines()`:
    silencing the message.
 
 All three change what paragraph three means, and paragraphs are addressed by
-index, so `getDirection()` drops a stored take whose line count no longer
+index, so `getSpeakers()` drops a stored record whose line count no longer
 matches the message. That also covers an edited message, which would otherwise
-read one paragraph's direction over another.
+give one paragraph's speakers to another.
 
 ### Skipping paragraphs
 
@@ -306,9 +291,9 @@ Each row in the message panel has a checkbox. Checked means read aloud, and
 everything starts checked; unchecking leaves a paragraph out of playback without
 editing the message.
 
-The indices live on `message.extra.breeze_skip`, **not** on a take. Regenerating
-direction or restoring an earlier one leaves the choice alone, because it is
-about the text rather than about how the text is read. The field is deleted when
+The indices live on `message.extra.breeze_skip`, **not** on the speakers
+record. Identifying the speakers again leaves the choice alone, because it is
+about the text rather than about who reads it. The field is deleted when
 nothing is skipped, so a chat that never uses the feature carries nothing extra.
 
 `player.load()` gives a skipped paragraph no clips, and `playAt()` and
@@ -320,18 +305,13 @@ it again first, since asking to hear it is asking for it back.
 ### The model call has a deadline, because it blocks the audio
 
 `callModel()` races `sendRequest` against `MODEL_TIMEOUT_MS` (120 s) and clears
-the timer either way. Nothing else in the path had a deadline, and the director
-hook still waits on `inFlight` for a message before it plans a single clip — so
-a profile that never answers used to stop every clip behind it, with the button
-spinning for ever and nothing ever sent to Breeze.
+the timer either way. Pre-generation waits on identification for a message
+before it plans a single clip — so a profile that never answers used to stop
+every clip behind it, with the button spinning for ever and nothing ever sent to
+Breeze.
 
-Giving up is safe here: `run()` catches, returns `null`, and narration falls
-back to the voice's own preset, which is the same soft failure every other
-director error takes.
-
-Pre-generation itself no longer waits on the model at all (see below), so the
-remaining ways a model call can sit in front of playback are the automatic run
-on a new message, the rotate button, and `on_missing: generate` at play time.
+Giving up is safe here: identification returns nothing, the quotes are stored
+unattributed, and they read in the narrator's voice.
 
 ### Breeze needs one of its three modes; "say nothing" is not one
 
@@ -339,17 +319,12 @@ Breeze picks what it is doing from the fields in the request: an `instruction`
 alone is Voice Design, `ref_audio` + `ref_text` is Voice Clone, both together
 are Voice Direction. **A request carrying neither matches no template at all.**
 
-A blank take composes an empty instruction by design. If the voice reading the
-line also carries no `instruction` of its own — a base with nothing written in
-the voices JSON, or narration with no cast line behind it — then nothing is
-left, and what would go out is a request Breeze cannot place. That is why blank
-takes made no sound while directed ones did: the difference is not the extension
-refusing to ask, it is the ask being unanswerable.
-
-`_plan()` therefore floors it: with no instruction and no reference audio, the
-line is read with `PLAIN_INSTRUCTION`. A clone is left alone — reference audio
-is already a mode. The fallback is part of the cache key like any other
-instruction, so nothing is smuggled past the cache.
+A voice with no `instruction` of its own in the voices JSON, read for a speaker
+with no description, composes nothing. `_plan()` therefore floors it: with no
+instruction and no reference audio, the line is read with `PLAIN_INSTRUCTION`.
+A clone is left alone — reference audio is already a mode. The fallback is part
+of the cache key like any other instruction, so nothing is smuggled past the
+cache.
 
 Measured against the server on 2026-09-21, `192.168.0.199:8004`:
 
@@ -366,14 +341,14 @@ is a different fault from this one — look at the model call's deadline instead
 ### Seeing what would be sent
 
 `await breezeExplain()` in the console prints a table for the last message (or
-`breezeExplain(12)` for one by index): one row per clip, with the take it read
-(`none` / `blank` / `directed`), who is speaking, the voice, **the instruction
+`breezeExplain(12)` for one by index): one row per clip, with whether the
+speakers have been identified, who is speaking, the voice, **the instruction
 actually composed**, the cfg scale, whether it is already cached, and the first
 of the text.
 
 It is the quickest way to place a line that makes no sound, because it separates
-the causes that look identical from outside: no voice assigned, an empty
-instruction, a clip already cached, a paragraph unchecked. It sends nothing —
+the causes that look identical from outside: no voice assigned, a speaker not
+identified, a clip already cached, a paragraph unchecked. It sends nothing —
 `breezeTts.explain()` runs `_plan()` and stops, and `breezeTts.isCached()` looks
 the key up without generating.
 
@@ -405,75 +380,19 @@ that only tests truthiness still behaves as it did.
 provider. That is the first thing to check when the cloud button spins and
 nothing reaches the server.
 
-### Takes: written, restored, deleted, blanked
+### Pre-generation identifies first; play does not
 
-A message holds one current take plus up to `HISTORY_LIMIT` behind it. Four
-things move between those slots, all of them in the panel toolbar:
+The cloud buttons and `/breeze-audio` go through `pregenerateReport()`. A
+message whose speakers have not been identified is identified first, because
+the speaker decides the voice: a quote cached in the narrator's voice is audio
+thrown away the moment its speaker is known. An identification already running
+for the message is awaited instead of raced. A message with no quotes, or with
+casting off, makes no model call.
 
-| Control | Does |
-|---|---|
-| rotate | `generate()` — a new take, the old one pushed to the history |
-| restore | `restoreTake()` — swap the take being viewed with the current one |
-| ✕ | `deleteTake()` — drop the take being viewed (playing it again writes a blank one) |
-| eraser | `blankTake()` — empty every instruction, no model call |
-
-`deleteTake()` confirms first, then: a take from the history is spliced out; the
-current take is replaced by the newest one behind it, so the undo path the
-history exists for still works; and with nothing behind it the message is left
-with no direction at all — which is a real state, the one every message starts
-in. The trash button next to it erases *cached audio*, not takes; they are
-deliberately different icons for different kinds of loss.
-
-A **blank take** is the answer to "read this plainly". A message with no take is
-not the same thing: with `on_missing` set to `generate` it still calls the
-director the moment narration reaches it, and audio cached before that happens
-is audio thrown away, because a clip is keyed by the instruction it was made
-under. `blankTake()` settles it — every paragraph present, every instruction the
-empty string, so `breezeDirector()` contributes nothing and the line is read
-with the voice's own preset behind it, which is exactly what the clips were
-cached against.
-
-It writes no model call, pushes the take it replaces into the history like any
-other, and is a no-op when the take is already blank (`isBlank()`), so pressing
-it twice does not churn five real takes out of the history. Segments are carried
-across where the paragraph text still matches: who speaks is not delivery
-direction, and blanking a take is not asking to recast the message. Both the
-dropdown and `/breeze-audio blank=true` mark such a take `(blank)`.
-
-### Pre-generation does not direct
-
-The cloud buttons and `/breeze-audio` exist for the case where **directing takes
-longer than you are willing to wait** — you want the message read now, plainly.
-So `pregenerateReport()` makes no model call:
-
-| State of the message | What pre-generation does |
-|---|---|
-| a take already written | uses it as it stands |
-| no take | writes a blank one, then generates |
-| `blank=true` | blanks the take it has, keeping it in the history, then generates |
-| `direct=true` | the old behaviour: directs first, then generates |
-
-Writing the blank take rather than generating against no take at all is what
-keeps the clips valid: with no take and `on_missing: generate`, the director
-would run when playback reached the message and every clip cached beforehand
-would be keyed to an instruction that no longer applies. A blank take settles
-it, and nothing directs the message afterwards.
-
-This was originally built the other way round — direct first, since a clip is
-keyed by the instruction it was made under — which put a model call between the
-button and any audio, exactly the wait the button exists to avoid. `direct=true`
-is where that behaviour went.
-
-**Pressing play settles the same way.** `playFrom()` calls
-`settleBeforePlaying()` first: a message with no take gets a blank one, and the
-line is read with the voice's own preset behind it rather than waiting on a
-model. `on_missing: generate` therefore no longer reaches the panel player at
-all — it applies to SillyTavern's own narration queue, which starts without
-passing through here, and the settings drawer says so.
-
-Settling in `playFrom()` rather than in `player.load()` is deliberate:
-`load()` also runs on a reload, and blanking there would make a take you just
-deleted reappear as a blank one under your hand.
+Pressing play is different. `playFrom()` waits for an identification already in
+flight — it is about to change the voices — but never starts one, so a message
+not yet identified plays now, quotes in the narrator's voice. The panel status
+line says so, and the rotate button identifies it.
 
 ### Pre-generating from a paragraph
 
@@ -484,9 +403,8 @@ the toolbar cloud still does the whole message. Skipped paragraphs are skipped
 either way. `from` is 0-based in the code and 1-based in the UI and in
 `/breeze-audio from=`, matching the panel's own "Paragraph 3 of 9".
 
-`pregenerateFrom()` re-reads the take afterwards, because pre-generation can
-settle the direction on its own — by writing one or by blanking it — and the
-panel would otherwise hold a take that no longer exists.
+`pregenerateFrom()` repaints afterwards, because pre-generation may have
+identified the speakers on its way.
 
 ### Casting a quoted speaker
 
@@ -517,7 +435,7 @@ character is called something else is still ignored.
    every character with that placeholder until someone chooses otherwise
    (`tts/index.js:1525`), so following it read "nobody picked a voice" as "the
    user picked this one" and pinned every character to the same base. That is
-   what made the director look like it always chose the same voice.
+   what made casting look like it always chose the same voice.
 
    Returning here at all was a separate bug: `{{char}}` usually has some entry,
    so the character sat on the sheet with a base and no description while side
@@ -564,9 +482,9 @@ so blanks and `"unknown"` never reach the cast. Look profiles up with
 `profileFor()`, never by direct index — the model files them under whatever
 casing it likes, and a missed lookup silently loses the whole description.
 
-This used to ride along on the director prompt. It was two jobs in one call with
-too little context for either; the director prompt now only directs, and its
-`{{quotes}}` placeholder is gone.
+This once rode along on the delivery-direction prompt. It was two jobs in one
+call with too little context for either, which is why it got its own call; the
+direction prompt has since been removed outright.
 
 The card is the best evidence there is about how someone sounds, and for the
 chat's own character it is often the only evidence — their lines are being read,
@@ -580,8 +498,8 @@ over in silence.
 ### The voice is the instrument, not the performance
 
 A cast member's `tone` describes how someone **always** sounds — pitch, texture,
-pace, habitual manner. How a given line is *felt* is the per-paragraph
-director's job, and the two compose at generation time.
+pace, habitual manner. It is the only description a line gets, so it must suit
+every line they speak.
 
 Keeping them apart matters in the prompt, or the model writes the performance
 into the instrument: an early version returned *"teasing and quick-witted when
@@ -636,36 +554,32 @@ without which SillyTavern's `.popup-content` stays `overflow: hidden`
 (`css/popup.css`) and any cast taller than the dialog is unreachable:
 
 - **Add speaker** pre-stages someone who has not spoken yet. A hand-added entry
-  is `pinned`, so when the director eventually names them it reuses the entry
+  is `pinned`, so when identification eventually names them it reuses the entry
   as-is — no model call, no overwriting the tone you wrote. That is the whole
   point of pre-staging, and there is a scenario in `tools/check.js` for it.
 - **Scan chat** runs `castMessage()` over the recent messages that contain
   quotes, newest first, bounded by `CAST_SCAN_LIMIT`. It confirms the cost
   first, because each message is at least one model call plus one per new voice.
 
-`castMessage()` is the casting half of `generate()` on its own: identify, then
-cast every foreign speaker. It deliberately never writes
-`extra.breeze_direction` — scanning for speakers must not silently re-direct
-messages you have already tuned. Edits apply immediately and re-derive the
-speaker's provider voice **under its existing name**, so segments already stored
-in the chat keep pointing at it. The settings panel only reports the count and
+`castMessage()` runs `generate()` and returns the names it found. Because
+`generate()` keeps hand-picked voices where the segment text still matches,
+scanning a message you have already tuned does not undo the tuning. The settings panel only reports the count and
 opens the sheet — one editor, not two.
 
 ### Failure policy
 
-Soft everywhere. A director failure returns `null` and narration falls back to
-the static preset; only user-initiated actions (`quiet: false`, the regenerate
+Soft everywhere. A failed identification stores the quotes unattributed and a
+failed cast leaves the speaker unvoiced; narration falls back to the static
+preset either way. Only user-initiated actions (`quiet: false`, the rotate
 button) surface a toast. Preserve that — a hard throw here breaks TTS entirely.
 
 ### Prompt rules
 
-`parseInstructions()` strips `<think>` blocks and code fences, extracts the
-first `[...]`, pads short arrays with the last usable line, and falls back to
-using the model's first line for every paragraph. Keep it forgiving.
+Model JSON is read with `extractJson()`, which tolerates prose, `<think>` blocks
+and code fences around it. Keep it forgiving.
 
-Instructions must describe **delivery only** — never age, gender, accent, or
-timbre, which would fight the reference audio in the provider's voice-clone
-mode. The voice-design prompt is the one place that *does* describe the voice.
+Cast descriptions describe the voice as it always sounds — never mood, history
+or appearance. See "The voice is the instrument, not the performance".
 
 ### The orphaned-call check
 
@@ -700,7 +614,7 @@ the no-writes invariant is checked from the UI as well as from `generate()`.
 The same treatment as the cast sheet, and for the same reason: `openPanel()`
 builds a toolbar and a row per paragraph, and a name that stopped resolving
 inside one of those handlers is invisible until the button is pressed. The check
-opens a panel over a message with a history, fires every handler it bound, then
+opens a panel over an identified message, fires every handler it bound, then
 **drains the pending promises and stops the player**. Without that the buttons
 that do not await their work leave a repaint in flight, and the elements it
 builds land inside the next section's marker — which is how a broken player
@@ -708,30 +622,22 @@ button once showed up as four failures in the cast sheet.
 
 ### Slash commands
 
-`registerSlashCommands()` adds four, each taking an optional message id — no
+`registerSlashCommands()` adds two, each taking an optional message id — no
 argument means the last message, a negative one counts back from the end:
 
 | Command | Does | Returns |
 |---|---|---|
-| `/breeze-direct` | writes delivery direction, keeping the old take in history | paragraphs directed |
-| `/breeze-cast` | identifies speakers and casts anyone new, leaving direction alone | names cast |
+| `/breeze-cast` | identifies speakers and casts anyone new | names cast |
 | `/breeze-audio` | generates the audio and leaves it cached, without playing | clips generated |
-| `/breeze-blank` | empties the take — every instruction cleared, no model call | paragraphs blanked |
 
-`/breeze-audio` takes two named arguments as well: `blank=true` settles the
-direction by emptying it rather than by calling the model, and `from=3` starts
-at that paragraph, counting from 1. So `/breeze-audio blank=true from=3 -2`
-means "the message before last, read plainly, from its third paragraph on".
+`/breeze-audio from=3` starts at that paragraph, counting from 1. So
+`/breeze-audio from=3 -2` means "the message before last, from its third
+paragraph on". `/breeze-direct` and `/breeze-blank` went with delivery
+direction.
 
 Named arguments go through `flag()`, which returns nothing at all when the
 running SillyTavern has no `SlashCommandNamedArgument`: a build without it gets
 the commands without their flags rather than no commands.
-
-STscript has no booleans — a flag arrives as whatever was typed — so `isOn()`
-reads it.
-
-`/breeze-audio` and the panel's cloud buttons all go through `pregenerate()`,
-which **never calls the model**. See "Pre-generation does not direct".
 
 `targetMessage()` tests its argument for emptiness before converting it.
 `Number('')` is `0`, so a plain `/breeze-audio` would otherwise silently act on
@@ -742,13 +648,10 @@ uncaught throw there would abort the rest of the ready handler.
 
 ## Known issues / gotchas
 
-- **Prompts persist in settings, so editing the default in this file changes
-  nothing for an existing install.** After any change to `DEFAULT_PROMPT` or
-  `DEFAULT_VOICE_PROMPT`, click "Reset prompt" in the panel. This now fails
-  loudly rather than silently: a saved prompt without `{{quotes}}` can never
-  return speaker attribution, so `bind()` shows a warning under the prompt box
-  until it is reset, and `generate()` logs when attribution was expected but
-  came back empty.
+- **Prompts persist in settings.** `syncPrompts()` upgrades an unedited one
+  automatically; one you have edited, or one saved before stamping existed, is
+  left alone and needs its reset button after a default changes. A saved casting
+  prompt without `{{cast}}` is warned about under its box.
 - **Every model call goes through `askModel()`.** Do not call
   `ConnectionManagerRequestService.sendRequest` directly. A reasoning model
   spends its budget thinking before it writes anything, so a request sized for
@@ -756,9 +659,9 @@ uncaught throw there would abort the rest of the ready handler.
   budget at the user's own `max_tokens`, never the caller's estimate of answer
   length, and warns distinctly when a completion is empty.
 
-  This bug has now happened twice. It was fixed for the director call, then
-  reintroduced the moment identification, base-picking and voice design were
-  added with budgets of 400, 80 and 200 tokens. The base pick at 80 could never
+  This bug has now happened twice. It was fixed for the old direction call,
+  then reintroduced the moment identification, base-picking and voice design
+  were added with budgets of 400, 80 and 200 tokens. The base pick at 80 could never
   have answered. A scenario in `tools/check.js` records the budget of every call
   `generate()` makes and fails if any is below `max_tokens`.
 
